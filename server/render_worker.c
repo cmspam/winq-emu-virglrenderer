@@ -3,6 +3,12 @@
  * SPDX-License-Identifier: MIT
  */
 
+#ifndef __APPLE__
+#include <sys/signalfd.h>
+#else
+#include <sys/event.h>
+#undef LIST_ENTRY
+#endif
 #include "render_worker.h"
 
 /* One and only one of ENABLE_RENDER_SERVER_WORKER_* must be set.
@@ -24,10 +30,11 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
-#include <sys/signalfd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#ifdef ENABLE_RENDER_SERVER_WORKER_THREAD
 #include <threads.h>
+#endif
 #include <unistd.h>
 
 struct minijail;
@@ -161,6 +168,48 @@ fork_minijail(const struct minijail *template)
 
 #ifndef ENABLE_RENDER_SERVER_WORKER_THREAD
 
+#ifdef __APPLE__
+static int
+create_sigchld_fd(void)
+{
+   /* On macOS, use kqueue to monitor SIGCHLD */
+   int kq = kqueue();
+   if (kq == -1) {
+      render_log("failed to create kqueue");
+      return -1;
+   }
+
+   /* Set up kqueue to monitor SIGCHLD signal */
+   struct kevent kev;
+   EV_SET(&kev, SIGCHLD, EVFILT_SIGNAL, EV_ADD, 0, 0, NULL);
+   
+   if (kevent(kq, &kev, 1, NULL, 0, NULL) == -1) {
+      render_log("failed to add SIGCHLD to kqueue");
+      close(kq);
+      return -1;
+   }
+
+   /* Block SIGCHLD so it's only handled through kqueue */
+   sigset_t set;
+   sigemptyset(&set);
+   sigaddset(&set, SIGCHLD);
+   if (sigprocmask(SIG_BLOCK, &set, NULL) == -1) {
+      render_log("failed to block SIGCHLD");
+      close(kq);
+      return -1;
+   }
+
+   /* Set kqueue to non-blocking mode */
+   int flags = fcntl(kq, F_GETFL);
+   if (flags == -1 || fcntl(kq, F_SETFL, flags | O_NONBLOCK) == -1) {
+      render_log("failed to set kqueue non-blocking");
+      close(kq);
+      return -1;
+   }
+
+   return kq;
+}
+#else
 static int
 create_sigchld_fd(void)
 {
@@ -196,6 +245,7 @@ create_sigchld_fd(void)
 
    return fd;
 }
+#endif /* __APPLE__ */
 
 #endif /* !ENABLE_RENDER_SERVER_WORKER_THREAD */
 
@@ -321,6 +371,31 @@ render_worker_jail_drain_sigchld_fd(struct render_worker_jail *jail)
    if (jail->sigchld_fd < 0)
       return true;
 
+#ifdef __APPLE__
+   /* On macOS, drain kqueue events */
+   do {
+      struct kevent events[8];
+      struct timespec timeout = {0, 0}; /* non-blocking */
+      int nevents = kevent(jail->sigchld_fd, NULL, 0, events, 8, &timeout);
+      
+      if (nevents == -1) {
+         if (errno == EINTR)
+            continue;
+         render_log("failed to read kqueue events");
+         return false;
+      }
+      
+      if (nevents == 0)
+         break; /* no more events */
+         
+      /* Process SIGCHLD events - we don't need to do anything special
+       * as the signal count is in events[i].data, but we just need to drain */
+      if (nevents < 8)
+         break; /* got fewer events than requested, so we're done */
+         
+   } while (true);
+#else
+   /* On Linux, drain signalfd */
    do {
       struct signalfd_siginfo siginfos[8];
       const ssize_t r = read(jail->sigchld_fd, siginfos, sizeof(siginfos));
@@ -332,6 +407,7 @@ render_worker_jail_drain_sigchld_fd(struct render_worker_jail *jail)
       render_log("failed to read signalfd");
       return false;
    } while (true);
+#endif
 
    return true;
 }
