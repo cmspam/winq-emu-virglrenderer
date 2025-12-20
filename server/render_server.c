@@ -148,7 +148,11 @@ render_server_parse_options(struct render_server *srv, int argc, char **argv)
       return false;
    }
 
-   if (srv->client_fd < 0 || !render_socket_is_seqpacket(srv->client_fd)) {
+   if (srv->client_fd < 0
+#ifndef __APPLE__
+       || !render_socket_is_seqpacket(srv->client_fd)
+#endif
+   ) {
       render_log("no valid client fd specified");
       return false;
    }

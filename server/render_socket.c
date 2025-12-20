@@ -37,7 +37,11 @@
 bool
 render_socket_pair(int out_fds[static 2])
 {
-   int ret = socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, out_fds);
+   int type = SOCK_SEQPACKET;
+#ifdef __APPLE__
+   type = SOCK_STREAM;
+#endif
+   int ret = socketpair(AF_UNIX, type | SOCK_CLOEXEC, 0, out_fds);
    if (ret) {
       render_log("failed to create socket pair");
       return false;
@@ -85,9 +89,86 @@ get_received_fds(const struct msghdr *msg, int *out_count)
    return (const int *)CMSG_DATA(cmsg);
 }
 
+#ifdef __APPLE__
+enum socket_state {
+   SOCKET_STATE_FIRST_MSG,
+   SOCKET_STATE_HEADER,
+   SOCKET_STATE_DATA,
+};
+#endif
+
 static bool
 render_socket_recvmsg(struct render_socket *socket, struct msghdr *msg, size_t *out_size)
 {
+#ifdef __APPLE__
+   enum socket_state state = SOCKET_STATE_FIRST_MSG;
+   struct render_context_socket_header hdr = {0};
+   ssize_t want = sizeof(hdr);
+   struct msghdr _msg = {
+      .msg_iov =
+         &(struct iovec){
+            .iov_base = &hdr,
+            .iov_len = want,
+         },
+      .msg_iovlen = 1,
+      .msg_control = msg->msg_control,
+      .msg_controllen = msg->msg_controllen,
+   };
+   socklen_t _msg_controllen;
+
+   assert(msg->msg_iovlen == 1);
+
+   *out_size = 0;
+   do {
+      const ssize_t s = recvmsg(socket->fd, &_msg, MSG_CMSG_CLOEXEC);
+      if (unlikely(s < 0)) {
+         if (errno == EAGAIN || errno == EINTR)
+            continue;
+
+         render_log("failed to receive message: %s", strerror(errno));
+         return false;
+      }
+
+      if (state == SOCKET_STATE_FIRST_MSG) {
+         _msg_controllen = _msg.msg_controllen;
+         state = SOCKET_STATE_HEADER;
+      } else {
+         /* retain the cmsg from first message */
+         assert(_msg.msg_controllen == 0);
+      }
+
+      if (unlikely(_msg.msg_flags & MSG_CTRUNC)) {
+         render_log("failed to receive message: truncated");
+
+         int fd_count;
+         const int *fds = get_received_fds(&_msg, &fd_count);
+         for (int i = 0; i < fd_count; i++)
+            close(fds[i]);
+
+         return false;
+      }
+
+      if (s <= want) {
+         _msg.msg_iov[0].iov_base = (char *)_msg.msg_iov[0].iov_base + s;
+         _msg.msg_iov[0].iov_len -= s;
+         want -= s;
+      }
+
+      if (state == SOCKET_STATE_DATA) {
+         *out_size += s;
+      }
+
+      if (!want && state == SOCKET_STATE_HEADER) {
+         want = ntohl(hdr.length);
+         _msg.msg_iov[0].iov_base = msg->msg_iov[0].iov_base;
+         _msg.msg_iov[0].iov_len = want;
+         state = SOCKET_STATE_DATA;
+      } else if (!want && state == SOCKET_STATE_DATA) {
+         msg->msg_controllen = _msg_controllen;
+         break;
+      }
+   } while (true);
+#else
    do {
       const ssize_t s = recvmsg(socket->fd, msg, MSG_CMSG_CLOEXEC);
       if (unlikely(s <= 0)) {
@@ -115,6 +196,9 @@ render_socket_recvmsg(struct render_socket *socket, struct msghdr *msg, size_t *
       *out_size = s;
       return true;
    } while (true);
+#endif
+
+   return true;
 }
 
 static bool
@@ -205,6 +289,57 @@ render_socket_receive_data(struct render_socket *socket, void *data, size_t size
 static bool
 render_socket_sendmsg(struct render_socket *socket, const struct msghdr *msg)
 {
+#ifdef __APPLE__
+   enum socket_state state = SOCKET_STATE_FIRST_MSG;
+   struct render_context_socket_header hdr = {
+      .length = htonl(msg->msg_iov[0].iov_len),
+   };
+   ssize_t want = sizeof(hdr);
+   struct msghdr _msg = {
+      .msg_iov =
+         &(struct iovec){
+            .iov_base = &hdr,
+            .iov_len = want,
+         },
+      .msg_iovlen = 1,
+      .msg_control = msg->msg_control,
+      .msg_controllen = msg->msg_controllen,
+   };
+
+   assert(msg->msg_iovlen == 1);
+
+   do {
+      const ssize_t s = sendmsg(socket->fd, &_msg, MSG_NOSIGNAL);
+      if (unlikely(s < 0)) {
+         if (errno == EAGAIN || errno == EINTR)
+            continue;
+
+         render_log("failed to send message: %s", strerror(errno));
+         return false;
+      }
+
+      if (state == SOCKET_STATE_FIRST_MSG) {
+         _msg.msg_controllen = 0;
+         _msg.msg_control = NULL;
+         state = SOCKET_STATE_HEADER;
+      }
+
+      if (s <= want) {
+         _msg.msg_iov[0].iov_base = (char *)_msg.msg_iov[0].iov_base + s;
+         _msg.msg_iov[0].iov_len -= s;
+         want -= s;
+      }
+
+      if (!want && state == SOCKET_STATE_HEADER) {
+         want = ntohl(hdr.length);
+         _msg.msg_iov[0].iov_base = msg->msg_iov[0].iov_base;
+         _msg.msg_iov[0].iov_len = want;
+         state = SOCKET_STATE_DATA;
+      } else if (!want && state == SOCKET_STATE_DATA) {
+         return true;
+      }
+   } while (true);
+#else
    do {
       const ssize_t s = sendmsg(socket->fd, msg, MSG_NOSIGNAL);
       if (unlikely(s < 0)) {
@@ -219,6 +354,7 @@ render_socket_sendmsg(struct render_socket *socket, const struct msghdr *msg)
       assert(msg->msg_iovlen == 1 && msg->msg_iov[0].iov_len == (size_t)s);
       return true;
    } while (true);
+#endif
 }
 
 static inline bool

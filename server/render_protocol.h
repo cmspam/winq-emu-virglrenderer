@@ -219,4 +219,17 @@ union render_context_op_request {
    struct render_context_op_submit_fence_request submit_fence;
 };
 
+#ifdef __APPLE__
+/**
+ * When we do not have SOCK_SEQPACKET support, we need to manage framing.
+ * This will be sent as the header of each packet when necessary.
+ */
+struct render_context_socket_header {
+   union {
+      uint32_t length;
+      uint8_t b[sizeof(uint32_t)];
+   };
+};
+#endif /* __APPLE__ */
+
 #endif /* RENDER_PROTOCOL_H */
