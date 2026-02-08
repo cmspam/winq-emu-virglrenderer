@@ -31,6 +31,7 @@ struct vn_physical_device_proc_table {
    PFN_vkGetDeviceProcAddr GetDeviceProcAddr;
    PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR GetPhysicalDeviceCalibrateableTimeDomainsKHR;
    PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR GetPhysicalDeviceCooperativeMatrixPropertiesKHR;
+   PFN_vkGetPhysicalDeviceDescriptorSizeEXT GetPhysicalDeviceDescriptorSizeEXT;
    PFN_vkGetPhysicalDeviceExternalBufferProperties GetPhysicalDeviceExternalBufferProperties;
    PFN_vkGetPhysicalDeviceExternalFenceProperties GetPhysicalDeviceExternalFenceProperties;
    PFN_vkGetPhysicalDeviceExternalSemaphoreProperties GetPhysicalDeviceExternalSemaphoreProperties;
@@ -75,6 +76,8 @@ struct vn_device_proc_table {
    PFN_vkCmdBindIndexBuffer CmdBindIndexBuffer;
    PFN_vkCmdBindIndexBuffer2 CmdBindIndexBuffer2;
    PFN_vkCmdBindPipeline CmdBindPipeline;
+   PFN_vkCmdBindResourceHeapEXT CmdBindResourceHeapEXT;
+   PFN_vkCmdBindSamplerHeapEXT CmdBindSamplerHeapEXT;
    PFN_vkCmdBindTransformFeedbackBuffersEXT CmdBindTransformFeedbackBuffersEXT;
    PFN_vkCmdBindVertexBuffers CmdBindVertexBuffers;
    PFN_vkCmdBindVertexBuffers2 CmdBindVertexBuffers2;
@@ -127,6 +130,7 @@ struct vn_device_proc_table {
    PFN_vkCmdPipelineBarrier2 CmdPipelineBarrier2;
    PFN_vkCmdPushConstants CmdPushConstants;
    PFN_vkCmdPushConstants2 CmdPushConstants2;
+   PFN_vkCmdPushDataEXT CmdPushDataEXT;
    PFN_vkCmdPushDescriptorSet CmdPushDescriptorSet;
    PFN_vkCmdPushDescriptorSet2 CmdPushDescriptorSet2;
    PFN_vkCmdPushDescriptorSetWithTemplate CmdPushDescriptorSetWithTemplate;
@@ -294,6 +298,7 @@ struct vn_device_proc_table {
    PFN_vkGetImageDrmFormatModifierPropertiesEXT GetImageDrmFormatModifierPropertiesEXT;
    PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements;
    PFN_vkGetImageMemoryRequirements2 GetImageMemoryRequirements2;
+   PFN_vkGetImageOpaqueCaptureDataEXT GetImageOpaqueCaptureDataEXT;
    PFN_vkGetImageSparseMemoryRequirements GetImageSparseMemoryRequirements;
    PFN_vkGetImageSparseMemoryRequirements2 GetImageSparseMemoryRequirements2;
    PFN_vkGetImageSubresourceLayout GetImageSubresourceLayout;
@@ -320,6 +325,7 @@ struct vn_device_proc_table {
    PFN_vkQueueSubmit QueueSubmit;
    PFN_vkQueueSubmit2 QueueSubmit2;
    PFN_vkQueueWaitIdle QueueWaitIdle;
+   PFN_vkRegisterCustomBorderColorEXT RegisterCustomBorderColorEXT;
    PFN_vkResetCommandBuffer ResetCommandBuffer;
    PFN_vkResetCommandPool ResetCommandPool;
    PFN_vkResetDescriptorPool ResetDescriptorPool;
@@ -333,11 +339,14 @@ struct vn_device_proc_table {
    PFN_vkTrimCommandPool TrimCommandPool;
    PFN_vkUnmapMemory UnmapMemory;
    PFN_vkUnmapMemory2 UnmapMemory2;
+   PFN_vkUnregisterCustomBorderColorEXT UnregisterCustomBorderColorEXT;
    PFN_vkUpdateDescriptorSetWithTemplate UpdateDescriptorSetWithTemplate;
    PFN_vkUpdateDescriptorSets UpdateDescriptorSets;
    PFN_vkWaitForFences WaitForFences;
    PFN_vkWaitSemaphores WaitSemaphores;
    PFN_vkWriteAccelerationStructuresPropertiesKHR WriteAccelerationStructuresPropertiesKHR;
+   PFN_vkWriteResourceDescriptorsEXT WriteResourceDescriptorsEXT;
+   PFN_vkWriteSamplerDescriptorsEXT WriteSamplerDescriptorsEXT;
 };
 
 static inline void
@@ -380,6 +389,7 @@ vn_util_init_physical_device_proc_table(VkInstance instance,
    if (!proc_table->GetPhysicalDeviceCalibrateableTimeDomainsKHR)
       proc_table->GetPhysicalDeviceCalibrateableTimeDomainsKHR = VN_GIPA(instance, vkGetPhysicalDeviceCalibrateableTimeDomainsEXT);
    proc_table->GetPhysicalDeviceCooperativeMatrixPropertiesKHR = VN_GIPA(instance, vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR);
+   proc_table->GetPhysicalDeviceDescriptorSizeEXT = VN_GIPA(instance, vkGetPhysicalDeviceDescriptorSizeEXT);
    proc_table->GetPhysicalDeviceExternalBufferProperties = VN_GIPA(instance, vkGetPhysicalDeviceExternalBufferProperties);
    if (!proc_table->GetPhysicalDeviceExternalBufferProperties)
       proc_table->GetPhysicalDeviceExternalBufferProperties = VN_GIPA(instance, vkGetPhysicalDeviceExternalBufferPropertiesKHR);
@@ -481,6 +491,12 @@ vn_util_init_device_proc_table(VkDevice dev,
       ext_table->KHR_maintenance5 ? VN_GDPA(dev, vkCmdBindIndexBuffer2KHR) :
       NULL;
    proc_table->CmdBindPipeline = VN_GDPA(dev, vkCmdBindPipeline);
+   proc_table->CmdBindResourceHeapEXT =
+      ext_table->EXT_descriptor_heap ? VN_GDPA(dev, vkCmdBindResourceHeapEXT) :
+      NULL;
+   proc_table->CmdBindSamplerHeapEXT =
+      ext_table->EXT_descriptor_heap ? VN_GDPA(dev, vkCmdBindSamplerHeapEXT) :
+      NULL;
    proc_table->CmdBindTransformFeedbackBuffersEXT =
       ext_table->EXT_transform_feedback ? VN_GDPA(dev, vkCmdBindTransformFeedbackBuffersEXT) :
       NULL;
@@ -604,6 +620,9 @@ vn_util_init_device_proc_table(VkDevice dev,
    proc_table->CmdPushConstants2 =
       api_version >= VK_API_VERSION_1_4 ? VN_GDPA(dev, vkCmdPushConstants2) :
       ext_table->KHR_maintenance6 ? VN_GDPA(dev, vkCmdPushConstants2KHR) :
+      NULL;
+   proc_table->CmdPushDataEXT =
+      ext_table->EXT_descriptor_heap ? VN_GDPA(dev, vkCmdPushDataEXT) :
       NULL;
    proc_table->CmdPushDescriptorSet =
       api_version >= VK_API_VERSION_1_4 ? VN_GDPA(dev, vkCmdPushDescriptorSet) :
@@ -1026,6 +1045,9 @@ vn_util_init_device_proc_table(VkDevice dev,
       api_version >= VK_API_VERSION_1_1 ? VN_GDPA(dev, vkGetImageMemoryRequirements2) :
       ext_table->KHR_get_memory_requirements2 ? VN_GDPA(dev, vkGetImageMemoryRequirements2KHR) :
       NULL;
+   proc_table->GetImageOpaqueCaptureDataEXT =
+      ext_table->EXT_descriptor_heap ? VN_GDPA(dev, vkGetImageOpaqueCaptureDataEXT) :
+      NULL;
    proc_table->GetImageSparseMemoryRequirements = VN_GDPA(dev, vkGetImageSparseMemoryRequirements);
    proc_table->GetImageSparseMemoryRequirements2 =
       api_version >= VK_API_VERSION_1_1 ? VN_GDPA(dev, vkGetImageSparseMemoryRequirements2) :
@@ -1090,6 +1112,9 @@ vn_util_init_device_proc_table(VkDevice dev,
       ext_table->KHR_synchronization2 ? VN_GDPA(dev, vkQueueSubmit2KHR) :
       NULL;
    proc_table->QueueWaitIdle = VN_GDPA(dev, vkQueueWaitIdle);
+   proc_table->RegisterCustomBorderColorEXT =
+      ext_table->EXT_descriptor_heap ? VN_GDPA(dev, vkRegisterCustomBorderColorEXT) :
+      NULL;
    proc_table->ResetCommandBuffer = VN_GDPA(dev, vkResetCommandBuffer);
    proc_table->ResetCommandPool = VN_GDPA(dev, vkResetCommandPool);
    proc_table->ResetDescriptorPool = VN_GDPA(dev, vkResetDescriptorPool);
@@ -1121,6 +1146,9 @@ vn_util_init_device_proc_table(VkDevice dev,
       api_version >= VK_API_VERSION_1_4 ? VN_GDPA(dev, vkUnmapMemory2) :
       ext_table->KHR_map_memory2 ? VN_GDPA(dev, vkUnmapMemory2KHR) :
       NULL;
+   proc_table->UnregisterCustomBorderColorEXT =
+      ext_table->EXT_descriptor_heap ? VN_GDPA(dev, vkUnregisterCustomBorderColorEXT) :
+      NULL;
    proc_table->UpdateDescriptorSetWithTemplate =
       api_version >= VK_API_VERSION_1_1 ? VN_GDPA(dev, vkUpdateDescriptorSetWithTemplate) :
       ext_table->KHR_descriptor_update_template ? VN_GDPA(dev, vkUpdateDescriptorSetWithTemplateKHR) :
@@ -1133,6 +1161,12 @@ vn_util_init_device_proc_table(VkDevice dev,
       NULL;
    proc_table->WriteAccelerationStructuresPropertiesKHR =
       ext_table->KHR_acceleration_structure ? VN_GDPA(dev, vkWriteAccelerationStructuresPropertiesKHR) :
+      NULL;
+   proc_table->WriteResourceDescriptorsEXT =
+      ext_table->EXT_descriptor_heap ? VN_GDPA(dev, vkWriteResourceDescriptorsEXT) :
+      NULL;
+   proc_table->WriteSamplerDescriptorsEXT =
+      ext_table->EXT_descriptor_heap ? VN_GDPA(dev, vkWriteSamplerDescriptorsEXT) :
       NULL;
 #undef VN_GDPA
 }

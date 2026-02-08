@@ -39,6 +39,7 @@
 #include "vn_protocol_renderer_private_data_slot.h"
 #include "vn_protocol_renderer_host_copy.h"
 #include "vn_protocol_renderer_acceleration_structure.h"
+#include "vn_protocol_renderer_descriptor_heap.h"
 
 static inline const char *vn_dispatch_command_name(VkCommandTypeEXT type)
 {
@@ -343,6 +344,13 @@ static inline const char *vn_dispatch_command_name(VkCommandTypeEXT type)
     case VK_COMMAND_TYPE_vkCmdSetRenderingAttachmentLocations_EXT: return "vkCmdSetRenderingAttachmentLocations";
     case VK_COMMAND_TYPE_vkCmdSetRenderingInputAttachmentIndices_EXT: return "vkCmdSetRenderingInputAttachmentIndices";
     case VK_COMMAND_TYPE_vkCmdSetDepthClampRangeEXT_EXT: return "vkCmdSetDepthClampRangeEXT";
+    case VK_COMMAND_TYPE_vkCmdBindSamplerHeapEXT_EXT: return "vkCmdBindSamplerHeapEXT";
+    case VK_COMMAND_TYPE_vkCmdBindResourceHeapEXT_EXT: return "vkCmdBindResourceHeapEXT";
+    case VK_COMMAND_TYPE_vkCmdPushDataEXT_EXT: return "vkCmdPushDataEXT";
+    case VK_COMMAND_TYPE_vkRegisterCustomBorderColorEXT_EXT: return "vkRegisterCustomBorderColorEXT";
+    case VK_COMMAND_TYPE_vkUnregisterCustomBorderColorEXT_EXT: return "vkUnregisterCustomBorderColorEXT";
+    case VK_COMMAND_TYPE_vkGetImageOpaqueCaptureDataEXT_EXT: return "vkGetImageOpaqueCaptureDataEXT";
+    case VK_COMMAND_TYPE_vkGetPhysicalDeviceDescriptorSizeEXT_EXT: return "vkGetPhysicalDeviceDescriptorSizeEXT";
     case VK_COMMAND_TYPE_vkSetReplyCommandStreamMESA_EXT: return "vkSetReplyCommandStreamMESA";
     case VK_COMMAND_TYPE_vkSeekReplyCommandStreamMESA_EXT: return "vkSeekReplyCommandStreamMESA";
     case VK_COMMAND_TYPE_vkExecuteCommandStreamsMESA_EXT: return "vkExecuteCommandStreamsMESA";
@@ -359,6 +367,8 @@ static inline const char *vn_dispatch_command_name(VkCommandTypeEXT type)
     case VK_COMMAND_TYPE_vkWaitRingSeqnoMESA_EXT: return "vkWaitRingSeqnoMESA";
     case VK_COMMAND_TYPE_vkCopyImageToMemoryMESA_EXT: return "vkCopyImageToMemoryMESA";
     case VK_COMMAND_TYPE_vkCopyMemoryToImageMESA_EXT: return "vkCopyMemoryToImageMESA";
+    case VK_COMMAND_TYPE_vkWriteSamplerDescriptorMESA_EXT: return "vkWriteSamplerDescriptorMESA";
+    case VK_COMMAND_TYPE_vkWriteResourceDescriptorMESA_EXT: return "vkWriteResourceDescriptorMESA";
     case VK_COMMAND_TYPE_vkGetDeviceProcAddr_EXT: return "vkGetDeviceProcAddr";
     case VK_COMMAND_TYPE_vkGetInstanceProcAddr_EXT: return "vkGetInstanceProcAddr";
     case VK_COMMAND_TYPE_vkMapMemory_EXT: return "vkMapMemory";
@@ -377,11 +387,13 @@ static inline const char *vn_dispatch_command_name(VkCommandTypeEXT type)
     case VK_COMMAND_TYPE_vkCopyImageToMemory_EXT: return "vkCopyImageToMemory";
     case VK_COMMAND_TYPE_vkMapMemory2_EXT: return "vkMapMemory2";
     case VK_COMMAND_TYPE_vkCmdPushDescriptorSetWithTemplate2_EXT: return "vkCmdPushDescriptorSetWithTemplate2";
+    case VK_COMMAND_TYPE_vkWriteSamplerDescriptorsEXT_EXT: return "vkWriteSamplerDescriptorsEXT";
+    case VK_COMMAND_TYPE_vkWriteResourceDescriptorsEXT_EXT: return "vkWriteResourceDescriptorsEXT";
     default: return "unknown";
     }
 }
 
-static void (*const vn_dispatch_table[335])(struct vn_dispatch_context *ctx, VkCommandFlagsEXT flags) = {
+static void (*const vn_dispatch_table[346])(struct vn_dispatch_context *ctx, VkCommandFlagsEXT flags) = {
     [VK_COMMAND_TYPE_vkCreateInstance_EXT] = vn_dispatch_vkCreateInstance,
     [VK_COMMAND_TYPE_vkDestroyInstance_EXT] = vn_dispatch_vkDestroyInstance,
     [VK_COMMAND_TYPE_vkEnumeratePhysicalDevices_EXT] = vn_dispatch_vkEnumeratePhysicalDevices,
@@ -682,6 +694,13 @@ static void (*const vn_dispatch_table[335])(struct vn_dispatch_context *ctx, VkC
     [VK_COMMAND_TYPE_vkCmdSetRenderingAttachmentLocations_EXT] = vn_dispatch_vkCmdSetRenderingAttachmentLocations,
     [VK_COMMAND_TYPE_vkCmdSetRenderingInputAttachmentIndices_EXT] = vn_dispatch_vkCmdSetRenderingInputAttachmentIndices,
     [VK_COMMAND_TYPE_vkCmdSetDepthClampRangeEXT_EXT] = vn_dispatch_vkCmdSetDepthClampRangeEXT,
+    [VK_COMMAND_TYPE_vkCmdBindSamplerHeapEXT_EXT] = vn_dispatch_vkCmdBindSamplerHeapEXT,
+    [VK_COMMAND_TYPE_vkCmdBindResourceHeapEXT_EXT] = vn_dispatch_vkCmdBindResourceHeapEXT,
+    [VK_COMMAND_TYPE_vkCmdPushDataEXT_EXT] = vn_dispatch_vkCmdPushDataEXT,
+    [VK_COMMAND_TYPE_vkRegisterCustomBorderColorEXT_EXT] = vn_dispatch_vkRegisterCustomBorderColorEXT,
+    [VK_COMMAND_TYPE_vkUnregisterCustomBorderColorEXT_EXT] = vn_dispatch_vkUnregisterCustomBorderColorEXT,
+    [VK_COMMAND_TYPE_vkGetImageOpaqueCaptureDataEXT_EXT] = vn_dispatch_vkGetImageOpaqueCaptureDataEXT,
+    [VK_COMMAND_TYPE_vkGetPhysicalDeviceDescriptorSizeEXT_EXT] = vn_dispatch_vkGetPhysicalDeviceDescriptorSizeEXT,
     [VK_COMMAND_TYPE_vkSetReplyCommandStreamMESA_EXT] = vn_dispatch_vkSetReplyCommandStreamMESA,
     [VK_COMMAND_TYPE_vkSeekReplyCommandStreamMESA_EXT] = vn_dispatch_vkSeekReplyCommandStreamMESA,
     [VK_COMMAND_TYPE_vkExecuteCommandStreamsMESA_EXT] = vn_dispatch_vkExecuteCommandStreamsMESA,
@@ -698,6 +717,8 @@ static void (*const vn_dispatch_table[335])(struct vn_dispatch_context *ctx, VkC
     [VK_COMMAND_TYPE_vkWaitRingSeqnoMESA_EXT] = vn_dispatch_vkWaitRingSeqnoMESA,
     [VK_COMMAND_TYPE_vkCopyImageToMemoryMESA_EXT] = vn_dispatch_vkCopyImageToMemoryMESA,
     [VK_COMMAND_TYPE_vkCopyMemoryToImageMESA_EXT] = vn_dispatch_vkCopyMemoryToImageMESA,
+    [VK_COMMAND_TYPE_vkWriteSamplerDescriptorMESA_EXT] = vn_dispatch_vkWriteSamplerDescriptorMESA,
+    [VK_COMMAND_TYPE_vkWriteResourceDescriptorMESA_EXT] = vn_dispatch_vkWriteResourceDescriptorMESA,
 };
 
 static inline void vn_dispatch_command(struct vn_dispatch_context *ctx)
@@ -709,7 +730,7 @@ static inline void vn_dispatch_command(struct vn_dispatch_context *ctx)
     vn_decode_VkFlags(ctx->decoder, &cmd_flags);
 
     {
-        if (cmd_type < 335 && vn_dispatch_table[cmd_type])
+        if (cmd_type < 346 && vn_dispatch_table[cmd_type])
             vn_dispatch_table[cmd_type](ctx, cmd_flags);
         else
             vn_cs_decoder_set_fatal(ctx->decoder);

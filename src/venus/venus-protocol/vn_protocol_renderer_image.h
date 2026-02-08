@@ -278,6 +278,70 @@ vn_replace_VkImageDrmFormatModifierExplicitCreateInfoEXT_handle(VkImageDrmFormat
     } while (pnext);
 }
 
+/* struct VkOpaqueCaptureDataCreateInfoEXT chain */
+
+static inline void *
+vn_decode_VkOpaqueCaptureDataCreateInfoEXT_pnext_temp(struct vn_cs_decoder *dec)
+{
+    /* no known/supported struct */
+    if (vn_decode_simple_pointer(dec))
+        vn_cs_decoder_set_fatal(dec);
+    return NULL;
+}
+
+static inline void
+vn_decode_VkOpaqueCaptureDataCreateInfoEXT_self_temp(struct vn_cs_decoder *dec, VkOpaqueCaptureDataCreateInfoEXT *val)
+{
+    /* skip val->{sType,pNext} */
+    if (vn_decode_simple_pointer(dec)) {
+        val->pData = vn_cs_decoder_alloc_temp(dec, sizeof(*val->pData));
+        if (!val->pData) return;
+        vn_decode_VkHostAddressRangeConstEXT_temp(dec, (VkHostAddressRangeConstEXT *)val->pData);
+    } else {
+        val->pData = NULL;
+    }
+}
+
+static inline void
+vn_decode_VkOpaqueCaptureDataCreateInfoEXT_temp(struct vn_cs_decoder *dec, VkOpaqueCaptureDataCreateInfoEXT *val)
+{
+    VkStructureType stype;
+    vn_decode_VkStructureType(dec, &stype);
+    if (stype != VK_STRUCTURE_TYPE_OPAQUE_CAPTURE_DATA_CREATE_INFO_EXT)
+        vn_cs_decoder_set_fatal(dec);
+
+    val->sType = stype;
+    val->pNext = vn_decode_VkOpaqueCaptureDataCreateInfoEXT_pnext_temp(dec);
+    vn_decode_VkOpaqueCaptureDataCreateInfoEXT_self_temp(dec, val);
+}
+
+static inline void
+vn_replace_VkOpaqueCaptureDataCreateInfoEXT_handle_self(VkOpaqueCaptureDataCreateInfoEXT *val)
+{
+    /* skip val->sType */
+    /* skip val->pNext */
+    if (val->pData)
+        vn_replace_VkHostAddressRangeConstEXT_handle((VkHostAddressRangeConstEXT *)val->pData);
+}
+
+static inline void
+vn_replace_VkOpaqueCaptureDataCreateInfoEXT_handle(VkOpaqueCaptureDataCreateInfoEXT *val)
+{
+    struct VkBaseOutStructure *pnext = (struct VkBaseOutStructure *)val;
+
+    do {
+        switch ((int32_t)pnext->sType) {
+        case VK_STRUCTURE_TYPE_OPAQUE_CAPTURE_DATA_CREATE_INFO_EXT:
+            vn_replace_VkOpaqueCaptureDataCreateInfoEXT_handle_self((VkOpaqueCaptureDataCreateInfoEXT *)pnext);
+            break;
+        default:
+            /* ignore unknown/unsupported struct */
+            break;
+        }
+        pnext = pnext->pNext;
+    } while (pnext);
+}
+
 /* struct VkImageCreateInfo chain */
 
 static inline void *
@@ -329,6 +393,14 @@ vn_decode_VkImageCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
             pnext->sType = stype;
             pnext->pNext = vn_decode_VkImageCreateInfo_pnext_temp(dec);
             vn_decode_VkImageStencilUsageCreateInfo_self_temp(dec, (VkImageStencilUsageCreateInfo *)pnext);
+        }
+        break;
+    case VK_STRUCTURE_TYPE_OPAQUE_CAPTURE_DATA_CREATE_INFO_EXT:
+        pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkOpaqueCaptureDataCreateInfoEXT));
+        if (pnext) {
+            pnext->sType = stype;
+            pnext->pNext = vn_decode_VkImageCreateInfo_pnext_temp(dec);
+            vn_decode_VkOpaqueCaptureDataCreateInfoEXT_self_temp(dec, (VkOpaqueCaptureDataCreateInfoEXT *)pnext);
         }
         break;
     default:
@@ -425,6 +497,9 @@ vn_replace_VkImageCreateInfo_handle(VkImageCreateInfo *val)
             break;
         case VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO:
             vn_replace_VkImageStencilUsageCreateInfo_handle_self((VkImageStencilUsageCreateInfo *)pnext);
+            break;
+        case VK_STRUCTURE_TYPE_OPAQUE_CAPTURE_DATA_CREATE_INFO_EXT:
+            vn_replace_VkOpaqueCaptureDataCreateInfoEXT_handle_self((VkOpaqueCaptureDataCreateInfoEXT *)pnext);
             break;
         default:
             /* ignore unknown/unsupported struct */

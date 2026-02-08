@@ -1863,6 +1863,48 @@ vn_decode_VkBufferUsageFlagBits2(struct vn_cs_decoder *dec, VkBufferUsageFlagBit
     vn_decode_uint64_t(dec, (uint64_t *)val);
 }
 
+/* typedef VkFlags64 VkTensorViewCreateFlagBitsARM */
+
+static inline size_t
+vn_sizeof_VkTensorViewCreateFlagBitsARM(const VkTensorViewCreateFlagBitsARM *val)
+{
+    assert(sizeof(*val) == sizeof(uint64_t));
+    return vn_sizeof_uint64_t((const uint64_t *)val);
+}
+
+static inline void
+vn_encode_VkTensorViewCreateFlagBitsARM(struct vn_cs_encoder *enc, const VkTensorViewCreateFlagBitsARM *val)
+{
+    vn_encode_uint64_t(enc, (const uint64_t *)val);
+}
+
+static inline void
+vn_decode_VkTensorViewCreateFlagBitsARM(struct vn_cs_decoder *dec, VkTensorViewCreateFlagBitsARM *val)
+{
+    vn_decode_uint64_t(dec, (uint64_t *)val);
+}
+
+/* enum VkSpirvResourceTypeFlagBitsEXT */
+
+static inline size_t
+vn_sizeof_VkSpirvResourceTypeFlagBitsEXT(const VkSpirvResourceTypeFlagBitsEXT *val)
+{
+    assert(sizeof(*val) == sizeof(int32_t));
+    return vn_sizeof_int32_t((const int32_t *)val);
+}
+
+static inline void
+vn_encode_VkSpirvResourceTypeFlagBitsEXT(struct vn_cs_encoder *enc, const VkSpirvResourceTypeFlagBitsEXT *val)
+{
+    vn_encode_int32_t(enc, (const int32_t *)val);
+}
+
+static inline void
+vn_decode_VkSpirvResourceTypeFlagBitsEXT(struct vn_cs_decoder *dec, VkSpirvResourceTypeFlagBitsEXT *val)
+{
+    vn_decode_int32_t(dec, (int32_t *)val);
+}
+
 /* enum VkPeerMemoryFeatureFlagBits */
 
 static inline size_t
@@ -3533,6 +3575,27 @@ vn_encode_VkDepthClampModeEXT(struct vn_cs_encoder *enc, const VkDepthClampModeE
 
 static inline void
 vn_decode_VkDepthClampModeEXT(struct vn_cs_decoder *dec, VkDepthClampModeEXT *val)
+{
+    vn_decode_int32_t(dec, (int32_t *)val);
+}
+
+/* enum VkDescriptorMappingSourceEXT */
+
+static inline size_t
+vn_sizeof_VkDescriptorMappingSourceEXT(const VkDescriptorMappingSourceEXT *val)
+{
+    assert(sizeof(*val) == sizeof(int32_t));
+    return vn_sizeof_int32_t((const int32_t *)val);
+}
+
+static inline void
+vn_encode_VkDescriptorMappingSourceEXT(struct vn_cs_encoder *enc, const VkDescriptorMappingSourceEXT *val)
+{
+    vn_encode_int32_t(enc, (const int32_t *)val);
+}
+
+static inline void
+vn_decode_VkDescriptorMappingSourceEXT(struct vn_cs_decoder *dec, VkDescriptorMappingSourceEXT *val)
 {
     vn_decode_int32_t(dec, (int32_t *)val);
 }
