@@ -153,6 +153,7 @@ static const struct vn_info_extension_table vkr_extension_table = {
    .EXT_depth_clip_control = true,
    .EXT_depth_clip_enable = true,
    .EXT_depth_range_unrestricted = true,
+   .EXT_descriptor_heap = true,
    .EXT_dynamic_rendering_unused_attachments = true,
    .EXT_extended_dynamic_state3 = true,
    .EXT_external_memory_acquire_unmodified = true,

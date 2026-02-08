@@ -20,6 +20,7 @@
 #include "vkr_command_buffer.h"
 #include "vkr_context.h"
 #include "vkr_cs.h"
+#include "vkr_descriptor_heap.h"
 #include "vkr_descriptor_set.h"
 #include "vkr_device.h"
 #include "vkr_device_memory.h"
@@ -102,6 +103,7 @@ vkr_context_init_dispatch(struct vkr_context *ctx)
    vkr_context_init_sampler_dispatch(ctx);
    vkr_context_init_sampler_ycbcr_conversion_dispatch(ctx);
 
+   vkr_context_init_descriptor_heap_dispatch(ctx);
    vkr_context_init_descriptor_set_layout_dispatch(ctx);
    vkr_context_init_descriptor_pool_dispatch(ctx);
    vkr_context_init_descriptor_set_dispatch(ctx);

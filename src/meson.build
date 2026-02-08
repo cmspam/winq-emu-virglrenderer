@@ -68,6 +68,7 @@ venus_sources = [
    'venus/vkr_common.c',
    'venus/vkr_context.c',
    'venus/vkr_cs.c',
+   'venus/vkr_descriptor_heap.c',
    'venus/vkr_descriptor_set.c',
    'venus/vkr_device.c',
    'venus/vkr_device_memory.c',

@@ -1246,6 +1246,27 @@ vkr_dispatch_vkCmdDrawMeshTasksIndirectCountEXT(
                 args->stride);
 }
 
+static void
+vkr_dispatch_vkCmdBindSamplerHeapEXT(UNUSED struct vn_dispatch_context *dispatch,
+                                     struct vn_command_vkCmdBindSamplerHeapEXT *args)
+{
+   VKR_CMD_CALL(CmdBindSamplerHeapEXT, args, args->pBindInfo);
+}
+
+static void
+vkr_dispatch_vkCmdBindResourceHeapEXT(UNUSED struct vn_dispatch_context *dispatch,
+                                      struct vn_command_vkCmdBindResourceHeapEXT *args)
+{
+   VKR_CMD_CALL(CmdBindResourceHeapEXT, args, args->pBindInfo);
+}
+
+static void
+vkr_dispatch_vkCmdPushDataEXT(UNUSED struct vn_dispatch_context *dispatch,
+                              struct vn_command_vkCmdPushDataEXT *args)
+{
+   VKR_CMD_CALL(CmdPushDataEXT, args, args->pPushDataInfo);
+}
+
 void
 vkr_context_init_command_pool_dispatch(struct vkr_context *ctx)
 {
@@ -1501,4 +1522,9 @@ vkr_context_init_command_buffer_dispatch(struct vkr_context *ctx)
       vkr_dispatch_vkCmdDrawMeshTasksIndirectEXT;
    dispatch->dispatch_vkCmdDrawMeshTasksIndirectCountEXT =
       vkr_dispatch_vkCmdDrawMeshTasksIndirectCountEXT;
+
+   /* VK_EXT_descriptor_heap */
+   dispatch->dispatch_vkCmdBindSamplerHeapEXT = vkr_dispatch_vkCmdBindSamplerHeapEXT;
+   dispatch->dispatch_vkCmdBindResourceHeapEXT = vkr_dispatch_vkCmdBindResourceHeapEXT;
+   dispatch->dispatch_vkCmdPushDataEXT = vkr_dispatch_vkCmdPushDataEXT;
 }

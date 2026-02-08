@@ -830,6 +830,20 @@ vkr_dispatch_vkGetPhysicalDeviceMultisamplePropertiesEXT(
                                                  args->pMultisampleProperties);
 }
 
+static void
+vkr_dispatch_vkGetPhysicalDeviceDescriptorSizeEXT(
+   UNUSED struct vn_dispatch_context *ctx,
+   struct vn_command_vkGetPhysicalDeviceDescriptorSizeEXT *args)
+{
+   struct vkr_physical_device *physical_dev =
+      vkr_physical_device_from_handle(args->physicalDevice);
+   struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+
+   vn_replace_vkGetPhysicalDeviceDescriptorSizeEXT_args_handle(args);
+   args->ret =
+      vk->GetPhysicalDeviceDescriptorSizeEXT(args->physicalDevice, args->descriptorType);
+}
+
 void
 vkr_context_init_physical_device_dispatch(struct vkr_context *ctx)
 {
@@ -893,4 +907,8 @@ vkr_context_init_physical_device_dispatch(struct vkr_context *ctx)
    /* VK_EXT_sample_locations */
    dispatch->dispatch_vkGetPhysicalDeviceMultisamplePropertiesEXT =
       vkr_dispatch_vkGetPhysicalDeviceMultisamplePropertiesEXT;
+
+   /* VK_EXT_descriptor_heap */
+   dispatch->dispatch_vkGetPhysicalDeviceDescriptorSizeEXT =
+      vkr_dispatch_vkGetPhysicalDeviceDescriptorSizeEXT;
 }
