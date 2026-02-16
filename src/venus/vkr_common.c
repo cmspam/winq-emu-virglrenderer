@@ -130,6 +130,7 @@ static const struct vn_info_extension_table vkr_extension_table = {
    .KHR_robustness2 = true,
    .KHR_shader_bfloat16 = true,
    .KHR_shader_clock = true,
+   .KHR_shader_fma = true,
    .KHR_shader_maximal_reconvergence = true,
    .KHR_shader_quad_control = true,
    .KHR_shader_relaxed_extended_instruction = true,
