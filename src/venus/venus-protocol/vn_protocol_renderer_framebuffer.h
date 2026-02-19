@@ -182,7 +182,7 @@ vn_decode_VkFramebufferCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkFramebufferAttachmentsCreateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkFramebufferCreateInfo_pnext_temp(dec);
+            ((VkFramebufferAttachmentsCreateInfo *)pnext)->pNext = vn_decode_VkFramebufferCreateInfo_pnext_temp(dec);
             vn_decode_VkFramebufferAttachmentsCreateInfo_self_temp(dec, (VkFramebufferAttachmentsCreateInfo *)pnext);
         }
         break;

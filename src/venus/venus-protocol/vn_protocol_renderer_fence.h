@@ -98,7 +98,7 @@ vn_decode_VkFenceCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkExportFenceCreateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkFenceCreateInfo_pnext_temp(dec);
+            ((VkExportFenceCreateInfo *)pnext)->pNext = vn_decode_VkFenceCreateInfo_pnext_temp(dec);
             vn_decode_VkExportFenceCreateInfo_self_temp(dec, (VkExportFenceCreateInfo *)pnext);
         }
         break;

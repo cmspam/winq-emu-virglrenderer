@@ -98,7 +98,7 @@ vn_decode_VkSemaphoreCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkExportSemaphoreCreateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkSemaphoreCreateInfo_pnext_temp(dec);
+            ((VkExportSemaphoreCreateInfo *)pnext)->pNext = vn_decode_VkSemaphoreCreateInfo_pnext_temp(dec);
             vn_decode_VkExportSemaphoreCreateInfo_self_temp(dec, (VkExportSemaphoreCreateInfo *)pnext);
         }
         break;
@@ -106,7 +106,7 @@ vn_decode_VkSemaphoreCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkSemaphoreTypeCreateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkSemaphoreCreateInfo_pnext_temp(dec);
+            ((VkSemaphoreTypeCreateInfo *)pnext)->pNext = vn_decode_VkSemaphoreCreateInfo_pnext_temp(dec);
             vn_decode_VkSemaphoreTypeCreateInfo_self_temp(dec, (VkSemaphoreTypeCreateInfo *)pnext);
         }
         break;

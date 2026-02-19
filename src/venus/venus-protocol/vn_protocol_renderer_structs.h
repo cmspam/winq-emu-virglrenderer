@@ -756,7 +756,7 @@ vn_decode_VkImageViewCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkImageViewUsageCreateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkImageViewCreateInfo_pnext_temp(dec);
+            ((VkImageViewUsageCreateInfo *)pnext)->pNext = vn_decode_VkImageViewCreateInfo_pnext_temp(dec);
             vn_decode_VkImageViewUsageCreateInfo_self_temp(dec, (VkImageViewUsageCreateInfo *)pnext);
         }
         break;
@@ -764,7 +764,7 @@ vn_decode_VkImageViewCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkImageViewSlicedCreateInfoEXT));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkImageViewCreateInfo_pnext_temp(dec);
+            ((VkImageViewSlicedCreateInfoEXT *)pnext)->pNext = vn_decode_VkImageViewCreateInfo_pnext_temp(dec);
             vn_decode_VkImageViewSlicedCreateInfoEXT_self_temp(dec, (VkImageViewSlicedCreateInfoEXT *)pnext);
         }
         break;
@@ -772,7 +772,7 @@ vn_decode_VkImageViewCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkSamplerYcbcrConversionInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkImageViewCreateInfo_pnext_temp(dec);
+            ((VkSamplerYcbcrConversionInfo *)pnext)->pNext = vn_decode_VkImageViewCreateInfo_pnext_temp(dec);
             vn_decode_VkSamplerYcbcrConversionInfo_self_temp(dec, (VkSamplerYcbcrConversionInfo *)pnext);
         }
         break;
@@ -780,7 +780,7 @@ vn_decode_VkImageViewCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkImageViewMinLodCreateInfoEXT));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkImageViewCreateInfo_pnext_temp(dec);
+            ((VkImageViewMinLodCreateInfoEXT *)pnext)->pNext = vn_decode_VkImageViewCreateInfo_pnext_temp(dec);
             vn_decode_VkImageViewMinLodCreateInfoEXT_self_temp(dec, (VkImageViewMinLodCreateInfoEXT *)pnext);
         }
         break;
@@ -1212,7 +1212,7 @@ vn_decode_VkSamplerCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkSamplerYcbcrConversionInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkSamplerCreateInfo_pnext_temp(dec);
+            ((VkSamplerYcbcrConversionInfo *)pnext)->pNext = vn_decode_VkSamplerCreateInfo_pnext_temp(dec);
             vn_decode_VkSamplerYcbcrConversionInfo_self_temp(dec, (VkSamplerYcbcrConversionInfo *)pnext);
         }
         break;
@@ -1220,7 +1220,7 @@ vn_decode_VkSamplerCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkSamplerReductionModeCreateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkSamplerCreateInfo_pnext_temp(dec);
+            ((VkSamplerReductionModeCreateInfo *)pnext)->pNext = vn_decode_VkSamplerCreateInfo_pnext_temp(dec);
             vn_decode_VkSamplerReductionModeCreateInfo_self_temp(dec, (VkSamplerReductionModeCreateInfo *)pnext);
         }
         break;
@@ -1228,7 +1228,7 @@ vn_decode_VkSamplerCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkSamplerCustomBorderColorCreateInfoEXT));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkSamplerCreateInfo_pnext_temp(dec);
+            ((VkSamplerCustomBorderColorCreateInfoEXT *)pnext)->pNext = vn_decode_VkSamplerCreateInfo_pnext_temp(dec);
             vn_decode_VkSamplerCustomBorderColorCreateInfoEXT_self_temp(dec, (VkSamplerCustomBorderColorCreateInfoEXT *)pnext);
         }
         break;
@@ -1236,7 +1236,7 @@ vn_decode_VkSamplerCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkSamplerBorderColorComponentMappingCreateInfoEXT));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkSamplerCreateInfo_pnext_temp(dec);
+            ((VkSamplerBorderColorComponentMappingCreateInfoEXT *)pnext)->pNext = vn_decode_VkSamplerCreateInfo_pnext_temp(dec);
             vn_decode_VkSamplerBorderColorComponentMappingCreateInfoEXT_self_temp(dec, (VkSamplerBorderColorComponentMappingCreateInfoEXT *)pnext);
         }
         break;
@@ -1244,7 +1244,7 @@ vn_decode_VkSamplerCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkSamplerCustomBorderColorIndexCreateInfoEXT));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkSamplerCreateInfo_pnext_temp(dec);
+            ((VkSamplerCustomBorderColorIndexCreateInfoEXT *)pnext)->pNext = vn_decode_VkSamplerCreateInfo_pnext_temp(dec);
             vn_decode_VkSamplerCustomBorderColorIndexCreateInfoEXT_self_temp(dec, (VkSamplerCustomBorderColorIndexCreateInfoEXT *)pnext);
         }
         break;
@@ -2172,7 +2172,7 @@ vn_decode_VkWriteDescriptorSet_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkWriteDescriptorSetInlineUniformBlock));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkWriteDescriptorSet_pnext_temp(dec);
+            ((VkWriteDescriptorSetInlineUniformBlock *)pnext)->pNext = vn_decode_VkWriteDescriptorSet_pnext_temp(dec);
             vn_decode_VkWriteDescriptorSetInlineUniformBlock_self_temp(dec, (VkWriteDescriptorSetInlineUniformBlock *)pnext);
         }
         break;
@@ -2180,7 +2180,7 @@ vn_decode_VkWriteDescriptorSet_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkWriteDescriptorSetAccelerationStructureKHR));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkWriteDescriptorSet_pnext_temp(dec);
+            ((VkWriteDescriptorSetAccelerationStructureKHR *)pnext)->pNext = vn_decode_VkWriteDescriptorSet_pnext_temp(dec);
             vn_decode_VkWriteDescriptorSetAccelerationStructureKHR_self_temp(dec, (VkWriteDescriptorSetAccelerationStructureKHR *)pnext);
         }
         break;
@@ -2464,7 +2464,7 @@ vn_encode_VkMemoryRequirements2_pnext(struct vn_cs_encoder *enc, const void *val
         case VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS:
             vn_encode_simple_pointer(enc, pnext);
             vn_encode_VkStructureType(enc, &pnext->sType);
-            vn_encode_VkMemoryRequirements2_pnext(enc, pnext->pNext);
+            vn_encode_VkMemoryRequirements2_pnext(enc, ((const VkMemoryDedicatedRequirements *)pnext)->pNext);
             vn_encode_VkMemoryDedicatedRequirements_self(enc, (const VkMemoryDedicatedRequirements *)pnext);
             return;
         default:
@@ -2508,7 +2508,7 @@ vn_decode_VkMemoryRequirements2_pnext_partial_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkMemoryDedicatedRequirements));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkMemoryRequirements2_pnext_partial_temp(dec);
+            ((VkMemoryDedicatedRequirements *)pnext)->pNext = vn_decode_VkMemoryRequirements2_pnext_partial_temp(dec);
             vn_decode_VkMemoryDedicatedRequirements_self_partial_temp(dec, (VkMemoryDedicatedRequirements *)pnext);
         }
         break;

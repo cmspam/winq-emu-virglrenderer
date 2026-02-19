@@ -34,7 +34,7 @@ vn_decode_VkBufferViewCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkBufferUsageFlags2CreateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkBufferViewCreateInfo_pnext_temp(dec);
+            ((VkBufferUsageFlags2CreateInfo *)pnext)->pNext = vn_decode_VkBufferViewCreateInfo_pnext_temp(dec);
             vn_decode_VkBufferUsageFlags2CreateInfo_self_temp(dec, (VkBufferUsageFlags2CreateInfo *)pnext);
         }
         break;

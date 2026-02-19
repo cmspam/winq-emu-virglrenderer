@@ -136,7 +136,7 @@ vn_decode_VkDescriptorSetLayoutCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkDescriptorSetLayoutBindingFlagsCreateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkDescriptorSetLayoutCreateInfo_pnext_temp(dec);
+            ((VkDescriptorSetLayoutBindingFlagsCreateInfo *)pnext)->pNext = vn_decode_VkDescriptorSetLayoutCreateInfo_pnext_temp(dec);
             vn_decode_VkDescriptorSetLayoutBindingFlagsCreateInfo_self_temp(dec, (VkDescriptorSetLayoutBindingFlagsCreateInfo *)pnext);
         }
         break;
@@ -144,7 +144,7 @@ vn_decode_VkDescriptorSetLayoutCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkMutableDescriptorTypeCreateInfoEXT));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkDescriptorSetLayoutCreateInfo_pnext_temp(dec);
+            ((VkMutableDescriptorTypeCreateInfoEXT *)pnext)->pNext = vn_decode_VkDescriptorSetLayoutCreateInfo_pnext_temp(dec);
             vn_decode_VkMutableDescriptorTypeCreateInfoEXT_self_temp(dec, (VkMutableDescriptorTypeCreateInfoEXT *)pnext);
         }
         break;
@@ -292,7 +292,7 @@ vn_encode_VkDescriptorSetLayoutSupport_pnext(struct vn_cs_encoder *enc, const vo
         case VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_LAYOUT_SUPPORT:
             vn_encode_simple_pointer(enc, pnext);
             vn_encode_VkStructureType(enc, &pnext->sType);
-            vn_encode_VkDescriptorSetLayoutSupport_pnext(enc, pnext->pNext);
+            vn_encode_VkDescriptorSetLayoutSupport_pnext(enc, ((const VkDescriptorSetVariableDescriptorCountLayoutSupport *)pnext)->pNext);
             vn_encode_VkDescriptorSetVariableDescriptorCountLayoutSupport_self(enc, (const VkDescriptorSetVariableDescriptorCountLayoutSupport *)pnext);
             return;
         default:
@@ -336,7 +336,7 @@ vn_decode_VkDescriptorSetLayoutSupport_pnext_partial_temp(struct vn_cs_decoder *
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkDescriptorSetVariableDescriptorCountLayoutSupport));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkDescriptorSetLayoutSupport_pnext_partial_temp(dec);
+            ((VkDescriptorSetVariableDescriptorCountLayoutSupport *)pnext)->pNext = vn_decode_VkDescriptorSetLayoutSupport_pnext_partial_temp(dec);
             vn_decode_VkDescriptorSetVariableDescriptorCountLayoutSupport_self_partial_temp(dec, (VkDescriptorSetVariableDescriptorCountLayoutSupport *)pnext);
         }
         break;

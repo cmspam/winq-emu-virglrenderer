@@ -261,7 +261,7 @@ vn_decode_VkSubmitInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkDeviceGroupSubmitInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkSubmitInfo_pnext_temp(dec);
+            ((VkDeviceGroupSubmitInfo *)pnext)->pNext = vn_decode_VkSubmitInfo_pnext_temp(dec);
             vn_decode_VkDeviceGroupSubmitInfo_self_temp(dec, (VkDeviceGroupSubmitInfo *)pnext);
         }
         break;
@@ -269,7 +269,7 @@ vn_decode_VkSubmitInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkProtectedSubmitInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkSubmitInfo_pnext_temp(dec);
+            ((VkProtectedSubmitInfo *)pnext)->pNext = vn_decode_VkSubmitInfo_pnext_temp(dec);
             vn_decode_VkProtectedSubmitInfo_self_temp(dec, (VkProtectedSubmitInfo *)pnext);
         }
         break;
@@ -277,7 +277,7 @@ vn_decode_VkSubmitInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkTimelineSemaphoreSubmitInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkSubmitInfo_pnext_temp(dec);
+            ((VkTimelineSemaphoreSubmitInfo *)pnext)->pNext = vn_decode_VkSubmitInfo_pnext_temp(dec);
             vn_decode_VkTimelineSemaphoreSubmitInfo_self_temp(dec, (VkTimelineSemaphoreSubmitInfo *)pnext);
         }
         break;
@@ -615,7 +615,7 @@ vn_decode_VkBindSparseInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkDeviceGroupBindSparseInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkBindSparseInfo_pnext_temp(dec);
+            ((VkDeviceGroupBindSparseInfo *)pnext)->pNext = vn_decode_VkBindSparseInfo_pnext_temp(dec);
             vn_decode_VkDeviceGroupBindSparseInfo_self_temp(dec, (VkDeviceGroupBindSparseInfo *)pnext);
         }
         break;
@@ -623,7 +623,7 @@ vn_decode_VkBindSparseInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkTimelineSemaphoreSubmitInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkBindSparseInfo_pnext_temp(dec);
+            ((VkTimelineSemaphoreSubmitInfo *)pnext)->pNext = vn_decode_VkBindSparseInfo_pnext_temp(dec);
             vn_decode_VkTimelineSemaphoreSubmitInfo_self_temp(dec, (VkTimelineSemaphoreSubmitInfo *)pnext);
         }
         break;

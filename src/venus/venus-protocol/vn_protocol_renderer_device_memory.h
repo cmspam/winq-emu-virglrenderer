@@ -333,7 +333,7 @@ vn_decode_VkMemoryAllocateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkExportMemoryAllocateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkMemoryAllocateInfo_pnext_temp(dec);
+            ((VkExportMemoryAllocateInfo *)pnext)->pNext = vn_decode_VkMemoryAllocateInfo_pnext_temp(dec);
             vn_decode_VkExportMemoryAllocateInfo_self_temp(dec, (VkExportMemoryAllocateInfo *)pnext);
         }
         break;
@@ -341,7 +341,7 @@ vn_decode_VkMemoryAllocateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkMemoryAllocateFlagsInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkMemoryAllocateInfo_pnext_temp(dec);
+            ((VkMemoryAllocateFlagsInfo *)pnext)->pNext = vn_decode_VkMemoryAllocateInfo_pnext_temp(dec);
             vn_decode_VkMemoryAllocateFlagsInfo_self_temp(dec, (VkMemoryAllocateFlagsInfo *)pnext);
         }
         break;
@@ -349,7 +349,7 @@ vn_decode_VkMemoryAllocateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkMemoryDedicatedAllocateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkMemoryAllocateInfo_pnext_temp(dec);
+            ((VkMemoryDedicatedAllocateInfo *)pnext)->pNext = vn_decode_VkMemoryAllocateInfo_pnext_temp(dec);
             vn_decode_VkMemoryDedicatedAllocateInfo_self_temp(dec, (VkMemoryDedicatedAllocateInfo *)pnext);
         }
         break;
@@ -357,7 +357,7 @@ vn_decode_VkMemoryAllocateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkMemoryOpaqueCaptureAddressAllocateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkMemoryAllocateInfo_pnext_temp(dec);
+            ((VkMemoryOpaqueCaptureAddressAllocateInfo *)pnext)->pNext = vn_decode_VkMemoryAllocateInfo_pnext_temp(dec);
             vn_decode_VkMemoryOpaqueCaptureAddressAllocateInfo_self_temp(dec, (VkMemoryOpaqueCaptureAddressAllocateInfo *)pnext);
         }
         break;
@@ -365,7 +365,7 @@ vn_decode_VkMemoryAllocateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkImportMemoryResourceInfoMESA));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkMemoryAllocateInfo_pnext_temp(dec);
+            ((VkImportMemoryResourceInfoMESA *)pnext)->pNext = vn_decode_VkMemoryAllocateInfo_pnext_temp(dec);
             vn_decode_VkImportMemoryResourceInfoMESA_self_temp(dec, (VkImportMemoryResourceInfoMESA *)pnext);
         }
         break;
@@ -687,7 +687,7 @@ vn_encode_VkMemoryResourcePropertiesMESA_pnext(struct vn_cs_encoder *enc, const 
         case VK_STRUCTURE_TYPE_MEMORY_RESOURCE_ALLOCATION_SIZE_PROPERTIES_MESA:
             vn_encode_simple_pointer(enc, pnext);
             vn_encode_VkStructureType(enc, &pnext->sType);
-            vn_encode_VkMemoryResourcePropertiesMESA_pnext(enc, pnext->pNext);
+            vn_encode_VkMemoryResourcePropertiesMESA_pnext(enc, ((const VkMemoryResourceAllocationSizePropertiesMESA *)pnext)->pNext);
             vn_encode_VkMemoryResourceAllocationSizePropertiesMESA_self(enc, (const VkMemoryResourceAllocationSizePropertiesMESA *)pnext);
             return;
         default:
@@ -731,7 +731,7 @@ vn_decode_VkMemoryResourcePropertiesMESA_pnext_partial_temp(struct vn_cs_decoder
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkMemoryResourceAllocationSizePropertiesMESA));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkMemoryResourcePropertiesMESA_pnext_partial_temp(dec);
+            ((VkMemoryResourceAllocationSizePropertiesMESA *)pnext)->pNext = vn_decode_VkMemoryResourcePropertiesMESA_pnext_partial_temp(dec);
             vn_decode_VkMemoryResourceAllocationSizePropertiesMESA_self_partial_temp(dec, (VkMemoryResourceAllocationSizePropertiesMESA *)pnext);
         }
         break;

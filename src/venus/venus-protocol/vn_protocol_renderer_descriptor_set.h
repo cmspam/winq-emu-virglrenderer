@@ -107,7 +107,7 @@ vn_decode_VkDescriptorSetAllocateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkDescriptorSetVariableDescriptorCountAllocateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkDescriptorSetAllocateInfo_pnext_temp(dec);
+            ((VkDescriptorSetVariableDescriptorCountAllocateInfo *)pnext)->pNext = vn_decode_VkDescriptorSetAllocateInfo_pnext_temp(dec);
             vn_decode_VkDescriptorSetVariableDescriptorCountAllocateInfo_self_temp(dec, (VkDescriptorSetVariableDescriptorCountAllocateInfo *)pnext);
         }
         break;

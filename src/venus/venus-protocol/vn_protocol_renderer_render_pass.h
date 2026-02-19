@@ -369,7 +369,7 @@ vn_decode_VkRenderPassCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkRenderPassMultiviewCreateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkRenderPassCreateInfo_pnext_temp(dec);
+            ((VkRenderPassMultiviewCreateInfo *)pnext)->pNext = vn_decode_VkRenderPassCreateInfo_pnext_temp(dec);
             vn_decode_VkRenderPassMultiviewCreateInfo_self_temp(dec, (VkRenderPassMultiviewCreateInfo *)pnext);
         }
         break;
@@ -377,7 +377,7 @@ vn_decode_VkRenderPassCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkRenderPassInputAttachmentAspectCreateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkRenderPassCreateInfo_pnext_temp(dec);
+            ((VkRenderPassInputAttachmentAspectCreateInfo *)pnext)->pNext = vn_decode_VkRenderPassCreateInfo_pnext_temp(dec);
             vn_decode_VkRenderPassInputAttachmentAspectCreateInfo_self_temp(dec, (VkRenderPassInputAttachmentAspectCreateInfo *)pnext);
         }
         break;
@@ -640,7 +640,7 @@ vn_decode_VkAttachmentDescription2_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkAttachmentDescriptionStencilLayout));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkAttachmentDescription2_pnext_temp(dec);
+            ((VkAttachmentDescriptionStencilLayout *)pnext)->pNext = vn_decode_VkAttachmentDescription2_pnext_temp(dec);
             vn_decode_VkAttachmentDescriptionStencilLayout_self_temp(dec, (VkAttachmentDescriptionStencilLayout *)pnext);
         }
         break;
@@ -793,7 +793,7 @@ vn_decode_VkAttachmentReference2_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkAttachmentReferenceStencilLayout));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkAttachmentReference2_pnext_temp(dec);
+            ((VkAttachmentReferenceStencilLayout *)pnext)->pNext = vn_decode_VkAttachmentReference2_pnext_temp(dec);
             vn_decode_VkAttachmentReferenceStencilLayout_self_temp(dec, (VkAttachmentReferenceStencilLayout *)pnext);
         }
         break;
@@ -1011,7 +1011,7 @@ vn_decode_VkSubpassDescription2_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkSubpassDescriptionDepthStencilResolve));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkSubpassDescription2_pnext_temp(dec);
+            ((VkSubpassDescriptionDepthStencilResolve *)pnext)->pNext = vn_decode_VkSubpassDescription2_pnext_temp(dec);
             vn_decode_VkSubpassDescriptionDepthStencilResolve_self_temp(dec, (VkSubpassDescriptionDepthStencilResolve *)pnext);
         }
         break;
@@ -1019,7 +1019,7 @@ vn_decode_VkSubpassDescription2_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkFragmentShadingRateAttachmentInfoKHR));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkSubpassDescription2_pnext_temp(dec);
+            ((VkFragmentShadingRateAttachmentInfoKHR *)pnext)->pNext = vn_decode_VkSubpassDescription2_pnext_temp(dec);
             vn_decode_VkFragmentShadingRateAttachmentInfoKHR_self_temp(dec, (VkFragmentShadingRateAttachmentInfoKHR *)pnext);
         }
         break;
@@ -1027,7 +1027,7 @@ vn_decode_VkSubpassDescription2_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkMultisampledRenderToSingleSampledInfoEXT));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkSubpassDescription2_pnext_temp(dec);
+            ((VkMultisampledRenderToSingleSampledInfoEXT *)pnext)->pNext = vn_decode_VkSubpassDescription2_pnext_temp(dec);
             vn_decode_VkMultisampledRenderToSingleSampledInfoEXT_self_temp(dec, (VkMultisampledRenderToSingleSampledInfoEXT *)pnext);
         }
         break;
@@ -1184,7 +1184,7 @@ vn_decode_VkSubpassDependency2_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkMemoryBarrier2));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkSubpassDependency2_pnext_temp(dec);
+            ((VkMemoryBarrier2 *)pnext)->pNext = vn_decode_VkSubpassDependency2_pnext_temp(dec);
             vn_decode_VkMemoryBarrier2_self_temp(dec, (VkMemoryBarrier2 *)pnext);
         }
         break;

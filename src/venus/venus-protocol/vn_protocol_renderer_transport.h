@@ -182,7 +182,7 @@ vn_decode_VkRingCreateInfoMESA_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkRingMonitorInfoMESA));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkRingCreateInfoMESA_pnext_temp(dec);
+            ((VkRingMonitorInfoMESA *)pnext)->pNext = vn_decode_VkRingCreateInfoMESA_pnext_temp(dec);
             vn_decode_VkRingMonitorInfoMESA_self_temp(dec, (VkRingMonitorInfoMESA *)pnext);
         }
         break;
@@ -190,7 +190,7 @@ vn_decode_VkRingCreateInfoMESA_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkRingPriorityInfoMESA));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkRingCreateInfoMESA_pnext_temp(dec);
+            ((VkRingPriorityInfoMESA *)pnext)->pNext = vn_decode_VkRingCreateInfoMESA_pnext_temp(dec);
             vn_decode_VkRingPriorityInfoMESA_self_temp(dec, (VkRingPriorityInfoMESA *)pnext);
         }
         break;

@@ -205,7 +205,7 @@ vn_decode_VkBufferCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkBufferUsageFlags2CreateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkBufferCreateInfo_pnext_temp(dec);
+            ((VkBufferUsageFlags2CreateInfo *)pnext)->pNext = vn_decode_VkBufferCreateInfo_pnext_temp(dec);
             vn_decode_VkBufferUsageFlags2CreateInfo_self_temp(dec, (VkBufferUsageFlags2CreateInfo *)pnext);
         }
         break;
@@ -213,7 +213,7 @@ vn_decode_VkBufferCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkExternalMemoryBufferCreateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkBufferCreateInfo_pnext_temp(dec);
+            ((VkExternalMemoryBufferCreateInfo *)pnext)->pNext = vn_decode_VkBufferCreateInfo_pnext_temp(dec);
             vn_decode_VkExternalMemoryBufferCreateInfo_self_temp(dec, (VkExternalMemoryBufferCreateInfo *)pnext);
         }
         break;
@@ -221,7 +221,7 @@ vn_decode_VkBufferCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkBufferOpaqueCaptureAddressCreateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkBufferCreateInfo_pnext_temp(dec);
+            ((VkBufferOpaqueCaptureAddressCreateInfo *)pnext)->pNext = vn_decode_VkBufferCreateInfo_pnext_temp(dec);
             vn_decode_VkBufferOpaqueCaptureAddressCreateInfo_self_temp(dec, (VkBufferOpaqueCaptureAddressCreateInfo *)pnext);
         }
         break;
@@ -229,7 +229,7 @@ vn_decode_VkBufferCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkBufferDeviceAddressCreateInfoEXT));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkBufferCreateInfo_pnext_temp(dec);
+            ((VkBufferDeviceAddressCreateInfoEXT *)pnext)->pNext = vn_decode_VkBufferCreateInfo_pnext_temp(dec);
             vn_decode_VkBufferDeviceAddressCreateInfoEXT_self_temp(dec, (VkBufferDeviceAddressCreateInfoEXT *)pnext);
         }
         break;
@@ -403,7 +403,7 @@ vn_decode_VkBindBufferMemoryInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkBindBufferMemoryDeviceGroupInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkBindBufferMemoryInfo_pnext_temp(dec);
+            ((VkBindBufferMemoryDeviceGroupInfo *)pnext)->pNext = vn_decode_VkBindBufferMemoryInfo_pnext_temp(dec);
             vn_decode_VkBindBufferMemoryDeviceGroupInfo_self_temp(dec, (VkBindBufferMemoryDeviceGroupInfo *)pnext);
         }
         break;
@@ -411,7 +411,7 @@ vn_decode_VkBindBufferMemoryInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkBindMemoryStatus));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkBindBufferMemoryInfo_pnext_temp(dec);
+            ((VkBindMemoryStatus *)pnext)->pNext = vn_decode_VkBindBufferMemoryInfo_pnext_temp(dec);
             vn_decode_VkBindMemoryStatus_self_temp(dec, (VkBindMemoryStatus *)pnext);
         }
         break;

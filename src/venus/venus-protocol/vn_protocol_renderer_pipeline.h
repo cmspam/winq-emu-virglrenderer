@@ -661,7 +661,7 @@ vn_decode_VkPipelineShaderStageCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkShaderModuleCreateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkPipelineShaderStageCreateInfo_pnext_temp(dec);
+            ((VkShaderModuleCreateInfo *)pnext)->pNext = vn_decode_VkPipelineShaderStageCreateInfo_pnext_temp(dec);
             vn_decode_VkShaderModuleCreateInfo_self_temp(dec, (VkShaderModuleCreateInfo *)pnext);
         }
         break;
@@ -669,7 +669,7 @@ vn_decode_VkPipelineShaderStageCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkPipelineShaderStageRequiredSubgroupSizeCreateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkPipelineShaderStageCreateInfo_pnext_temp(dec);
+            ((VkPipelineShaderStageRequiredSubgroupSizeCreateInfo *)pnext)->pNext = vn_decode_VkPipelineShaderStageCreateInfo_pnext_temp(dec);
             vn_decode_VkPipelineShaderStageRequiredSubgroupSizeCreateInfo_self_temp(dec, (VkPipelineShaderStageRequiredSubgroupSizeCreateInfo *)pnext);
         }
         break;
@@ -677,7 +677,7 @@ vn_decode_VkPipelineShaderStageCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkPipelineRobustnessCreateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkPipelineShaderStageCreateInfo_pnext_temp(dec);
+            ((VkPipelineRobustnessCreateInfo *)pnext)->pNext = vn_decode_VkPipelineShaderStageCreateInfo_pnext_temp(dec);
             vn_decode_VkPipelineRobustnessCreateInfo_self_temp(dec, (VkPipelineRobustnessCreateInfo *)pnext);
         }
         break;
@@ -685,7 +685,7 @@ vn_decode_VkPipelineShaderStageCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkShaderDescriptorSetAndBindingMappingInfoEXT));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkPipelineShaderStageCreateInfo_pnext_temp(dec);
+            ((VkShaderDescriptorSetAndBindingMappingInfoEXT *)pnext)->pNext = vn_decode_VkPipelineShaderStageCreateInfo_pnext_temp(dec);
             vn_decode_VkShaderDescriptorSetAndBindingMappingInfoEXT_self_temp(dec, (VkShaderDescriptorSetAndBindingMappingInfoEXT *)pnext);
         }
         break;
@@ -922,7 +922,7 @@ vn_decode_VkPipelineVertexInputStateCreateInfo_pnext_temp(struct vn_cs_decoder *
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkPipelineVertexInputDivisorStateCreateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkPipelineVertexInputStateCreateInfo_pnext_temp(dec);
+            ((VkPipelineVertexInputDivisorStateCreateInfo *)pnext)->pNext = vn_decode_VkPipelineVertexInputStateCreateInfo_pnext_temp(dec);
             vn_decode_VkPipelineVertexInputDivisorStateCreateInfo_self_temp(dec, (VkPipelineVertexInputDivisorStateCreateInfo *)pnext);
         }
         break;
@@ -1152,7 +1152,7 @@ vn_decode_VkPipelineTessellationStateCreateInfo_pnext_temp(struct vn_cs_decoder 
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkPipelineTessellationDomainOriginStateCreateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkPipelineTessellationStateCreateInfo_pnext_temp(dec);
+            ((VkPipelineTessellationDomainOriginStateCreateInfo *)pnext)->pNext = vn_decode_VkPipelineTessellationStateCreateInfo_pnext_temp(dec);
             vn_decode_VkPipelineTessellationDomainOriginStateCreateInfo_self_temp(dec, (VkPipelineTessellationDomainOriginStateCreateInfo *)pnext);
         }
         break;
@@ -1357,7 +1357,7 @@ vn_decode_VkPipelineViewportStateCreateInfo_pnext_temp(struct vn_cs_decoder *dec
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkPipelineViewportDepthClipControlCreateInfoEXT));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkPipelineViewportStateCreateInfo_pnext_temp(dec);
+            ((VkPipelineViewportDepthClipControlCreateInfoEXT *)pnext)->pNext = vn_decode_VkPipelineViewportStateCreateInfo_pnext_temp(dec);
             vn_decode_VkPipelineViewportDepthClipControlCreateInfoEXT_self_temp(dec, (VkPipelineViewportDepthClipControlCreateInfoEXT *)pnext);
         }
         break;
@@ -1365,7 +1365,7 @@ vn_decode_VkPipelineViewportStateCreateInfo_pnext_temp(struct vn_cs_decoder *dec
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkPipelineViewportDepthClampControlCreateInfoEXT));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkPipelineViewportStateCreateInfo_pnext_temp(dec);
+            ((VkPipelineViewportDepthClampControlCreateInfoEXT *)pnext)->pNext = vn_decode_VkPipelineViewportStateCreateInfo_pnext_temp(dec);
             vn_decode_VkPipelineViewportDepthClampControlCreateInfoEXT_self_temp(dec, (VkPipelineViewportDepthClampControlCreateInfoEXT *)pnext);
         }
         break;
@@ -1779,7 +1779,7 @@ vn_decode_VkPipelineRasterizationStateCreateInfo_pnext_temp(struct vn_cs_decoder
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkPipelineRasterizationConservativeStateCreateInfoEXT));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkPipelineRasterizationStateCreateInfo_pnext_temp(dec);
+            ((VkPipelineRasterizationConservativeStateCreateInfoEXT *)pnext)->pNext = vn_decode_VkPipelineRasterizationStateCreateInfo_pnext_temp(dec);
             vn_decode_VkPipelineRasterizationConservativeStateCreateInfoEXT_self_temp(dec, (VkPipelineRasterizationConservativeStateCreateInfoEXT *)pnext);
         }
         break;
@@ -1787,7 +1787,7 @@ vn_decode_VkPipelineRasterizationStateCreateInfo_pnext_temp(struct vn_cs_decoder
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkPipelineRasterizationStateStreamCreateInfoEXT));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkPipelineRasterizationStateCreateInfo_pnext_temp(dec);
+            ((VkPipelineRasterizationStateStreamCreateInfoEXT *)pnext)->pNext = vn_decode_VkPipelineRasterizationStateCreateInfo_pnext_temp(dec);
             vn_decode_VkPipelineRasterizationStateStreamCreateInfoEXT_self_temp(dec, (VkPipelineRasterizationStateStreamCreateInfoEXT *)pnext);
         }
         break;
@@ -1795,7 +1795,7 @@ vn_decode_VkPipelineRasterizationStateCreateInfo_pnext_temp(struct vn_cs_decoder
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkPipelineRasterizationDepthClipStateCreateInfoEXT));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkPipelineRasterizationStateCreateInfo_pnext_temp(dec);
+            ((VkPipelineRasterizationDepthClipStateCreateInfoEXT *)pnext)->pNext = vn_decode_VkPipelineRasterizationStateCreateInfo_pnext_temp(dec);
             vn_decode_VkPipelineRasterizationDepthClipStateCreateInfoEXT_self_temp(dec, (VkPipelineRasterizationDepthClipStateCreateInfoEXT *)pnext);
         }
         break;
@@ -1803,7 +1803,7 @@ vn_decode_VkPipelineRasterizationStateCreateInfo_pnext_temp(struct vn_cs_decoder
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkPipelineRasterizationLineStateCreateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkPipelineRasterizationStateCreateInfo_pnext_temp(dec);
+            ((VkPipelineRasterizationLineStateCreateInfo *)pnext)->pNext = vn_decode_VkPipelineRasterizationStateCreateInfo_pnext_temp(dec);
             vn_decode_VkPipelineRasterizationLineStateCreateInfo_self_temp(dec, (VkPipelineRasterizationLineStateCreateInfo *)pnext);
         }
         break;
@@ -1811,7 +1811,7 @@ vn_decode_VkPipelineRasterizationStateCreateInfo_pnext_temp(struct vn_cs_decoder
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkPipelineRasterizationProvokingVertexStateCreateInfoEXT));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkPipelineRasterizationStateCreateInfo_pnext_temp(dec);
+            ((VkPipelineRasterizationProvokingVertexStateCreateInfoEXT *)pnext)->pNext = vn_decode_VkPipelineRasterizationStateCreateInfo_pnext_temp(dec);
             vn_decode_VkPipelineRasterizationProvokingVertexStateCreateInfoEXT_self_temp(dec, (VkPipelineRasterizationProvokingVertexStateCreateInfoEXT *)pnext);
         }
         break;
@@ -1819,7 +1819,7 @@ vn_decode_VkPipelineRasterizationStateCreateInfo_pnext_temp(struct vn_cs_decoder
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkDepthBiasRepresentationInfoEXT));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkPipelineRasterizationStateCreateInfo_pnext_temp(dec);
+            ((VkDepthBiasRepresentationInfoEXT *)pnext)->pNext = vn_decode_VkPipelineRasterizationStateCreateInfo_pnext_temp(dec);
             vn_decode_VkDepthBiasRepresentationInfoEXT_self_temp(dec, (VkDepthBiasRepresentationInfoEXT *)pnext);
         }
         break;
@@ -1993,7 +1993,7 @@ vn_decode_VkPipelineMultisampleStateCreateInfo_pnext_temp(struct vn_cs_decoder *
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkPipelineSampleLocationsStateCreateInfoEXT));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkPipelineMultisampleStateCreateInfo_pnext_temp(dec);
+            ((VkPipelineSampleLocationsStateCreateInfoEXT *)pnext)->pNext = vn_decode_VkPipelineMultisampleStateCreateInfo_pnext_temp(dec);
             vn_decode_VkPipelineSampleLocationsStateCreateInfoEXT_self_temp(dec, (VkPipelineSampleLocationsStateCreateInfoEXT *)pnext);
         }
         break;
@@ -2350,7 +2350,7 @@ vn_decode_VkPipelineColorBlendStateCreateInfo_pnext_temp(struct vn_cs_decoder *d
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkPipelineColorBlendAdvancedStateCreateInfoEXT));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkPipelineColorBlendStateCreateInfo_pnext_temp(dec);
+            ((VkPipelineColorBlendAdvancedStateCreateInfoEXT *)pnext)->pNext = vn_decode_VkPipelineColorBlendStateCreateInfo_pnext_temp(dec);
             vn_decode_VkPipelineColorBlendAdvancedStateCreateInfoEXT_self_temp(dec, (VkPipelineColorBlendAdvancedStateCreateInfoEXT *)pnext);
         }
         break;
@@ -2358,7 +2358,7 @@ vn_decode_VkPipelineColorBlendStateCreateInfo_pnext_temp(struct vn_cs_decoder *d
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkPipelineColorWriteCreateInfoEXT));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkPipelineColorBlendStateCreateInfo_pnext_temp(dec);
+            ((VkPipelineColorWriteCreateInfoEXT *)pnext)->pNext = vn_decode_VkPipelineColorBlendStateCreateInfo_pnext_temp(dec);
             vn_decode_VkPipelineColorWriteCreateInfoEXT_self_temp(dec, (VkPipelineColorWriteCreateInfoEXT *)pnext);
         }
         break;
@@ -2952,7 +2952,7 @@ vn_decode_VkGraphicsPipelineCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkPipelineCreateFlags2CreateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkGraphicsPipelineCreateInfo_pnext_temp(dec);
+            ((VkPipelineCreateFlags2CreateInfo *)pnext)->pNext = vn_decode_VkGraphicsPipelineCreateInfo_pnext_temp(dec);
             vn_decode_VkPipelineCreateFlags2CreateInfo_self_temp(dec, (VkPipelineCreateFlags2CreateInfo *)pnext);
         }
         break;
@@ -2960,7 +2960,7 @@ vn_decode_VkGraphicsPipelineCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkPipelineLibraryCreateInfoKHR));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkGraphicsPipelineCreateInfo_pnext_temp(dec);
+            ((VkPipelineLibraryCreateInfoKHR *)pnext)->pNext = vn_decode_VkGraphicsPipelineCreateInfo_pnext_temp(dec);
             vn_decode_VkPipelineLibraryCreateInfoKHR_self_temp(dec, (VkPipelineLibraryCreateInfoKHR *)pnext);
         }
         break;
@@ -2968,7 +2968,7 @@ vn_decode_VkGraphicsPipelineCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkPipelineCreationFeedbackCreateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkGraphicsPipelineCreateInfo_pnext_temp(dec);
+            ((VkPipelineCreationFeedbackCreateInfo *)pnext)->pNext = vn_decode_VkGraphicsPipelineCreateInfo_pnext_temp(dec);
             vn_decode_VkPipelineCreationFeedbackCreateInfo_self_temp(dec, (VkPipelineCreationFeedbackCreateInfo *)pnext);
         }
         break;
@@ -2976,7 +2976,7 @@ vn_decode_VkGraphicsPipelineCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkPipelineFragmentShadingRateStateCreateInfoKHR));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkGraphicsPipelineCreateInfo_pnext_temp(dec);
+            ((VkPipelineFragmentShadingRateStateCreateInfoKHR *)pnext)->pNext = vn_decode_VkGraphicsPipelineCreateInfo_pnext_temp(dec);
             vn_decode_VkPipelineFragmentShadingRateStateCreateInfoKHR_self_temp(dec, (VkPipelineFragmentShadingRateStateCreateInfoKHR *)pnext);
         }
         break;
@@ -2984,7 +2984,7 @@ vn_decode_VkGraphicsPipelineCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkPipelineRenderingCreateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkGraphicsPipelineCreateInfo_pnext_temp(dec);
+            ((VkPipelineRenderingCreateInfo *)pnext)->pNext = vn_decode_VkGraphicsPipelineCreateInfo_pnext_temp(dec);
             vn_decode_VkPipelineRenderingCreateInfo_self_temp(dec, (VkPipelineRenderingCreateInfo *)pnext);
         }
         break;
@@ -2992,7 +2992,7 @@ vn_decode_VkGraphicsPipelineCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkGraphicsPipelineLibraryCreateInfoEXT));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkGraphicsPipelineCreateInfo_pnext_temp(dec);
+            ((VkGraphicsPipelineLibraryCreateInfoEXT *)pnext)->pNext = vn_decode_VkGraphicsPipelineCreateInfo_pnext_temp(dec);
             vn_decode_VkGraphicsPipelineLibraryCreateInfoEXT_self_temp(dec, (VkGraphicsPipelineLibraryCreateInfoEXT *)pnext);
         }
         break;
@@ -3000,7 +3000,7 @@ vn_decode_VkGraphicsPipelineCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkPipelineRobustnessCreateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkGraphicsPipelineCreateInfo_pnext_temp(dec);
+            ((VkPipelineRobustnessCreateInfo *)pnext)->pNext = vn_decode_VkGraphicsPipelineCreateInfo_pnext_temp(dec);
             vn_decode_VkPipelineRobustnessCreateInfo_self_temp(dec, (VkPipelineRobustnessCreateInfo *)pnext);
         }
         break;
@@ -3008,7 +3008,7 @@ vn_decode_VkGraphicsPipelineCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkRenderingAttachmentLocationInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkGraphicsPipelineCreateInfo_pnext_temp(dec);
+            ((VkRenderingAttachmentLocationInfo *)pnext)->pNext = vn_decode_VkGraphicsPipelineCreateInfo_pnext_temp(dec);
             vn_decode_VkRenderingAttachmentLocationInfo_self_temp(dec, (VkRenderingAttachmentLocationInfo *)pnext);
         }
         break;
@@ -3016,7 +3016,7 @@ vn_decode_VkGraphicsPipelineCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkRenderingInputAttachmentIndexInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkGraphicsPipelineCreateInfo_pnext_temp(dec);
+            ((VkRenderingInputAttachmentIndexInfo *)pnext)->pNext = vn_decode_VkGraphicsPipelineCreateInfo_pnext_temp(dec);
             vn_decode_VkRenderingInputAttachmentIndexInfo_self_temp(dec, (VkRenderingInputAttachmentIndexInfo *)pnext);
         }
         break;
@@ -3227,7 +3227,7 @@ vn_decode_VkComputePipelineCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkPipelineCreateFlags2CreateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkComputePipelineCreateInfo_pnext_temp(dec);
+            ((VkPipelineCreateFlags2CreateInfo *)pnext)->pNext = vn_decode_VkComputePipelineCreateInfo_pnext_temp(dec);
             vn_decode_VkPipelineCreateFlags2CreateInfo_self_temp(dec, (VkPipelineCreateFlags2CreateInfo *)pnext);
         }
         break;
@@ -3235,7 +3235,7 @@ vn_decode_VkComputePipelineCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkPipelineCreationFeedbackCreateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkComputePipelineCreateInfo_pnext_temp(dec);
+            ((VkPipelineCreationFeedbackCreateInfo *)pnext)->pNext = vn_decode_VkComputePipelineCreateInfo_pnext_temp(dec);
             vn_decode_VkPipelineCreationFeedbackCreateInfo_self_temp(dec, (VkPipelineCreationFeedbackCreateInfo *)pnext);
         }
         break;
@@ -3243,7 +3243,7 @@ vn_decode_VkComputePipelineCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkPipelineRobustnessCreateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkComputePipelineCreateInfo_pnext_temp(dec);
+            ((VkPipelineRobustnessCreateInfo *)pnext)->pNext = vn_decode_VkComputePipelineCreateInfo_pnext_temp(dec);
             vn_decode_VkPipelineRobustnessCreateInfo_self_temp(dec, (VkPipelineRobustnessCreateInfo *)pnext);
         }
         break;
@@ -3467,7 +3467,7 @@ vn_decode_VkRayTracingPipelineCreateInfoKHR_pnext_temp(struct vn_cs_decoder *dec
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkPipelineCreateFlags2CreateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkRayTracingPipelineCreateInfoKHR_pnext_temp(dec);
+            ((VkPipelineCreateFlags2CreateInfo *)pnext)->pNext = vn_decode_VkRayTracingPipelineCreateInfoKHR_pnext_temp(dec);
             vn_decode_VkPipelineCreateFlags2CreateInfo_self_temp(dec, (VkPipelineCreateFlags2CreateInfo *)pnext);
         }
         break;
@@ -3475,7 +3475,7 @@ vn_decode_VkRayTracingPipelineCreateInfoKHR_pnext_temp(struct vn_cs_decoder *dec
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkPipelineCreationFeedbackCreateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkRayTracingPipelineCreateInfoKHR_pnext_temp(dec);
+            ((VkPipelineCreationFeedbackCreateInfo *)pnext)->pNext = vn_decode_VkRayTracingPipelineCreateInfoKHR_pnext_temp(dec);
             vn_decode_VkPipelineCreationFeedbackCreateInfo_self_temp(dec, (VkPipelineCreationFeedbackCreateInfo *)pnext);
         }
         break;
@@ -3483,7 +3483,7 @@ vn_decode_VkRayTracingPipelineCreateInfoKHR_pnext_temp(struct vn_cs_decoder *dec
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkPipelineRobustnessCreateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkRayTracingPipelineCreateInfoKHR_pnext_temp(dec);
+            ((VkPipelineRobustnessCreateInfo *)pnext)->pNext = vn_decode_VkRayTracingPipelineCreateInfoKHR_pnext_temp(dec);
             vn_decode_VkPipelineRobustnessCreateInfo_self_temp(dec, (VkPipelineRobustnessCreateInfo *)pnext);
         }
         break;
