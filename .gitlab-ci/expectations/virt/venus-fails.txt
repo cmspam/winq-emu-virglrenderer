@@ -11,4 +11,5 @@ dEQP-VK.draw.dynamic_rendering.partial_secondary_cmd_buff.multiple_interpolation
 
 # uprev Mesa in Virglrenderer
 dEQP-VK.sparse_resources.image_block_shapes.2d.g8b8g8r8_422_unorm.samples_1,Fail
+dEQP-VK.wsi.direct_drm.swapchain.private_data.image_usage,Crash
 
