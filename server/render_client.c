@@ -131,7 +131,8 @@ render_client_create_context(struct render_client *client,
    if (rec->worker)
       ctx_fd = -1; /* ownership transferred */
 #else
-   rec->worker = render_worker_create(srv->worker_jail, NULL, NULL, 0);
+   rec->worker = render_worker_create(srv->worker_jail, NULL,
+                                      &ctx_args, sizeof(ctx_args));
 #endif
    if (!rec->worker) {
       render_log("failed to create a context worker");

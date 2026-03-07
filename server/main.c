@@ -23,6 +23,9 @@
  * When a worker is a process,
  * - On Linux, it's a subprocess forked from the server process. It returns
  *   from render_server_main and enters render_context_main.
+ * - On macOS, the worker is posix_spawn'd with --worker-context-* args.
+ *   render_server_main parses these, skips the server loop, and returns
+ *   with ctx_args.valid set for render_context_main.
  */
 int
 main(int argc, char **argv)
