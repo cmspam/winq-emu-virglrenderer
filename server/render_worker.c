@@ -199,14 +199,6 @@ create_sigchld_fd(void)
       return -1;
    }
 
-   /* Set kqueue to non-blocking mode */
-   int flags = fcntl(kq, F_GETFL);
-   if (flags == -1 || fcntl(kq, F_SETFL, flags | O_NONBLOCK) == -1) {
-      render_log("failed to set kqueue non-blocking");
-      close(kq);
-      return -1;
-   }
-
    return kq;
 }
 #else
