@@ -145,6 +145,10 @@ proxy_socket_recvmsg(struct proxy_socket *socket, struct msghdr *msg)
          proxy_log("failed to receive message: %s", strerror(errno));
          return false;
       }
+      if (unlikely(s == 0)) {
+         proxy_log("socket disconnected");
+         return false;
+      }
 
       if (state == SOCKET_STATE_FIRST_MSG) {
          _msg_controllen = _msg.msg_controllen;
@@ -304,6 +308,10 @@ proxy_socket_sendmsg(struct proxy_socket *socket, const struct msghdr *msg)
             continue;
 
          proxy_log("failed to send message: %s", strerror(errno));
+         return false;
+      }
+      if (unlikely(s == 0)) {
+         proxy_log("failed to send message: socket disconnected");
          return false;
       }
 

@@ -128,6 +128,11 @@ render_socket_recvmsg(struct render_socket *socket, struct msghdr *msg, size_t *
          render_log("failed to receive message: %s", strerror(errno));
          return false;
       }
+      if (unlikely(s == 0)) {
+         /* Peer closed the socket. */
+         render_log("socket disconnected");
+         return false;
+      }
 
       if (state == SOCKET_STATE_FIRST_MSG) {
          _msg_controllen = _msg.msg_controllen;
@@ -315,6 +320,10 @@ render_socket_sendmsg(struct render_socket *socket, const struct msghdr *msg)
             continue;
 
          render_log("failed to send message: %s", strerror(errno));
+         return false;
+      }
+      if (unlikely(s == 0)) {
+         render_log("failed to send message: socket disconnected");
          return false;
       }
 
