@@ -13,6 +13,12 @@
 
 #define PROXY_SOCKET_MAX_FD_COUNT 8
 
+#ifdef __APPLE__
+#ifndef MSG_CMSG_CLOEXEC
+#define MSG_CMSG_CLOEXEC 0
+#endif /* MSG_CMSG_CLOEXEC */
+#endif /* __APPLE__ */
+
 /* this is only used when the render server is started on demand */
 bool
 proxy_socket_pair(int out_fds[static 2])

@@ -10,6 +10,15 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#ifdef __APPLE__
+#ifndef SOCK_CLOEXEC
+#define SOCK_CLOEXEC 0
+#endif /* SOCK_CLOEXEC */
+#ifndef MSG_CMSG_CLOEXEC
+#define MSG_CMSG_CLOEXEC 0
+#endif /* MSG_CMSG_CLOEXEC */
+#endif /* __APPLE__ */
+
 #define RENDER_SOCKET_MAX_FD_COUNT 8
 
 /* The socket pair between the server process and the client process is set up
