@@ -116,6 +116,7 @@ typedef uint64_t vkr_object_id;
 enum vkr_debug_flags {
    VKR_DEBUG_VALIDATE = 1 << 0,
    VKR_DEBUG_UDMABUF = 1 << 1,
+   VKR_DEBUG_GBM = 1 << 2,
 };
 
 /* base class for all objects */

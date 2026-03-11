@@ -48,21 +48,23 @@ vkr_physical_device_get_udmabuf_dev_fd(void)
 #ifdef MINIGBM
 #include <minigbm/minigbm_helpers.h>
 #else
-#define minigbm_create_default_device(out_fd) NULL
+#include "../vrend/vrend_winsys_gbm.h"
 #endif /* MINIGBM */
 
-/* TODO remove minigbm allocation fallback after requiring exporting from raw mappable
- * device memory via a new Vulkan extension
- */
 static struct gbm_device *vkr_gbm_dev;
 
 static void
 vkr_gbm_device_init_once(void)
 {
+#ifdef MINIGBM
    UNUSED int gbm_fd;
    vkr_gbm_dev = minigbm_create_default_device(&gbm_fd);
+#else
+   struct virgl_gbm *gbm = virgl_gbm_init(-1);
+   vkr_gbm_dev = gbm->device;
+#endif /* MINIGBM */
    if (!vkr_gbm_dev) {
-      vkr_log("minigbm_create_default_device failed");
+      vkr_log("vkr_gbm_device_init_once failed");
       exit(-1);
    }
 }
@@ -239,6 +241,11 @@ vkr_physical_device_init_memory_properties(struct vkr_physical_device *physical_
          physical_dev->udmabuf_dev_fd = vkr_physical_device_get_udmabuf_dev_fd();
       else
          vkr_log("missing VK_EXT_external_memory_dma_buf for udmabuf import!");
+   } else if (VKR_DEBUG(GBM)) {
+      if (physical_dev->EXT_external_memory_dma_buf)
+         physical_dev->gbm_device = vkr_physical_device_get_gbm_device();
+      else
+         vkr_log("missing VK_EXT_external_memory_dma_buf for gbm import!");
    }
 }
 

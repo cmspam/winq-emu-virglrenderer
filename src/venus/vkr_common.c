@@ -216,6 +216,7 @@ static const struct vn_info_extension_table vkr_extension_table = {
 static const struct debug_named_value vkr_debug_options[] = {
    { "validate", VKR_DEBUG_VALIDATE, "Force enabling the validation layer" },
    { "udmabuf", VKR_DEBUG_UDMABUF, "Force udmabuf for host visible memory" },
+   { "gbm", VKR_DEBUG_GBM, "Force gbm for host visible memory" },
    DEBUG_NAMED_VALUE_END
 };
 
