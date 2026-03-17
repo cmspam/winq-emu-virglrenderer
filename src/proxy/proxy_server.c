@@ -114,14 +114,12 @@ proxy_server_create(void)
       }
    }
 
-#ifndef __APPLE__
-   if (!proxy_socket_is_seqpacket(srv->client_fd)) {
+   if (!proxy_socket_is_valid(srv->client_fd)) {
       proxy_log("invalid client fd type");
       close(srv->client_fd);
       free(srv);
       return NULL;
    }
-#endif
 
    proxy_log("proxy server with pid %d", srv->pid);
 

@@ -16,7 +16,7 @@ bool
 proxy_socket_pair(int out_fds[static 2]);
 
 bool
-proxy_socket_is_seqpacket(int fd);
+proxy_socket_is_valid(int fd);
 
 void
 proxy_socket_init(struct proxy_socket *socket, int fd);

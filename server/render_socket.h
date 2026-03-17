@@ -16,7 +16,7 @@ bool
 render_socket_pair(int out_fds[static 2]);
 
 bool
-render_socket_is_seqpacket(int fd);
+render_socket_is_valid(int fd);
 
 void
 render_socket_init(struct render_socket *socket, int fd);

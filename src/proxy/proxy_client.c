@@ -55,12 +55,10 @@ proxy_client_create_context(struct proxy_client *client,
       return false;
    }
 
-#ifndef __APPLE__
-   if (!proxy_socket_is_seqpacket(ctx_fd)) {
+   if (!proxy_socket_is_valid(ctx_fd)) {
       close(ctx_fd);
       return false;
    }
-#endif
 
    *out_ctx_fd = ctx_fd;
    return true;

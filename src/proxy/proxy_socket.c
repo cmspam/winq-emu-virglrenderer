@@ -38,7 +38,7 @@ proxy_socket_pair(int out_fds[static 2])
 }
 
 bool
-proxy_socket_is_seqpacket(int fd)
+proxy_socket_is_valid(int fd)
 {
    int type;
    socklen_t len = sizeof(type);
@@ -46,7 +46,11 @@ proxy_socket_is_seqpacket(int fd)
       proxy_log("fd %d err %s", fd, strerror(errno));
       return false;
    }
+#ifdef __APPLE__
+   return type == SOCK_STREAM;
+#else
    return type == SOCK_SEQPACKET;
+#endif
 }
 
 void

@@ -51,13 +51,17 @@ render_socket_pair(int out_fds[static 2])
 }
 
 bool
-render_socket_is_seqpacket(int fd)
+render_socket_is_valid(int fd)
 {
    int type;
    socklen_t len = sizeof(type);
    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &len))
       return false;
+#ifdef __APPLE__
+   return type == SOCK_STREAM;
+#else
    return type == SOCK_SEQPACKET;
+#endif
 }
 
 void
