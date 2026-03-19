@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "render_client.h"
+#include "render_context.h"
 #include "render_worker.h"
 
 #define RENDER_SERVER_MAX_WORKER_COUNT 256
@@ -105,6 +106,10 @@ render_server_parse_options(struct render_server *srv, int argc, char **argv)
       OPT_WORKER_SECCOMP_BPF,
       OPT_WORKER_SECCOMP_MINIJAIL_POLICY,
       OPT_WORKER_SECCOMP_MINIJAIL_LOG,
+      OPT_WORKER_CONTEXT_INIT_FLAGS,
+      OPT_WORKER_CONTEXT_ID,
+      OPT_WORKER_CONTEXT_NAME,
+      OPT_WORKER_CONTEXT_FD,
       OPT_COUNT,
    };
    static const struct option options[] = {
@@ -114,6 +119,11 @@ render_server_parse_options(struct render_server *srv, int argc, char **argv)
         OPT_WORKER_SECCOMP_MINIJAIL_POLICY },
       { "worker-seccomp-minijail-log", no_argument, NULL,
         OPT_WORKER_SECCOMP_MINIJAIL_LOG },
+      { "worker-context-init-flags", required_argument, NULL,
+        OPT_WORKER_CONTEXT_INIT_FLAGS },
+      { "worker-context-id", required_argument, NULL, OPT_WORKER_CONTEXT_ID },
+      { "worker-context-name", required_argument, NULL, OPT_WORKER_CONTEXT_NAME },
+      { "worker-context-fd", required_argument, NULL, OPT_WORKER_CONTEXT_FD },
       { NULL, 0, NULL, 0 }
    };
    static_assert(OPT_COUNT <= 'z', "");
@@ -136,6 +146,19 @@ render_server_parse_options(struct render_server *srv, int argc, char **argv)
       case OPT_WORKER_SECCOMP_MINIJAIL_LOG:
          srv->worker_seccomp_minijail_log = true;
          break;
+      case OPT_WORKER_CONTEXT_INIT_FLAGS:
+         srv->context_args->init_flags = atoi(optarg);
+         break;
+      case OPT_WORKER_CONTEXT_ID:
+         srv->context_args->ctx_id = atoi(optarg);
+         break;
+      case OPT_WORKER_CONTEXT_NAME:
+         snprintf(srv->context_args->ctx_name, sizeof(srv->context_args->ctx_name), "%s",
+                  optarg);
+         break;
+      case OPT_WORKER_CONTEXT_FD:
+         srv->context_args->ctx_fd = atoi(optarg);
+         break;
       default:
          render_log("unknown option specified");
          return false;
@@ -148,12 +171,35 @@ render_server_parse_options(struct render_server *srv, int argc, char **argv)
       return false;
    }
 
-   if (srv->client_fd < 0 || !render_socket_is_valid(srv->client_fd)) {
-      render_log("no valid client fd specified");
+   if (srv->client_fd < 0 && srv->context_args->ctx_fd < 0) {
+      render_log("no socket fd specified");
       return false;
    }
 
+   if (srv->client_fd >= 0 && srv->context_args->ctx_fd >= 0) {
+      render_log("multiple socket fds specified");
+      goto fail;
+   }
+
+   if (srv->client_fd >= 0 && !render_socket_is_valid(srv->client_fd)) {
+      render_log("client fd is invalid");
+      goto fail;
+   }
+
+   if (srv->context_args->ctx_fd >= 0 &&
+       !render_socket_is_valid(srv->context_args->ctx_fd)) {
+      render_log("context fd is invalid");
+      goto fail;
+   }
+
    return true;
+
+fail:
+   if (srv->client_fd >= 0)
+      close(srv->client_fd);
+   if (srv->context_args->ctx_fd >= 0)
+      close(srv->context_args->ctx_fd);
+   return false;
 }
 
 static bool
@@ -162,6 +208,9 @@ render_server_init(struct render_server *srv,
                    char **argv,
                    struct render_context_args *ctx_args)
 {
+   memset(ctx_args, 0, sizeof(*ctx_args));
+   ctx_args->ctx_fd = -1;
+
    memset(srv, 0, sizeof(*srv));
    srv->state = RENDER_SERVER_STATE_RUN;
    srv->context_args = ctx_args;
