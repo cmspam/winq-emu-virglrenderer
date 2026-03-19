@@ -16,13 +16,13 @@
  * up a socket pair, with one end owned by the worker and the other end sent
  * to and owned by the client process.
  *
- * A worker can be a subprocess forked from the server process, or a thread
- * created by the server process.  When a worker is a subprocess, the
- * subprocess returns from render_server_main and enters render_context_main.
- *
  * When a worker is a thread, the thread enters render_context_main directly
  * from its start function.  In this case, render_context_main must be
  * thread-safe.
+ *
+ * When a worker is a process,
+ * - On Linux, it's a subprocess forked from the server process. It returns
+ *   from render_server_main and enters render_context_main.
  */
 int
 main(int argc, char **argv)
