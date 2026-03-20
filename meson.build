@@ -365,6 +365,12 @@ if with_venus
       epoll_dep = []
    endif
 
+   if with_host_darwin
+      venus_dep += declare_dependency(
+         compile_args : ['-DVK_USE_PLATFORM_METAL_EXT'],
+      )
+   endif
+
    conf_data.set('ENABLE_VENUS', 1)
    conf_data.set('ENABLE_RENDER_SERVER', 1)
    conf_data.set('RENDER_SERVER_EXEC_PATH',
