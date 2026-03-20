@@ -62,6 +62,9 @@ render_server_poll(UNUSED struct render_server *srv,
 static bool
 render_server_run(struct render_server *srv)
 {
+   if (srv->state == RENDER_SERVER_STATE_SUBPROCESS)
+      return true;
+
    struct render_client *client = srv->client;
 
    struct pollfd poll_fds[RENDER_SERVER_POLL_COUNT];
@@ -218,6 +221,13 @@ render_server_init(struct render_server *srv,
 
    if (!render_server_parse_options(srv, argc, argv))
       return false;
+
+   if (srv->context_args->ctx_fd >= 0) {
+      assert(srv->client_fd < 0);
+      srv->context_args->valid = true;
+      srv->state = RENDER_SERVER_STATE_SUBPROCESS;
+      return true;
+   }
 
    enum render_worker_jail_seccomp_filter seccomp_filter =
       RENDER_WORKER_JAIL_SECCOMP_NONE;
