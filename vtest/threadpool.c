@@ -37,7 +37,7 @@ worker_main(void *arg)
    mtx_lock(&w->tp->lock);
 
    do {
-      if (!w->work)
+      while (!w->work)
          cnd_wait(&w->cnd, &w->tp->lock);
 
       if (w->work == exit_work)
@@ -129,7 +129,7 @@ threadpool_fini(struct threadpool *tp)
       int ret;
 
       /* Wait for an idle worker: */
-      if (list_is_empty(&tp->idle_workers))
+      while (list_is_empty(&tp->idle_workers))
          cnd_wait(&tp->cnd, &tp->lock);
 
       /* Kick exit job to notify the worker to shut down: */
