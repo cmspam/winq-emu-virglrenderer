@@ -123,7 +123,7 @@ threadpool_fini(struct threadpool *tp)
 {
    mtx_lock(&tp->lock);
 
-   while (!list_is_empty(&tp->idle_workers) &&
+   while (!list_is_empty(&tp->idle_workers) ||
           !list_is_empty(&tp->busy_workers)) {
       struct threadpool_worker *w;
       int ret;
