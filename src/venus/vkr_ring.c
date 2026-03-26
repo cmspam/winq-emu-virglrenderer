@@ -281,8 +281,14 @@ vkr_ring_thread(void *arg)
          TRACE_SCOPE("ring idle");
 
          mtx_lock(&ring->mutex);
-         if (ring->started && !ring->pending_notify)
-            cnd_wait(&ring->cond, &ring->mutex);
+         while (ring->started && !ring->pending_notify) {
+            ret = cnd_wait(&ring->cond, &ring->mutex);
+            if (ret != thrd_success) {
+               vkr_log("%s: ring idle cnd_wait has failed(%d)", __func__, ret);
+               ret = -EINVAL;
+               goto out;
+            }
+         }
          vkr_ring_unset_status_bits(ring, VK_RING_STATUS_IDLE_BIT_MESA);
          mtx_unlock(&ring->mutex);
 
@@ -333,6 +339,7 @@ vkr_ring_thread(void *arg)
       }
    }
 
+out:
    if (ret < 0) {
       vkr_ring_set_status_bits(ring, VK_RING_STATUS_FATAL_BIT_MESA);
       vkr_context_on_ring_fatal(ctx);
