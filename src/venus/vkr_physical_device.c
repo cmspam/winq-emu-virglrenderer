@@ -213,20 +213,26 @@ vkr_physical_device_init_memory_properties(struct vkr_physical_device *physical_
       info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
       vk->GetPhysicalDeviceExternalBufferProperties(handle, &info, &props);
       physical_dev->is_dma_buf_fd_export_supported =
-         (props.externalMemoryProperties.externalMemoryFeatures &
-          VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) &&
-         (props.externalMemoryProperties.exportFromImportedHandleTypes &
+          (props.externalMemoryProperties.externalMemoryFeatures &
+           VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) &&
+         (props.externalMemoryProperties.compatibleHandleTypes &
           VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
    }
 
-   if (physical_dev->KHR_external_memory_fd) {
+   if (physical_dev->KHR_external_memory_fd || physical_dev->host_external_memory_win32) {
+#ifdef _WIN32
+      info.handleType = physical_dev->host_external_memory_win32
+                           ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT
+                           : VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+#else
       info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
+#endif
       vk->GetPhysicalDeviceExternalBufferProperties(handle, &info, &props);
       physical_dev->is_opaque_fd_export_supported =
-         (props.externalMemoryProperties.externalMemoryFeatures &
-          VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) &&
-         (props.externalMemoryProperties.exportFromImportedHandleTypes &
-          VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT);
+          (props.externalMemoryProperties.externalMemoryFeatures &
+           VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) &&
+         (props.externalMemoryProperties.compatibleHandleTypes &
+           info.handleType);
    }
 
    /* fallback to gbm allocation with dma-buf import */
@@ -249,6 +255,34 @@ vkr_physical_device_init_memory_properties(struct vkr_physical_device *physical_
    }
 }
 
+static bool
+vkr_physical_device_has_extension(const VkExtensionProperties *exts,
+                                  uint32_t count,
+                                  const char *name)
+{
+   for (uint32_t i = 0; i < count; i++) {
+      if (!strcmp(exts[i].extensionName, name))
+         return true;
+   }
+
+   return false;
+}
+
+static bool
+vkr_physical_device_append_extension(VkExtensionProperties *exts,
+                                     uint32_t capacity,
+                                     uint32_t *count,
+                                     const char *name)
+{
+   if (*count >= capacity)
+      return false;
+
+   snprintf(exts[*count].extensionName, sizeof(exts[*count].extensionName), "%s", name);
+   exts[*count].specVersion = vkr_extension_get_spec_version(name);
+   (*count)++;
+   return true;
+}
+
 static void
 vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
 {
@@ -262,7 +296,8 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
    if (result != VK_SUCCESS)
       return;
 
-   exts = malloc(sizeof(*exts) * count);
+   const uint32_t extra_guest_exts = 4;
+   exts = calloc(count + extra_guest_exts, sizeof(*exts));
    if (!exts)
       return;
 
@@ -273,8 +308,13 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
    }
 
    uint32_t advertised_count = 0;
+   bool saw_host_swapchain = false;
+   bool advertised_swapchain = false;
    for (uint32_t i = 0; i < count; i++) {
       VkExtensionProperties *props = &exts[i];
+
+      if (!strcmp(props->extensionName, "VK_KHR_swapchain"))
+         saw_host_swapchain = true;
 
       if (!strcmp(props->extensionName, "VK_KHR_external_memory_fd"))
          physical_dev->KHR_external_memory_fd = true;
@@ -282,19 +322,90 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
          physical_dev->EXT_external_memory_dma_buf = true;
       else if (!strcmp(props->extensionName, "VK_KHR_external_fence_fd"))
          physical_dev->KHR_external_fence_fd = true;
+      else if (!strcmp(props->extensionName, "VK_KHR_external_semaphore_fd"))
+         physical_dev->KHR_external_semaphore_fd = true;
+#ifdef _WIN32
+      else if (!strcmp(props->extensionName, "VK_KHR_external_memory_win32"))
+         physical_dev->host_external_memory_win32 = true;
+      else if (!strcmp(props->extensionName, "VK_KHR_external_fence_win32"))
+         physical_dev->host_external_fence_win32 = true;
+      else if (!strcmp(props->extensionName, "VK_KHR_external_semaphore_win32"))
+         physical_dev->host_external_semaphore_win32 = true;
+#endif
 
       const uint32_t spec_ver = vkr_extension_get_spec_version(props->extensionName);
       if (spec_ver) {
          if (props->specVersion > spec_ver)
             props->specVersion = spec_ver;
          exts[advertised_count++] = exts[i];
+         if (!strcmp(props->extensionName, "VK_KHR_swapchain"))
+            advertised_swapchain = true;
       }
+   }
+
+#ifdef _WIN32
+   if (physical_dev->host_external_memory_win32)
+      physical_dev->KHR_external_memory_fd = true;
+   if (physical_dev->host_external_fence_win32)
+      physical_dev->KHR_external_fence_fd = true;
+   if (physical_dev->host_external_semaphore_win32)
+      physical_dev->KHR_external_semaphore_fd = true;
+
+   if (physical_dev->host_external_memory_win32 &&
+       !vkr_physical_device_has_extension(exts, advertised_count,
+                                          "VK_KHR_external_memory_fd")) {
+      if (!vkr_physical_device_append_extension(exts, count + extra_guest_exts,
+                                                &advertised_count,
+                                                "VK_KHR_external_memory_fd")) {
+         free(exts);
+         return;
+      }
+   }
+
+   if (physical_dev->host_external_fence_win32 &&
+       !vkr_physical_device_has_extension(exts, advertised_count,
+                                          "VK_KHR_external_fence_fd")) {
+      if (!vkr_physical_device_append_extension(exts, count + extra_guest_exts,
+                                                &advertised_count,
+                                                "VK_KHR_external_fence_fd")) {
+         free(exts);
+         return;
+      }
+   }
+
+   if (physical_dev->host_external_semaphore_win32 &&
+       !vkr_physical_device_has_extension(exts, advertised_count,
+                                          "VK_KHR_external_semaphore_fd")) {
+      if (!vkr_physical_device_append_extension(exts, count + extra_guest_exts,
+                                                &advertised_count,
+                                                "VK_KHR_external_semaphore_fd")) {
+         free(exts);
+         return;
+      }
+   }
+#endif
+
+   if (saw_host_swapchain &&
+       !vkr_physical_device_has_extension(exts, advertised_count, "VK_KHR_swapchain")) {
+      if (!vkr_physical_device_append_extension(exts, count + extra_guest_exts,
+                                                &advertised_count,
+                                                "VK_KHR_swapchain")) {
+         free(exts);
+         return;
+      }
+      advertised_swapchain = true;
    }
 
    if (physical_dev->KHR_external_fence_fd) {
       const VkPhysicalDeviceExternalFenceInfo fence_info = {
          .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_FENCE_INFO,
+#ifdef _WIN32
+         .handleType = physical_dev->host_external_fence_win32
+                          ? VK_EXTERNAL_FENCE_HANDLE_TYPE_OPAQUE_WIN32_BIT
+                          : VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT,
+#else
          .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT,
+#endif
       };
       VkExternalFenceProperties fence_props = {
          .sType = VK_STRUCTURE_TYPE_EXTERNAL_FENCE_PROPERTIES,
@@ -761,6 +872,36 @@ vkr_dispatch_vkGetPhysicalDeviceExternalSemaphoreProperties(
       vkr_physical_device_from_handle(args->physicalDevice);
    struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
 
+#ifdef _WIN32
+   if (physical_dev->host_external_semaphore_win32 &&
+       args->pExternalSemaphoreInfo->handleType ==
+          VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT) {
+      const VkPhysicalDeviceExternalSemaphoreInfo host_info = {
+         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO,
+         .pNext = args->pExternalSemaphoreInfo->pNext,
+         .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT,
+      };
+      VkExternalSemaphoreProperties host_props = {
+         .sType = VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES,
+      };
+
+      vn_replace_vkGetPhysicalDeviceExternalSemaphoreProperties_args_handle(args);
+      vk->GetPhysicalDeviceExternalSemaphoreProperties(args->physicalDevice,
+                                                       &host_info, &host_props);
+
+      *args->pExternalSemaphoreProperties = host_props;
+      args->pExternalSemaphoreProperties->exportFromImportedHandleTypes =
+         host_props.exportFromImportedHandleTypes
+            ? VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT
+            : 0;
+      args->pExternalSemaphoreProperties->compatibleHandleTypes =
+         host_props.compatibleHandleTypes
+            ? VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT
+            : 0;
+      return;
+   }
+#endif
+
    vn_replace_vkGetPhysicalDeviceExternalSemaphoreProperties_args_handle(args);
    vk->GetPhysicalDeviceExternalSemaphoreProperties(args->physicalDevice,
                                                     args->pExternalSemaphoreInfo,
@@ -775,6 +916,35 @@ vkr_dispatch_vkGetPhysicalDeviceExternalFenceProperties(
    struct vkr_physical_device *physical_dev =
       vkr_physical_device_from_handle(args->physicalDevice);
    struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+
+#ifdef _WIN32
+   if (physical_dev->host_external_fence_win32 &&
+       args->pExternalFenceInfo->handleType == VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT) {
+      const VkPhysicalDeviceExternalFenceInfo host_info = {
+         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_FENCE_INFO,
+         .pNext = args->pExternalFenceInfo->pNext,
+         .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_OPAQUE_WIN32_BIT,
+      };
+      VkExternalFenceProperties host_props = {
+         .sType = VK_STRUCTURE_TYPE_EXTERNAL_FENCE_PROPERTIES,
+      };
+
+      vn_replace_vkGetPhysicalDeviceExternalFenceProperties_args_handle(args);
+      vk->GetPhysicalDeviceExternalFenceProperties(args->physicalDevice,
+                                                   &host_info, &host_props);
+
+      *args->pExternalFenceProperties = host_props;
+      args->pExternalFenceProperties->exportFromImportedHandleTypes =
+         host_props.exportFromImportedHandleTypes
+            ? VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT
+            : 0;
+      args->pExternalFenceProperties->compatibleHandleTypes =
+         host_props.compatibleHandleTypes
+            ? VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT
+            : 0;
+      return;
+   }
+#endif
 
    vn_replace_vkGetPhysicalDeviceExternalFenceProperties_args_handle(args);
    vk->GetPhysicalDeviceExternalFenceProperties(

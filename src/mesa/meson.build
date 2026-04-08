@@ -14,9 +14,7 @@ files_mesa = files(
   'util/u_math.c',
 )
 
-if not with_host_windows
-   files_mesa += files('util/anon_file.c')
-endif
+files_mesa += files('util/anon_file.c')
 
 deps_mesa = [
   m_dep,

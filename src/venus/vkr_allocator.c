@@ -27,10 +27,17 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <vulkan/vulkan.h>
+#include <vulkan/vulkan_win32.h>
+#else
 #include <unistd.h>
+#endif
 
 #include "util/list.h"
 #include "util/macros.h"
+#include "util/os_file.h"
 #include "venus-protocol/vulkan.h"
 #include "virgl_resource.h"
 
@@ -125,10 +132,33 @@ vkr_allocator_allocate_memory(struct virgl_resource *res)
    int fd = -1;
    if (virgl_resource_export_fd(res, &fd) != VIRGL_RESOURCE_FD_OPAQUE) {
       if (fd >= 0)
-         close(fd);
+         os_close_fd(fd);
       return NULL;
    }
 
+#ifdef _WIN32
+   HANDLE import_handle = os_get_win32_handle_from_fd(fd);
+   HANDLE dup_handle = NULL;
+   if (import_handle == INVALID_HANDLE_VALUE ||
+       !DuplicateHandle(GetCurrentProcess(), import_handle, GetCurrentProcess(), &dup_handle,
+                        0, FALSE, DUPLICATE_SAME_ACCESS)) {
+      os_close_fd(fd);
+      return NULL;
+   }
+
+   VkMemoryAllocateInfo alloc_info = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .pNext =
+         &(VkImportMemoryWin32HandleInfoKHR){
+            .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR,
+            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT,
+            .handle = dup_handle,
+            .name = NULL,
+         },
+      .allocationSize = res->vulkan_info.allocation_size,
+      .memoryTypeIndex = res->vulkan_info.memory_type_index
+   };
+#else
    VkMemoryAllocateInfo alloc_info = {
       .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
       .pNext =
@@ -139,12 +169,18 @@ vkr_allocator_allocate_memory(struct virgl_resource *res)
       .allocationSize = res->vulkan_info.allocation_size,
       .memoryTypeIndex = res->vulkan_info.memory_type_index
    };
+#endif
 
    VkDeviceMemory mem_handle;
    if (vk->AllocateMemory(dev_handle, &alloc_info, NULL, &mem_handle) != VK_SUCCESS) {
-      close(fd);
+#ifdef _WIN32
+      CloseHandle(dup_handle);
+#endif
+      os_close_fd(fd);
       return NULL;
    }
+
+   os_close_fd(fd);
 
    struct vkr_opaque_fd_mem_info *mem_info = calloc(1, sizeof(*mem_info));
    if (!mem_info) {
@@ -211,16 +247,22 @@ vkr_allocator_dev_proc_table_init(VkDevice dev_handle,
    vk->AllocateMemory = VN_GDPA(vkAllocateMemory);
    vk->FreeMemory = VN_GDPA(vkFreeMemory);
    vk->MapMemory = VN_GDPA(vkMapMemory);
-   vk->UnmapMemory = VN_GDPA(vkUnmapMemory);
+    vk->UnmapMemory = VN_GDPA(vkUnmapMemory);
 #undef VN_GDPA
 }
 
 int
 vkr_allocator_init(void)
 {
+#ifdef _WIN32
+   static const char *required_extensions[] = {
+      "VK_KHR_external_memory_win32",
+   };
+#else
    static const char *required_extensions[] = {
       "VK_KHR_external_memory_fd",
    };
+#endif
    struct vkr_inst_proc_table *vk = &vkr_allocator.proc_table;
    VkResult res;
 

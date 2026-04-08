@@ -6,13 +6,21 @@
 #include "proxy_context.h"
 
 #include <fcntl.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <io.h>
+#include <winsock2.h>
+#include "mman_win32.h"
+#else
 #include <poll.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#endif
 
 #include "server/render_protocol.h"
 #include "util/anon_file.h"
 #include "util/bitscan.h"
+#include "util/os_file.h"
 
 #include "proxy_client.h"
 
@@ -165,19 +173,27 @@ static int
 proxy_context_sync_thread(void *arg)
 {
    struct proxy_context *ctx = arg;
-   struct pollfd poll_fds[2] = {
-      [0] = {
-         .fd = ctx->sync_thread.fence_eventfd,
-         .events = POLLIN,
-      },
-      [1] = {
-         .fd = ctx->socket.fd,
-      },
-   };
 
    assert(proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB);
 
    while (!ctx->sync_thread.stop) {
+#ifdef _WIN32
+      HANDLE event = (HANDLE)_get_osfhandle(ctx->sync_thread.fence_eventfd);
+      DWORD wait_ret = WaitForSingleObject(event, 100); /* 100ms timeout */
+      if (wait_ret == WAIT_FAILED) {
+         proxy_log("failed to wait on fence event");
+         break;
+      }
+#else
+      struct pollfd poll_fds[2] = {
+         [0] = {
+            .fd = ctx->sync_thread.fence_eventfd,
+            .events = POLLIN,
+         },
+         [1] = {
+            .fd = ctx->socket.fd,
+         },
+      };
       const int ret = poll(poll_fds, ARRAY_SIZE(poll_fds), -1);
       if (ret <= 0) {
          if (ret < 0 && (errno == EINTR || errno == EAGAIN))
@@ -186,6 +202,7 @@ proxy_context_sync_thread(void *arg)
          proxy_log("failed to poll fence eventfd");
          break;
       }
+#endif
 
       proxy_context_retire_fences_internal(ctx);
    }
@@ -346,14 +363,14 @@ proxy_context_get_blob(struct virgl_context *base,
     */
    struct proxy_context *ctx = (struct proxy_context *)base;
 
-   const struct render_context_op_create_resource_request req = {
-      .header.op = RENDER_CONTEXT_OP_CREATE_RESOURCE,
-      .res_id = res_id,
-      .blob_id = blob_id,
-      .blob_size = blob_size,
-      .blob_flags = blob_flags,
+   const struct render_context_op_header hdr = {
+      .op = RENDER_CONTEXT_OP_CREATE_RESOURCE,
    };
-   if (!proxy_socket_send_request(&ctx->socket, &req, sizeof(req))) {
+   if (!proxy_socket_send_request(&ctx->socket, &hdr, sizeof(hdr)) ||
+       !proxy_socket_send_request(&ctx->socket, &res_id, sizeof(res_id)) ||
+       !proxy_socket_send_request(&ctx->socket, &blob_id, sizeof(blob_id)) ||
+       !proxy_socket_send_request(&ctx->socket, &blob_size, sizeof(blob_size)) ||
+       !proxy_socket_send_request(&ctx->socket, &blob_flags, sizeof(blob_flags))) {
       proxy_log("failed to get blob %" PRIu64, blob_id);
       return -1;
    }
@@ -383,16 +400,23 @@ proxy_context_get_blob(struct virgl_context *base,
       reply_fd_valid = true;
       break;
    case VIRGL_RESOURCE_FD_SHM:
+#ifdef _WIN32
+      /* On Windows, the fd is a raw HANDLE from CreateFileMapping.
+       * File seals and lseek validation don't apply.
+       */
+      reply_fd_valid = true;
+#else
       /* validate the seals and size here */
       reply_fd_valid = !add_required_seals_to_fd(reply_fd) &&
                        validate_resource_fd_shm(reply_fd, blob_size);
+#endif
       break;
    default:
       break;
    }
    if (!reply_fd_valid) {
       proxy_log("invalid fd type %d for blob %" PRIu64, reply.fd_type, blob_id);
-      close(reply_fd);
+      os_close_fd(reply_fd);
       return -1;
    }
 
@@ -471,7 +495,7 @@ proxy_context_attach_resource(struct virgl_context *base, struct virgl_resource 
       if (res_fd_type != VIRGL_RESOURCE_FD_DMABUF) {
          /* close fd for unexpected fd type from succeeded export */
          if (res_fd_type != VIRGL_RESOURCE_FD_INVALID)
-            close(res_fd);
+            os_close_fd(res_fd);
          proxy_log("exported res %d to unexpected fd_type %d", res_id, res_fd_type);
          return;
       }
@@ -496,7 +520,7 @@ proxy_context_attach_resource(struct virgl_context *base, struct virgl_resource 
       proxy_log("failed to attach res %d", res_id);
 
    if (res_fd >= 0 && close_res_fd)
-      close(res_fd);
+      os_close_fd(res_fd);
 
    proxy_context_resource_add(ctx, res_id);
 }
@@ -517,13 +541,13 @@ proxy_context_destroy(struct virgl_context *base)
          thrd_join(ctx->sync_thread.thread, NULL);
       }
 
-      close(ctx->sync_thread.fence_eventfd);
+      os_close_fd(ctx->sync_thread.fence_eventfd);
    }
 
    if (ctx->shmem.ptr)
       munmap(ctx->shmem.ptr, ctx->shmem.size);
    if (ctx->shmem.fd >= 0)
-      close(ctx->shmem.fd);
+      os_close_fd(ctx->shmem.fd);
 
    if (ctx->timeline_seqnos) {
       for (uint32_t i = 0; i < PROXY_CONTEXT_TIMELINE_COUNT; i++) {
@@ -632,7 +656,7 @@ alloc_memfd(const char *name, size_t size, void **out_ptr)
    return fd;
 
 fail:
-   close(fd);
+   os_close_fd(fd);
    return -1;
 }
 
@@ -652,11 +676,17 @@ proxy_context_init_shmem(struct proxy_context *ctx)
 static bool
 proxy_context_init(struct proxy_context *ctx, uint32_t ctx_flags)
 {
-   if (!proxy_context_init_shmem(ctx) || !proxy_context_init_timelines(ctx) ||
-       !proxy_context_init_fencing(ctx) || !proxy_context_resource_table_init(ctx)) {
-      proxy_log("failed to pre-initialize context");
-      return false;
-   }
+   bool shmem_ok = proxy_context_init_shmem(ctx);
+   if (!shmem_ok) { proxy_log("failed shmem"); return false; }
+
+   bool timelines_ok = proxy_context_init_timelines(ctx);
+   if (!timelines_ok) { proxy_log("failed timelines"); return false; }
+
+   bool fencing_ok = proxy_context_init_fencing(ctx);
+   if (!fencing_ok) { proxy_log("failed fencing"); return false; }
+
+   bool table_ok = proxy_context_resource_table_init(ctx);
+   if (!table_ok) { proxy_log("failed table"); return false; }
 
    const struct render_context_op_init_request req = {
       .header.op = RENDER_CONTEXT_OP_INIT,
@@ -691,7 +721,7 @@ proxy_context_create(uint32_t ctx_id,
 
    ctx = calloc(1, sizeof(*ctx));
    if (!ctx) {
-      close(ctx_fd);
+      os_close_fd(ctx_fd);
       return NULL;
    }
 

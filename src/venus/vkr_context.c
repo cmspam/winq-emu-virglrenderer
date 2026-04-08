@@ -5,11 +5,18 @@
 
 #include "vkr_context.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#include <io.h>
+#include "mman_win32.h"
+#else
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <unistd.h>
+#endif
 
 #include "util/anon_file.h"
+#include "util/os_file.h"
 #include "venus-protocol/vn_protocol_renderer_dispatches.h"
 
 #define XXH_INLINE_ALL
@@ -192,7 +199,7 @@ vkr_context_free_resource(struct hash_entry *entry)
    if (res->fd_type == VIRGL_RESOURCE_FD_SHM)
       munmap(res->u.data, res->size);
    else if (res->u.fd >= 0)
-      close(res->u.fd);
+      os_close_fd(res->u.fd);
    free(res);
 }
 
@@ -288,14 +295,14 @@ vkr_context_create_resource_from_shm(struct vkr_context *ctx,
 
    void *mmap_ptr = mmap(NULL, blob_size, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
    if (mmap_ptr == MAP_FAILED) {
-      close(fd);
+      os_close_fd(fd);
       return false;
    }
 
    if (!vkr_context_import_resource_internal(ctx, res_id, blob_size,
                                              VIRGL_RESOURCE_FD_SHM, -1, mmap_ptr)) {
       munmap(mmap_ptr, blob_size);
-      close(fd);
+      os_close_fd(fd);
       return false;
    }
 
@@ -318,13 +325,18 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
 {
    assert(!vkr_context_get_resource(ctx, res_id));
 
-   struct vkr_device_memory *mem = vkr_context_get_object(ctx, blob_id);
-   if (!mem || mem->base.type != VK_OBJECT_TYPE_DEVICE_MEMORY)
+   mtx_lock(&ctx->object_mutex);
+   const struct hash_entry *mem_entry = _mesa_hash_table_search(ctx->object_table, &blob_id);
+   struct vkr_device_memory *mem = likely(mem_entry) ? mem_entry->data : NULL;
+   mtx_unlock(&ctx->object_mutex);
+   if (!mem || mem->base.type != VK_OBJECT_TYPE_DEVICE_MEMORY) {
       return false;
+   }
 
    struct virgl_context_blob blob;
-   if (!vkr_device_memory_export_blob(mem, blob_size, blob_flags, &blob))
+   if (!vkr_device_memory_export_blob(mem, blob_size, blob_flags, &blob)) {
       return false;
+   }
 
    /* If memory might get exported, store a dup'ed fd in vkr_resource for:
     * - vkAllocateMemory for dma_buf import
@@ -334,16 +346,16 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
    if (mem->might_export) {
       res_fd = os_dupfd_cloexec(blob.u.fd);
       if (res_fd < 0) {
-         close(blob.u.fd);
+         os_close_fd(blob.u.fd);
          return false;
       }
    }
 
    if (!vkr_context_import_resource_internal(ctx, res_id, blob_size, blob.type, res_fd,
-                                             NULL)) {
+                                              NULL)) {
       if (res_fd >= 0)
-         close(res_fd);
-      close(blob.u.fd);
+         os_close_fd(res_fd);
+      os_close_fd(blob.u.fd);
       return false;
    }
 

@@ -7737,6 +7737,11 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
       if (flags & VREND_USE_ASYNC_FENCE_CB)
          vrend_state.use_async_fence_cb = true;
       vrend_renderer_use_threaded_sync();
+      /* If sync thread creation failed, disable async fence mode to avoid
+       * using uninitialized mutexes in vrend_renderer_poll().
+       */
+      if (!vrend_state.sync_thread)
+         vrend_state.use_async_fence_cb = false;
    }
    if (flags & VREND_USE_EXTERNAL_BLOB)
       vrend_state.use_external_blob = true;
@@ -12377,6 +12382,7 @@ static void vrend_renderer_fill_caps_v2(int gl_ver, int gles_ver,  union virgl_c
    uint32_t video_memory;
    const char *renderer = (const char *)glGetString(GL_RENDERER);
 
+
    /* Count this up when you add a feature flag that is used to set a CAP in
     * the guest that was set unconditionally before. Then check that flag and
     * this value to avoid regressions when a guest with a new mesa version is
@@ -12404,13 +12410,26 @@ static void vrend_renderer_fill_caps_v2(int gl_ver, int gles_ver,  union virgl_c
 
    if (gl_ver > 0) {
       glGetFloatv(GL_SMOOTH_POINT_SIZE_RANGE, range);
+      if (glGetError() != GL_NO_ERROR) {
+         /* Some Windows GL drivers (Intel) return GL_INVALID_ENUM for
+          * GL_SMOOTH_POINT_SIZE_RANGE.  Drain the error to prevent it
+          * from cascading through subsequent operations.
+          */
+         range[0] = 1.0f;
+         range[1] = 1.0f;
+      }
       caps->v2.min_smooth_point_size = range[0];
       caps->v2.max_smooth_point_size = range[1];
 
       glGetFloatv(GL_SMOOTH_LINE_WIDTH_RANGE, range);
+      if (glGetError() != GL_NO_ERROR) {
+         range[0] = 1.0f;
+         range[1] = 1.0f;
+      }
       caps->v2.min_smooth_line_width = range[0];
       caps->v2.max_smooth_line_width = range[1];
    }
+
 
    glGetFloatv(GL_MAX_TEXTURE_LOD_BIAS, &caps->v2.max_texture_lod_bias);
 
@@ -12450,6 +12469,7 @@ static void vrend_renderer_fill_caps_v2(int gl_ver, int gles_ver,  union virgl_c
       caps->v2.max_shader_patch_varyings = 0;
 
    vrend_state.max_shader_patch_varyings = caps->v2.max_shader_patch_varyings;
+
 
    if (has_feature(feat_texture_gather)) {
        glGetIntegerv(GL_MIN_PROGRAM_TEXTURE_GATHER_OFFSET, &caps->v2.min_texture_gather_offset);
@@ -12493,6 +12513,7 @@ static void vrend_renderer_fill_caps_v2(int gl_ver, int gles_ver,  union virgl_c
       caps->v2.max_combined_shader_buffers = MIN2(max, VREND_MAX_COMBINED_SSBO_BINDING_POINTS);
    }
 
+
    if (has_feature(feat_images)) {
       glGetIntegerv(GL_MAX_VERTEX_IMAGE_UNIFORMS, &max);
       if (max > PIPE_MAX_SHADER_IMAGES)
@@ -12503,9 +12524,11 @@ static void vrend_renderer_fill_caps_v2(int gl_ver, int gles_ver,  union virgl_c
          max = PIPE_MAX_SHADER_IMAGES;
       caps->v2.max_shader_image_frag_compute = max;
 
+   
       if (gl_ver > 0) /* Seems GLES doesn't support multisample images */
          glGetIntegerv(GL_MAX_IMAGE_SAMPLES, (GLint*)&caps->v2.max_image_samples);
-   }
+
+      }
 
    if (has_feature(feat_storage_multisample))
       caps->v1.max_samples = vrend_renderer_query_multisample_caps(caps->v1.max_samples, &caps->v2);

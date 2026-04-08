@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 
 #if DETECT_OS_WINDOWS
+#include <windows.h>
 #include <io.h>
 #define open _open
 #define fdopen _fdopen
@@ -23,6 +24,134 @@
 #ifndef F_DUPFD_CLOEXEC
 #define F_DUPFD_CLOEXEC 1030
 #endif
+#endif
+
+#if DETECT_OS_WINDOWS
+struct os_win32_handle_entry {
+   int token;
+   HANDLE handle;
+};
+
+static CRITICAL_SECTION os_win32_handle_mutex;
+static INIT_ONCE os_win32_handle_once = INIT_ONCE_STATIC_INIT;
+static struct os_win32_handle_entry *os_win32_handles;
+static size_t os_win32_handle_count;
+static size_t os_win32_handle_capacity;
+static LONG os_win32_next_token = 0x40000000;
+
+static BOOL CALLBACK
+os_win32_handle_init_once(PINIT_ONCE InitOnce, PVOID Parameter, PVOID *Context)
+{
+   (void)InitOnce;
+   (void)Parameter;
+   (void)Context;
+   InitializeCriticalSection(&os_win32_handle_mutex);
+   return TRUE;
+}
+
+static void
+os_win32_handle_ensure_init(void)
+{
+   InitOnceExecuteOnce(&os_win32_handle_once, os_win32_handle_init_once, NULL, NULL);
+}
+
+static ptrdiff_t
+os_win32_handle_find_index_locked(int token)
+{
+   for (size_t i = 0; i < os_win32_handle_count; i++) {
+      if (os_win32_handles[i].token == token)
+         return (ptrdiff_t)i;
+   }
+
+   return -1;
+}
+
+static int
+os_win32_handle_insert(HANDLE handle)
+{
+   os_win32_handle_ensure_init();
+   EnterCriticalSection(&os_win32_handle_mutex);
+
+   if (os_win32_handle_count == os_win32_handle_capacity) {
+      size_t new_cap = os_win32_handle_capacity ? os_win32_handle_capacity * 2 : 16;
+      struct os_win32_handle_entry *new_entries =
+         realloc(os_win32_handles, new_cap * sizeof(*new_entries));
+      if (!new_entries) {
+         LeaveCriticalSection(&os_win32_handle_mutex);
+         return -1;
+      }
+
+      os_win32_handles = new_entries;
+      os_win32_handle_capacity = new_cap;
+   }
+
+   int token = InterlockedIncrement(&os_win32_next_token);
+   os_win32_handles[os_win32_handle_count++] = (struct os_win32_handle_entry){
+      .token = token,
+      .handle = handle,
+   };
+
+   LeaveCriticalSection(&os_win32_handle_mutex);
+   return token;
+}
+
+bool
+os_fd_is_handle_token(int fd)
+{
+   os_win32_handle_ensure_init();
+   EnterCriticalSection(&os_win32_handle_mutex);
+   const bool found = os_win32_handle_find_index_locked(fd) >= 0;
+   LeaveCriticalSection(&os_win32_handle_mutex);
+   return found;
+}
+
+HANDLE
+os_get_win32_handle_from_fd(int fd)
+{
+   intptr_t crt_handle = _get_osfhandle(fd);
+   if (crt_handle != -1)
+      return (HANDLE)crt_handle;
+
+   os_win32_handle_ensure_init();
+   EnterCriticalSection(&os_win32_handle_mutex);
+   const ptrdiff_t idx = os_win32_handle_find_index_locked(fd);
+   HANDLE handle = idx >= 0 ? os_win32_handles[idx].handle : INVALID_HANDLE_VALUE;
+   LeaveCriticalSection(&os_win32_handle_mutex);
+   return handle;
+}
+
+int
+os_wrap_win32_handle(HANDLE handle)
+{
+   if (!handle || handle == INVALID_HANDLE_VALUE)
+      return -1;
+
+   return os_win32_handle_insert(handle);
+}
+
+int
+os_close_fd(int fd)
+{
+   os_win32_handle_ensure_init();
+   EnterCriticalSection(&os_win32_handle_mutex);
+   const ptrdiff_t idx = os_win32_handle_find_index_locked(fd);
+   if (idx >= 0) {
+      HANDLE handle = os_win32_handles[idx].handle;
+      os_win32_handles[idx] = os_win32_handles[os_win32_handle_count - 1];
+      os_win32_handle_count--;
+      LeaveCriticalSection(&os_win32_handle_mutex);
+      return CloseHandle(handle) ? 0 : -1;
+   }
+   LeaveCriticalSection(&os_win32_handle_mutex);
+
+   return _close(fd);
+}
+#else
+int
+os_close_fd(int fd)
+{
+   return close(fd);
+}
 #endif
 
 
@@ -40,6 +169,18 @@ os_file_create_unique(const char *filename, int filemode)
 int
 os_dupfd_cloexec(int fd)
 {
+   if (os_fd_is_handle_token(fd)) {
+      HANDLE handle = os_get_win32_handle_from_fd(fd);
+      HANDLE dup_handle = NULL;
+      if (!DuplicateHandle(GetCurrentProcess(), handle, GetCurrentProcess(), &dup_handle,
+                           0, FALSE, DUPLICATE_SAME_ACCESS)) {
+         errno = EBADF;
+         return -1;
+      }
+
+      return os_wrap_win32_handle(dup_handle);
+   }
+
    /*
     * On Windows child processes don't inherit handles by default:
     * https://devblogs.microsoft.com/oldnewthing/20111216-00/?p=8873

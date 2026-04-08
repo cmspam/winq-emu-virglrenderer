@@ -113,15 +113,28 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fildes, intptr_t off
       return MAP_FAILED;
    }
 
-   h = ((flags & MAP_ANONYMOUS) == 0) ?
-      (HANDLE)_get_osfhandle(fildes) : INVALID_HANDLE_VALUE;
-
-   if ((flags & MAP_ANONYMOUS) == 0 && h == INVALID_HANDLE_VALUE) {
-      errno = EBADF;
-      return MAP_FAILED;
+   if ((flags & MAP_ANONYMOUS) != 0) {
+      h = INVALID_HANDLE_VALUE;
+   } else {
+      h = (HANDLE)_get_osfhandle(fildes);
+      if (h == INVALID_HANDLE_VALUE) {
+         /* fildes may be a raw HANDLE (e.g. from CreateFileMapping passed as int
+          * through the Venus proxy protocol). Try using it directly.
+          */
+         h = (HANDLE)(intptr_t)fildes;
+      }
    }
 
    fm = CreateFileMappingW(h, NULL, protect, dwMaxSizeHigh, dwMaxSizeLow, NULL);
+
+   if (fm == NULL && (flags & MAP_ANONYMOUS) == 0) {
+      /* h may already be a file mapping handle (e.g. from os_create_anonymous_file
+       * which wraps CreateFileMapping + _open_osfhandle). CreateFileMapping fails
+       * when given a mapping handle instead of a file handle. Try using h directly.
+       */
+      fm = h;
+      h = NULL; /* signal that we're borrowing, not owning fm */
+   }
 
    if (fm == NULL) {
       errno = __map_mman_error(GetLastError(), EPERM);
@@ -134,7 +147,9 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fildes, intptr_t off
       map = MapViewOfFileEx(fm, desiredAccess, dwFileOffsetHigh, dwFileOffsetLow, len, addr);
    }
 
-   CloseHandle(fm);
+   /* Only close fm if we created it (h != NULL means we own fm) */
+   if (h != NULL)
+      CloseHandle(fm);
 
    if (map == NULL) {
       errno = __map_mman_error(GetLastError(), EPERM);

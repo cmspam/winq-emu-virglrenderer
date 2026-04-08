@@ -8,11 +8,19 @@
 
 #include "proxy_common.h"
 
+#ifndef _WIN32
 #include <sys/types.h>
+#endif
 
 struct proxy_server {
+#ifndef _WIN32
    pid_t pid;
+#endif
    int client_fd;
+#ifdef _WIN32
+   /* opaque pointer to win32 server thread state */
+   void *thread_data;
+#endif
 };
 
 struct proxy_server *

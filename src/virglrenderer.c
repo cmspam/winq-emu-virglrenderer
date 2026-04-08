@@ -40,7 +40,9 @@
 #include "pipe/p_state.h"
 #include "util/u_format.h"
 #include "util/u_math.h"
+#include "util/os_file.h"
 #include "vkr_allocator.h"
+#include "vkr_renderer.h"
 #include "drm_renderer.h"
 #include "proxy/proxy_renderer.h"
 #include "vrend/vrend_renderer.h"
@@ -239,8 +241,9 @@ int virgl_renderer_context_create_with_flags(uint32_t ctx_id,
       ctx = vrend_renderer_context_create(ctx_id, nlen, name);
       break;
    case VIRTGPU_DRM_CAPSET_VENUS:
-      if (!state.proxy_initialized)
+      if (!state.proxy_initialized) {
          return EINVAL;
+      }
       ctx = proxy_context_create(ctx_id, ctx_flags, nlen, name);
       break;
    case VIRTGPU_DRM_CAPSET_DRM:
@@ -570,7 +573,7 @@ void virgl_renderer_get_cap_set(uint32_t cap_set, uint32_t *max_ver,
       break;
    case VIRTGPU_DRM_CAPSET_VENUS:
       *max_ver = 0;
-      *max_size = proxy_get_capset(cap_set, NULL);
+      *max_size = vkr_get_capset(NULL, state.flags);
       break;
    case VIRTGPU_DRM_CAPSET_DRM:
       *max_ver = 0;
@@ -1281,7 +1284,7 @@ int virgl_renderer_resource_map(uint32_t res_handle, void **out_map, uint64_t *o
       }
 
       if (export_fd_type != fd_type)
-         close(fd);
+         os_close_fd(fd);
    }
 
    if (!map || map == MAP_FAILED)
@@ -1335,7 +1338,7 @@ int virgl_renderer_resource_map_fixed(uint32_t res_handle, void *addr)
    }
 
    if (export_fd_type != fd_type)
-      close(fd);
+      os_close_fd(fd);
 
    if (!map)
       return -EOPNOTSUPP;

@@ -8,6 +8,59 @@
 #include "vkr_buffer_gen.h"
 #include "vkr_physical_device.h"
 
+static VkExternalMemoryHandleTypeFlags
+vkr_buffer_get_host_external_handle_types(struct vkr_device *dev)
+{
+#ifdef _WIN32
+   if (dev->physical_device->host_external_memory_win32)
+      return VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+#endif
+   if (dev->physical_device->KHR_external_memory_fd)
+      return VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+
+   return 0;
+}
+
+static void
+vkr_buffer_prepare_external_create_info(struct vkr_device *dev,
+                                        const VkBufferCreateInfo **in_out_create_info,
+                                        VkBufferCreateInfo *create_info_storage,
+                                        VkExternalMemoryBufferCreateInfo *external_info_storage)
+{
+   const VkExternalMemoryHandleTypeFlags host_handle_types =
+      vkr_buffer_get_host_external_handle_types(dev);
+   if (!host_handle_types)
+      return;
+
+   VkBufferCreateInfo *create_info = create_info_storage;
+   *create_info = **in_out_create_info;
+
+   for (VkBaseOutStructure *iter = (VkBaseOutStructure *)create_info->pNext; iter;
+        iter = iter->pNext) {
+      if (iter->sType != VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO)
+         continue;
+
+      VkExternalMemoryBufferCreateInfo *external_info =
+         (VkExternalMemoryBufferCreateInfo *)iter;
+#ifdef _WIN32
+      if (external_info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT) {
+         external_info->handleTypes &= ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+         external_info->handleTypes |= host_handle_types;
+      }
+#endif
+      *in_out_create_info = create_info;
+      return;
+   }
+
+   *external_info_storage = (VkExternalMemoryBufferCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+      .pNext = (void *)create_info->pNext,
+      .handleTypes = host_handle_types,
+   };
+   create_info->pNext = (void *)external_info_storage;
+   *in_out_create_info = create_info;
+}
+
 static void
 vkr_dispatch_vkCreateBuffer(struct vn_dispatch_context *dispatch,
                             struct vn_command_vkCreateBuffer *args)
@@ -36,6 +89,15 @@ vkr_dispatch_vkCreateBuffer(struct vn_dispatch_context *dispatch,
     * to determine the exportability.  See
     * vkr_physical_device_init_memory_properties as well.
     */
+
+   struct vkr_device *dev = vkr_device_from_handle(args->device);
+   VkBufferCreateInfo create_info_storage;
+   VkExternalMemoryBufferCreateInfo external_info_storage;
+   const VkBufferCreateInfo *create_info = args->pCreateInfo;
+
+   vkr_buffer_prepare_external_create_info(dev, &create_info, &create_info_storage,
+                                           &external_info_storage);
+   ((struct vn_command_vkCreateBuffer *)args)->pCreateInfo = create_info;
 
    vkr_buffer_create_and_add(dispatch->data, args);
 }
