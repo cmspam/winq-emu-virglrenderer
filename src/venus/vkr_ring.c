@@ -6,8 +6,12 @@
 #include "vkr_ring.h"
 
 #include <stdio.h>
-#include <sys/resource.h>
 #include <time.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sys/resource.h>
+#endif
 
 #include "venus-protocol/vn_protocol_renderer_dispatches.h"
 
@@ -254,7 +258,14 @@ vkr_ring_thread(void *arg)
 
    snprintf(thread_name, ARRAY_SIZE(thread_name), "vkr-ring-%d", ctx->ctx_id);
    u_thread_setname(thread_name);
+#ifdef _WIN32
+   if (ring->prio_valid && !SetThreadPriority(GetCurrentThread(),
+         ring->prio <= -10 ? THREAD_PRIORITY_HIGHEST :
+         ring->prio <= 0   ? THREAD_PRIORITY_ABOVE_NORMAL :
+                             THREAD_PRIORITY_NORMAL)) {
+#else
    if (ring->prio_valid && setpriority(PRIO_PROCESS, 0, ring->prio)) {
+#endif
 #ifdef DEBUG
       /* Currently venus doesn't forward the CAP_SYS_NICE request upon forking, so
        * requesting a high priority outside of the normal range would be at the best
@@ -364,7 +375,11 @@ bool
 vkr_ring_stop(struct vkr_ring *ring)
 {
    mtx_lock(&ring->mutex);
+#ifdef _WIN32
+   if (GetThreadId(ring->thread) == GetCurrentThreadId()) {
+#else
    if (thrd_equal(ring->thread, thrd_current())) {
+#endif
       mtx_unlock(&ring->mutex);
       return false;
    }

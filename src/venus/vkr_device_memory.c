@@ -6,16 +6,32 @@
 #include "vkr_device_memory.h"
 
 #include <math.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <vulkan/vulkan_win32.h>
+static inline int getpagesize(void) {
+   SYSTEM_INFO si;
+   GetSystemInfo(&si);
+   return (int)si.dwPageSize;
+}
+#endif
 
 #include "venus-protocol/vn_protocol_renderer_transport.h"
+
+#include "util/os_file.h"
 
 #include "vkr_device_memory_gen.h"
 #include "vkr_physical_device.h"
 
 static bool
 vkr_get_fd_info_from_resource_info(struct vkr_context *ctx,
+                                   struct vkr_device *dev,
                                    const VkImportMemoryResourceInfoMESA *res_info,
-                                   VkImportMemoryFdInfoKHR *out)
+                                   VkImportMemoryFdInfoKHR *out_fd,
+#ifdef _WIN32
+                                   VkImportMemoryWin32HandleInfoKHR *out_win32,
+#endif
+                                   const void **out_import_info)
 {
    struct vkr_resource *res = vkr_context_get_resource(ctx, res_info->resourceId);
    if (!res) {
@@ -30,6 +46,27 @@ vkr_get_fd_info_from_resource_info(struct vkr_context *ctx,
       handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
       break;
    case VIRGL_RESOURCE_FD_OPAQUE:
+#ifdef _WIN32
+      if (dev->physical_device->host_external_memory_win32) {
+         HANDLE handle = os_get_win32_handle_from_fd(res->u.fd);
+         HANDLE dup_handle = NULL;
+         if (handle == INVALID_HANDLE_VALUE ||
+             !DuplicateHandle(GetCurrentProcess(), handle, GetCurrentProcess(), &dup_handle,
+                              0, FALSE, DUPLICATE_SAME_ACCESS)) {
+            return false;
+         }
+
+         *out_win32 = (VkImportMemoryWin32HandleInfoKHR){
+            .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR,
+            .pNext = res_info->pNext,
+            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT,
+            .handle = dup_handle,
+            .name = NULL,
+         };
+         *out_import_info = out_win32;
+         return true;
+      }
+#endif
       handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
       break;
    default:
@@ -40,12 +77,13 @@ vkr_get_fd_info_from_resource_info(struct vkr_context *ctx,
    if (fd < 0)
       return false;
 
-   *out = (VkImportMemoryFdInfoKHR){
+   *out_fd = (VkImportMemoryFdInfoKHR){
       .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
       .pNext = res_info->pNext,
       .fd = fd,
       .handleType = handle_type,
    };
+   *out_import_info = out_fd;
    return true;
 }
 
@@ -101,7 +139,7 @@ vkr_udmabuf_get_fd_info_from_allocation_info(struct vkr_physical_device *physica
       goto fail;
    }
 
-   close(memfd);
+   os_close_fd(memfd);
 
    *out_udmabuf_fd = udmabuf_fd;
    *out_fd_info = (VkImportMemoryFdInfoKHR){
@@ -115,9 +153,9 @@ vkr_udmabuf_get_fd_info_from_allocation_info(struct vkr_physical_device *physica
 
 fail:
    if (udmabuf_fd >= 0)
-      close(udmabuf_fd);
+      os_close_fd(udmabuf_fd);
    if (memfd >= 0)
-      close(memfd);
+      os_close_fd(memfd);
    return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 }
 
@@ -261,17 +299,27 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
 
    /* translate VkImportMemoryResourceInfoMESA into VkImportMemoryFdInfoKHR in place */
    VkImportMemoryFdInfoKHR local_import_info = { .fd = -1 };
+#ifdef _WIN32
+   VkImportMemoryWin32HandleInfoKHR local_import_win32_info = {
+      .handle = INVALID_HANDLE_VALUE,
+   };
+#endif
+   const void *import_info = NULL;
    VkImportMemoryResourceInfoMESA *res_info = NULL;
    VkBaseInStructure *prev_of_res_info = vkr_find_prev_struct(
       alloc_info, VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA);
    if (prev_of_res_info) {
       res_info = (VkImportMemoryResourceInfoMESA *)prev_of_res_info->pNext;
-      if (!vkr_get_fd_info_from_resource_info(ctx, res_info, &local_import_info)) {
+      if (!vkr_get_fd_info_from_resource_info(ctx, dev, res_info, &local_import_info,
+#ifdef _WIN32
+                                              &local_import_win32_info,
+#endif
+                                              &import_info)) {
          args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
          return;
       }
 
-      prev_of_res_info->pNext = (const struct VkBaseInStructure *)&local_import_info;
+      prev_of_res_info->pNext = import_info;
    }
 
    VkExportMemoryAllocateInfo *export_info =
@@ -294,6 +342,7 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
    const uint32_t property_flags =
       physical_dev->memory_properties.memoryTypes[mem_type_index].propertyFlags;
    uint32_t valid_fd_types = 0;
+   VkExternalMemoryHandleTypeFlags guest_export_handle_types = 0;
    int udmabuf_fd = -1;
    void *gbm_bo = NULL;
    VkExportMemoryAllocateInfo local_export_info;
@@ -311,22 +360,30 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
       if (!(force_gbm_import || force_udmabuf_import) &&
           (physical_dev->is_dma_buf_fd_export_supported ||
            (physical_dev->is_opaque_fd_export_supported && no_dma_buf_export))) {
-         const VkExternalMemoryHandleTypeFlagBits handle_type =
+         const VkExternalMemoryHandleTypeFlagBits guest_handle_type =
             physical_dev->is_dma_buf_fd_export_supported
                ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
                : VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+         VkExternalMemoryHandleTypeFlagBits host_handle_type = guest_handle_type;
+#ifdef _WIN32
+         if (guest_handle_type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT &&
+             physical_dev->host_external_memory_win32) {
+            host_handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+         }
+#endif
+         guest_export_handle_types = guest_handle_type;
          if (export_info) {
-            export_info->handleTypes |= handle_type;
+            export_info->handleTypes = host_handle_type;
          } else {
             local_export_info = (const VkExportMemoryAllocateInfo){
                .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
                .pNext = alloc_info->pNext,
-               .handleTypes = handle_type,
+               .handleTypes = host_handle_type,
             };
             export_info = &local_export_info;
             alloc_info->pNext = &local_export_info;
 
-            if (handle_type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT) {
+            if (guest_handle_type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT) {
                /* Guest virtgpu kernel aligns up blob mem size to the page boundary. No
                 * matter dma-buf or opaque fd export allocation, the actual allocation
                 * in most cases would follow the same padding. For dma-buf, we are able
@@ -375,17 +432,25 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
       }
    }
 
+   if (!guest_export_handle_types && export_info)
+      guest_export_handle_types = export_info->handleTypes;
+
    if (export_info) {
-      if (export_info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT)
+      if (guest_export_handle_types & VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT)
          valid_fd_types |= 1 << VIRGL_RESOURCE_FD_OPAQUE;
-      if (export_info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
+      if (guest_export_handle_types & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
          valid_fd_types |= 1 << VIRGL_RESOURCE_FD_DMABUF;
    }
 
    struct vkr_device_memory *mem = vkr_device_memory_create_and_add(ctx, args);
    if (!mem) {
       if (local_import_info.fd >= 0)
-         close(local_import_info.fd);
+         os_close_fd(local_import_info.fd);
+#ifdef _WIN32
+      if (local_import_win32_info.handle &&
+          local_import_win32_info.handle != INVALID_HANDLE_VALUE)
+         CloseHandle(local_import_win32_info.handle);
+#endif
       if (gbm_bo)
          vkr_gbm_bo_destroy(gbm_bo);
       return;
@@ -455,25 +520,41 @@ vkr_dispatch_vkGetMemoryResourcePropertiesMESA(
       return;
    }
 
-   if (res->fd_type != VIRGL_RESOURCE_FD_DMABUF) {
+   vn_replace_vkGetMemoryResourcePropertiesMESA_args_handle(args);
+   if (res->fd_type == VIRGL_RESOURCE_FD_DMABUF) {
+      static const VkExternalMemoryHandleTypeFlagBits handle_type =
+         VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+      VkMemoryFdPropertiesKHR mem_fd_props = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR,
+         .pNext = NULL,
+         .memoryTypeBits = 0,
+      };
+      args->ret =
+         vk->GetMemoryFdPropertiesKHR(args->device, handle_type, res->u.fd, &mem_fd_props);
+      if (args->ret != VK_SUCCESS)
+         return;
+
+      args->pMemoryResourceProperties->memoryTypeBits = mem_fd_props.memoryTypeBits;
+#ifdef _WIN32
+   } else if (res->fd_type == VIRGL_RESOURCE_FD_OPAQUE &&
+              dev->GetMemoryWin32HandlePropertiesKHR) {
+      HANDLE handle = os_get_win32_handle_from_fd(res->u.fd);
+      VkMemoryWin32HandlePropertiesKHR props = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR,
+         .pNext = NULL,
+         .memoryTypeBits = 0,
+      };
+      args->ret = dev->GetMemoryWin32HandlePropertiesKHR(
+         args->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT, handle, &props);
+      if (args->ret != VK_SUCCESS)
+         return;
+
+      args->pMemoryResourceProperties->memoryTypeBits = props.memoryTypeBits;
+#endif
+   } else {
       args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
       return;
    }
-
-   static const VkExternalMemoryHandleTypeFlagBits handle_type =
-      VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-   VkMemoryFdPropertiesKHR mem_fd_props = {
-      .sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR,
-      .pNext = NULL,
-      .memoryTypeBits = 0,
-   };
-   vn_replace_vkGetMemoryResourcePropertiesMESA_args_handle(args);
-   args->ret =
-      vk->GetMemoryFdPropertiesKHR(args->device, handle_type, res->u.fd, &mem_fd_props);
-   if (args->ret != VK_SUCCESS)
-      return;
-
-   args->pMemoryResourceProperties->memoryTypeBits = mem_fd_props.memoryTypeBits;
 
    VkMemoryResourceAllocationSizePropertiesMESA *alloc_size_props =
       vkr_find_struct(args->pMemoryResourceProperties->pNext,
@@ -508,7 +589,7 @@ vkr_device_memory_release(struct vkr_device_memory *mem)
    if (mem->gbm_bo)
       vkr_gbm_bo_destroy(mem->gbm_bo);
    if (mem->udmabuf_fd >= 0)
-      close(mem->udmabuf_fd);
+      os_close_fd(mem->udmabuf_fd);
 }
 
 bool
@@ -561,7 +642,13 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
    } else if (can_export_opaque) {
       /* prefer opaque for performance? */
       fd_type = VIRGL_RESOURCE_FD_OPAQUE;
-      handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+      handle_type =
+#ifdef _WIN32
+         mem->device->physical_device->host_external_memory_win32
+            ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT
+            :
+#endif
+            VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
 
       STATIC_ASSERT(sizeof(vulkan_info.device_uuid) == VK_UUID_SIZE);
       STATIC_ASSERT(sizeof(vulkan_info.driver_uuid) == VK_UUID_SIZE);
@@ -596,15 +683,39 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
       }
    } else {
       struct vn_device_proc_table *vk = &mem->device->proc_table;
-      const VkMemoryGetFdInfoKHR fd_info = {
-         .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
-         .memory = mem->base.handle.device_memory,
-         .handleType = handle_type,
-      };
-      VkResult ret = vk->GetMemoryFdKHR(mem->device->base.handle.device, &fd_info, &fd);
-      if (ret != VK_SUCCESS) {
-         vkr_log("mem fd export failed (vk ret %d)", ret);
-         return false;
+#ifdef _WIN32
+      if (handle_type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT &&
+          mem->device->GetMemoryWin32HandleKHR) {
+         HANDLE handle = INVALID_HANDLE_VALUE;
+         const VkMemoryGetWin32HandleInfoKHR info = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR,
+            .memory = mem->base.handle.device_memory,
+            .handleType = handle_type,
+         };
+         VkResult ret = mem->device->GetMemoryWin32HandleKHR(
+            mem->device->base.handle.device, &info, &handle);
+         if (ret != VK_SUCCESS) {
+            vkr_log("mem win32 handle export failed (vk ret %d)", ret);
+            return false;
+         }
+         fd = os_wrap_win32_handle(handle);
+         if (fd < 0) {
+            CloseHandle(handle);
+            return false;
+         }
+      } else
+#endif
+      {
+         const VkMemoryGetFdInfoKHR fd_info = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
+            .memory = mem->base.handle.device_memory,
+            .handleType = handle_type,
+         };
+         VkResult ret = vk->GetMemoryFdKHR(mem->device->base.handle.device, &fd_info, &fd);
+         if (ret != VK_SUCCESS) {
+            vkr_log("mem fd export failed (vk ret %d)", ret);
+            return false;
+         }
       }
    }
 
@@ -613,13 +724,12 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
       if (dma_buf_size < 0 || (uint64_t)dma_buf_size < blob_size) {
          vkr_log("mem dma_buf_size %lld < blob_size %" PRIu64, (long long)dma_buf_size,
                  blob_size);
-         close(fd);
+         os_close_fd(fd);
          return false;
       }
    }
 
    mem->exported = true;
-
    *out_blob = (struct virgl_context_blob){
       .type = fd_type,
       .u.fd = fd,

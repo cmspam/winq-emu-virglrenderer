@@ -48,7 +48,7 @@ virgl_resource_destroy_func(void *val)
       pipe_callbacks.unref(res->pipe_resource, pipe_callbacks.data);
    if ((res->fd_type != VIRGL_RESOURCE_FD_INVALID) &&
        (res->fd_type != VIRGL_RESOURCE_OPAQUE_HANDLE))
-      close(res->fd);
+      os_close_fd(res->fd);
 
    free(res);
 }
@@ -144,7 +144,7 @@ virgl_resource_create_from_fd(uint32_t res_id,
 
    res = virgl_resource_create(res_id);
    if (!res) {
-      close(fd);
+      os_close_fd(fd);
       return NULL;
    }
 

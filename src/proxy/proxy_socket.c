@@ -6,6 +6,209 @@
 #include "proxy_socket.h"
 #include "server/render_protocol.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <io.h>
+
+#define close closesocket
+#define PROXY_SOCKET_MAX_FD_COUNT 8
+
+/*
+ * Windows implementation of proxy socket using TCP localhost.
+ *
+ * On Windows, Unix domain sockets and SCM_RIGHTS are not available.
+ * Since we only use thread worker mode (in-process), file descriptors
+ * are shared across threads and can be passed as inline data.
+ *
+ * Protocol for messages with fds:
+ *   [uint32_t data_len][data bytes][uint32_t fd_count][int fds...]
+ */
+
+bool
+proxy_socket_pair(int out_fds[static 2])
+{
+   WSADATA wsa;
+   WSAStartup(MAKEWORD(2, 2), &wsa);
+
+   SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+   if (listener == INVALID_SOCKET)
+      return false;
+
+   struct sockaddr_in addr = {
+      .sin_family = AF_INET,
+      .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+      .sin_port = 0,
+   };
+
+   if (bind(listener, (struct sockaddr *)&addr, sizeof(addr)) ||
+       listen(listener, 1)) {
+      closesocket(listener);
+      return false;
+   }
+
+   int addrlen = sizeof(addr);
+   getsockname(listener, (struct sockaddr *)&addr, &addrlen);
+
+   SOCKET client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+   if (client == INVALID_SOCKET) {
+      closesocket(listener);
+      return false;
+   }
+
+   if (connect(client, (struct sockaddr *)&addr, sizeof(addr))) {
+      closesocket(client);
+      closesocket(listener);
+      return false;
+   }
+
+   SOCKET server = accept(listener, NULL, NULL);
+   closesocket(listener);
+
+   if (server == INVALID_SOCKET) {
+      closesocket(client);
+      return false;
+   }
+
+   out_fds[0] = (int)client;
+   out_fds[1] = (int)server;
+   return true;
+}
+
+bool
+proxy_socket_is_valid(int fd)
+{
+   /* On Windows with TCP sockets, just check it's a valid socket */
+   int type;
+   int len = sizeof(type);
+   return getsockopt((SOCKET)fd, SOL_SOCKET, SO_TYPE, (char *)&type, &len) == 0;
+}
+
+void
+proxy_socket_init(struct proxy_socket *socket, int fd)
+{
+   assert(fd >= 0);
+   *socket = (struct proxy_socket){
+      .fd = fd,
+   };
+}
+
+void
+proxy_socket_fini(struct proxy_socket *socket)
+{
+   closesocket((SOCKET)socket->fd);
+}
+
+bool
+proxy_socket_is_connected(const struct proxy_socket *socket)
+{
+   /* Quick poll to check if socket is still open */
+   fd_set readfds;
+   struct timeval tv = { 0, 0 };
+   FD_ZERO(&readfds);
+   FD_SET((SOCKET)socket->fd, &readfds);
+   int ret = select(0, &readfds, NULL, NULL, &tv);
+   return ret >= 0;
+}
+
+static bool
+send_all(SOCKET s, const void *data, size_t len)
+{
+   const char *p = data;
+   while (len > 0) {
+      int sent = send(s, p, (int)len, 0);
+      if (sent <= 0)
+         return false;
+      p += sent;
+      len -= sent;
+   }
+   return true;
+}
+
+static bool
+recv_all(SOCKET s, void *data, size_t len)
+{
+   char *p = data;
+   while (len > 0) {
+      int got = recv(s, p, (int)len, 0);
+      if (got <= 0)
+         return false;
+      p += got;
+      len -= got;
+   }
+   return true;
+}
+
+bool
+proxy_socket_receive_reply(struct proxy_socket *socket, void *data, size_t size)
+{
+   return recv_all((SOCKET)socket->fd, data, size);
+}
+
+bool
+proxy_socket_receive_reply_with_fds(struct proxy_socket *socket,
+                                    void *data,
+                                    size_t size,
+                                    int *fds,
+                                    int max_fd_count,
+                                    int *out_fd_count)
+{
+   if (!recv_all((SOCKET)socket->fd, data, size))
+      return false;
+
+   /* Receive inline fd count and fds (thread-local, no SCM_RIGHTS needed) */
+   uint32_t fd_count = 0;
+   if (!recv_all((SOCKET)socket->fd, &fd_count, sizeof(fd_count)))
+      return false;
+
+   if (fd_count > (uint32_t)max_fd_count) {
+      proxy_log("too many fds: %u > %d", fd_count, max_fd_count);
+      return false;
+   }
+
+   if (fd_count > 0) {
+      if (!recv_all((SOCKET)socket->fd, fds, sizeof(int) * fd_count))
+         return false;
+   }
+
+   if (out_fd_count)
+      *out_fd_count = (int)fd_count;
+
+   return true;
+}
+
+bool
+proxy_socket_send_request(struct proxy_socket *socket, const void *data, size_t size)
+{
+   return send_all((SOCKET)socket->fd, data, size);
+}
+
+bool
+proxy_socket_send_request_with_fds(struct proxy_socket *socket,
+                                   const void *data,
+                                   size_t size,
+                                   const int *fds,
+                                   int fd_count)
+{
+   if (!send_all((SOCKET)socket->fd, data, size))
+      return false;
+
+   /* Send fds inline (threads share fd table, no SCM_RIGHTS needed) */
+   uint32_t count = (uint32_t)fd_count;
+   if (!send_all((SOCKET)socket->fd, &count, sizeof(count)))
+      return false;
+
+   if (fd_count > 0) {
+      if (!send_all((SOCKET)socket->fd, fds, sizeof(int) * fd_count))
+         return false;
+   }
+
+   return true;
+}
+
+#else /* !_WIN32 */
+
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -406,3 +609,5 @@ proxy_socket_send_request_with_fds(struct proxy_socket *socket,
 {
    return proxy_socket_send_request_internal(socket, data, size, fds, fd_count);
 }
+
+#endif /* _WIN32 */

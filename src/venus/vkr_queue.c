@@ -7,9 +7,65 @@
 
 #include "venus-protocol/vn_protocol_renderer_queue.h"
 
+#include "util/os_file.h"
+
 #include "vkr_context.h"
 #include "vkr_physical_device.h"
 #include "vkr_queue_gen.h"
+
+static struct vkr_queue *
+vkr_device_get_any_queue(struct vkr_device *dev)
+{
+   if (list_is_empty(&dev->queues))
+      return NULL;
+
+   return LIST_ENTRY(struct vkr_queue, dev->queues.next, base.track_head);
+}
+
+static bool
+vkr_queue_submit_empty(struct vkr_queue *queue,
+                       uint32_t wait_count,
+                       const VkSemaphore *wait_semaphores,
+                       const VkPipelineStageFlags *wait_stages,
+                       uint32_t signal_count,
+                       const VkSemaphore *signal_semaphores,
+                       bool wait_for_completion)
+{
+   struct vkr_device *dev = queue->device;
+   struct vn_device_proc_table *vk = &dev->proc_table;
+   VkFence fence = VK_NULL_HANDLE;
+
+   if (wait_for_completion) {
+      const VkFenceCreateInfo fence_info = {
+         .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+      };
+      if (vk->CreateFence(dev->base.handle.device, &fence_info, NULL, &fence) !=
+          VK_SUCCESS)
+         return false;
+   }
+
+   const VkSubmitInfo submit_info = {
+      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+      .waitSemaphoreCount = wait_count,
+      .pWaitSemaphores = wait_semaphores,
+      .pWaitDstStageMask = wait_stages,
+      .signalSemaphoreCount = signal_count,
+      .pSignalSemaphores = signal_semaphores,
+   };
+
+   mtx_lock(&queue->vk_mutex);
+   VkResult result =
+      vk->QueueSubmit(queue->base.handle.queue, 1, &submit_info, fence);
+   if (result == VK_SUCCESS && wait_for_completion) {
+      result = vk->WaitForFences(dev->base.handle.device, 1, &fence, true, UINT64_MAX);
+   }
+   mtx_unlock(&queue->vk_mutex);
+
+   if (fence != VK_NULL_HANDLE)
+      vk->DestroyFence(dev->base.handle.device, fence, NULL);
+
+   return result == VK_SUCCESS;
+}
 
 static struct vkr_queue_sync *
 vkr_device_alloc_queue_sync(struct vkr_device *dev,
@@ -476,7 +532,6 @@ vkr_dispatch_vkResetFenceResourceMESA(struct vn_dispatch_context *dispatch,
 {
    struct vkr_context *ctx = dispatch->data;
    struct vkr_device *dev = vkr_device_from_handle(args->device);
-   struct vn_device_proc_table *vk = &dev->proc_table;
    int fd = -1;
 
    vn_replace_vkResetFenceResourceMESA_args_handle(args);
@@ -486,14 +541,15 @@ vkr_dispatch_vkResetFenceResourceMESA(struct vn_dispatch_context *dispatch,
       .fence = args->fence,
       .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT,
    };
-   VkResult result = vk->GetFenceFdKHR(args->device, &info, &fd);
+   VkResult result =
+      vkr_device_get_fence_fd(dev, info.fence, info.handleType, &fd);
    if (result != VK_SUCCESS) {
       vkr_context_set_fatal(ctx);
       return;
    }
 
    if (fd >= 0)
-      close(fd);
+      os_close_fd(fd);
 }
 
 static void
@@ -550,24 +606,36 @@ vkr_dispatch_vkWaitSemaphoreResourceMESA(
 {
    struct vkr_context *ctx = dispatch->data;
    struct vkr_device *dev = vkr_device_from_handle(args->device);
-   struct vn_device_proc_table *vk = &dev->proc_table;
-   int fd = -1;
 
    vn_replace_vkWaitSemaphoreResourceMESA_args_handle(args);
+
+#ifdef _WIN32
+   struct vkr_queue *queue = vkr_device_get_any_queue(dev);
+   const VkSemaphore semaphore = args->semaphore;
+   const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+   if (!queue || !vkr_queue_submit_empty(queue, 1, &semaphore, &wait_stage, 0, NULL,
+                                         true)) {
+      vkr_context_set_fatal(ctx);
+   }
+   return;
+#else
+   int fd = -1;
 
    const VkSemaphoreGetFdInfoKHR info = {
       .sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
       .semaphore = args->semaphore,
       .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
    };
-   VkResult result = vk->GetSemaphoreFdKHR(args->device, &info, &fd);
+   VkResult result =
+      vkr_device_get_semaphore_fd(dev, info.semaphore, info.handleType, &fd);
    if (result != VK_SUCCESS) {
       vkr_context_set_fatal(ctx);
       return;
    }
 
    if (fd >= 0)
-      close(fd);
+      os_close_fd(fd);
+#endif
 }
 
 static void
@@ -577,7 +645,6 @@ vkr_dispatch_vkImportSemaphoreResourceMESA(
 {
    struct vkr_context *ctx = dispatch->data;
    struct vkr_device *dev = vkr_device_from_handle(args->device);
-   struct vn_device_proc_table *vk = &dev->proc_table;
 
    vn_replace_vkImportSemaphoreResourceMESA_args_handle(args);
 
@@ -586,6 +653,12 @@ vkr_dispatch_vkImportSemaphoreResourceMESA(
    /* resourceId 0 is for importing a signaled payload to sync_fd fence */
    assert(!res_info->resourceId);
 
+#ifdef _WIN32
+   struct vkr_queue *queue = vkr_device_get_any_queue(dev);
+   const VkSemaphore semaphore = res_info->semaphore;
+   if (!queue || !vkr_queue_submit_empty(queue, 0, NULL, NULL, 1, &semaphore, false))
+      vkr_context_set_fatal(ctx);
+#else
    const VkImportSemaphoreFdInfoKHR import_info = {
       .sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR,
       .semaphore = res_info->semaphore,
@@ -593,8 +666,9 @@ vkr_dispatch_vkImportSemaphoreResourceMESA(
       .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
       .fd = -1,
    };
-   if (vk->ImportSemaphoreFdKHR(args->device, &import_info) != VK_SUCCESS)
+   if (vkr_device_import_semaphore_fd(dev, &import_info) != VK_SUCCESS)
       vkr_context_set_fatal(ctx);
+#endif
 }
 
 static void

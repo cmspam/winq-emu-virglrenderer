@@ -11,6 +11,10 @@
 #include <stdbool.h>
 #include <stdio.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #ifdef  __cplusplus
 extern "C" {
 #endif
@@ -29,6 +33,20 @@ os_file_create_unique(const char *filename, int filemode);
  */
 int
 os_dupfd_cloexec(int fd);
+
+int
+os_close_fd(int fd);
+
+#ifdef _WIN32
+bool
+os_fd_is_handle_token(int fd);
+
+HANDLE
+os_get_win32_handle_from_fd(int fd);
+
+int
+os_wrap_win32_handle(HANDLE handle);
+#endif
 
 /*
  * Read a file.

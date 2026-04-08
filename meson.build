@@ -388,7 +388,10 @@ if with_venus
       conf_data.set('ENABLE_VULKAN_PRELOAD', 1)
    endif
 
-   if with_render_server_worker == 'process'
+   if with_host_windows
+      # Windows always uses thread workers (in-process render server)
+      conf_data.set('ENABLE_RENDER_SERVER_WORKER_THREAD', 1)
+   elif with_render_server_worker == 'process'
       conf_data.set('ENABLE_RENDER_SERVER_WORKER_PROCESS', 1)
    elif with_render_server_worker == 'thread'
       if not has_attribute_cleanup
@@ -440,7 +443,7 @@ if not with_host_windows
    subdir('vtest')
 endif
 
-if with_render_server
+if with_render_server and not with_host_windows
 subdir('server')
 endif
 

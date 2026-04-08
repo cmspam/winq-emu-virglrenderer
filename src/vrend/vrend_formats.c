@@ -713,8 +713,10 @@ unsigned vrend_renderer_query_multisample_caps(unsigned max_samples, struct virg
    int out_buf_offsets[4] = {0,1,2,4};
    int lowest_working_ms_count_idx = -1;
 
-   assert(glGetError() == GL_NO_ERROR &&
-          "Stale error state detected, please check for failures in initialization");
+   /* Drain any stale GL error (e.g. from GL_SMOOTH_POINT_SIZE_RANGE
+    * returning GL_INVALID_ENUM on some Windows GL drivers).
+    */
+   (void)glGetError();
 
    glGenFramebuffers( 1, &fbo );
    memset(caps->sample_locations, 0, 8 * sizeof(uint32_t));

@@ -32,7 +32,14 @@
 #ifdef HAVE_EVENTFD_H
 #include <sys/eventfd.h>
 #endif
+#ifdef _WIN32
+#include <windows.h>
+#include <io.h>
+#include <process.h>  /* _getpid */
+#define getpid _getpid
+#else
 #include <unistd.h>
+#endif
 
 #include "util/os_misc.h"
 #include "util/u_pointer.h"
@@ -88,7 +95,7 @@ bool equal_func(const void *key1, const void *key2)
 
 bool has_eventfd(void)
 {
-#ifdef HAVE_EVENTFD_H
+#if defined(HAVE_EVENTFD_H) || defined(_WIN32)
    return true;
 #else
    return false;
@@ -99,6 +106,14 @@ int create_eventfd(unsigned int initval)
 {
 #ifdef HAVE_EVENTFD_H
    return eventfd(initval, EFD_CLOEXEC | EFD_NONBLOCK);
+#elif defined(_WIN32)
+   HANDLE event = CreateEventA(NULL, TRUE, initval ? TRUE : FALSE, NULL);
+   if (!event)
+      return -1;
+   int fd = _open_osfhandle((intptr_t)event, 0);
+   if (fd < 0)
+      CloseHandle(event);
+   return fd;
 #else
    (void)initval;
    return -1;
@@ -107,6 +122,13 @@ int create_eventfd(unsigned int initval)
 
 int write_eventfd(int fd, uint64_t val)
 {
+#ifdef _WIN32
+   (void)val;
+   HANDLE event = (HANDLE)_get_osfhandle(fd);
+   if (event == INVALID_HANDLE_VALUE)
+      return -1;
+   return SetEvent(event) ? 0 : -1;
+#else
    const char *buf = (const char *)&val;
    size_t count = sizeof(val);
    ssize_t ret = 0;
@@ -123,15 +145,22 @@ int write_eventfd(int fd, uint64_t val)
    }
 
    return count ? -1 : 0;
+#endif
 }
 
 void flush_eventfd(int fd)
 {
+#ifdef _WIN32
+   HANDLE event = (HANDLE)_get_osfhandle(fd);
+   if (event != INVALID_HANDLE_VALUE)
+      ResetEvent(event);
+#else
     ssize_t len;
     uint64_t value;
     do {
        len = read(fd, &value, sizeof(value));
     } while ((len == -1 && errno == EINTR) || len == sizeof(value));
+#endif
 }
 
 const struct log_levels_lut {

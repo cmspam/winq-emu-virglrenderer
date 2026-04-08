@@ -190,6 +190,7 @@ struct vn_info_extension_table {
          bool KHR_shader_untyped_pointers;
          bool KHR_spirv_1_4;
          bool KHR_storage_buffer_storage_class;
+         bool KHR_swapchain;
          bool KHR_synchronization2;
          bool KHR_timeline_semaphore;
          bool KHR_uniform_buffer_standard_layout;
@@ -214,8 +215,8 @@ struct vn_info_extension {
 };
 
 /* sorted by extension names for bsearch */
-static const uint32_t _vn_info_extension_count = 187;
-static const struct vn_info_extension _vn_info_extensions[187] = {
+static const uint32_t _vn_info_extension_count = 188;
+static const struct vn_info_extension _vn_info_extensions[188] = {
    { "VK_ARM_rasterization_order_attachment_access", 343, 1 },
    { "VK_EXT_4444_formats", 341, 1 },
    { "VK_EXT_attachment_feedback_loop_dynamic_state", 525, 1 },
@@ -392,6 +393,7 @@ static const struct vn_info_extension _vn_info_extensions[187] = {
    { "VK_KHR_shader_untyped_pointers", 388, 1 },
    { "VK_KHR_spirv_1_4", 237, 1 },
    { "VK_KHR_storage_buffer_storage_class", 132, 1 },
+   { "VK_KHR_swapchain", 2, 70 },
    { "VK_KHR_synchronization2", 315, 1 },
    { "VK_KHR_timeline_semaphore", 208, 2 },
    { "VK_KHR_uniform_buffer_standard_layout", 254, 1 },
