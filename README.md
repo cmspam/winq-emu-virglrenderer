@@ -24,33 +24,45 @@ All changes are in the `winq-emu-alpha1` branch, applied as a single commit on t
 
 ### Requirements (MSYS2 UCRT64)
 
+All builds must be done from the MSYS2 UCRT64 shell (not MINGW64 or MSYS).
+
 ```bash
-pacman -S mingw-w64-ucrt64-x86_64-meson mingw-w64-ucrt64-x86_64-ninja \
-          mingw-w64-ucrt64-x86_64-gcc mingw-w64-ucrt64-x86_64-pkg-config \
-          mingw-w64-ucrt64-x86_64-libepoxy mingw-w64-ucrt64-x86_64-vulkan-headers \
-          mingw-w64-ucrt64-x86_64-vulkan-loader mingw-w64-ucrt64-x86_64-angleproject
+pacman -S mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-meson \
+          mingw-w64-ucrt-x86_64-ninja mingw-w64-ucrt-x86_64-pkg-config \
+          mingw-w64-ucrt-x86_64-libepoxy mingw-w64-ucrt-x86_64-vulkan-headers \
+          mingw-w64-ucrt-x86_64-vulkan-loader mingw-w64-ucrt-x86_64-python \
+          mingw-w64-ucrt-x86_64-python-yaml
 ```
+
+**Important**: The `mingw-w64-ucrt-x86_64-python-yaml` package is required — the build uses Python YAML processing for gallium format table generation and will fail at configure time without it.
 
 ### Build
 
 ```bash
-meson setup builddir --prefix=/ucrt64
+meson setup builddir --prefix=/ucrt64 -Dvenus=true -Dtests=false
 ninja -C builddir
 ```
 
 The output is `builddir/src/libvirglrenderer-1.dll`.
 
+### Install
+
+To make the library available to QEMU during its build:
+
+```bash
+ninja -C builddir install
+```
+
+This installs `libvirglrenderer-1.dll` to `/ucrt64/bin/` and the pkg-config file to `/ucrt64/lib/pkgconfig/`.
+
 ## Syncing with Upstream
 
-This fork tracks [virglrenderer upstream](https://gitlab.freedesktop.org/virgl/virglrenderer). To sync:
+This fork tracks [virglrenderer upstream](https://gitlab.freedesktop.org/virgl/virglrenderer). All custom changes are in a single commit, so rebasing is straightforward:
 
 ```bash
 git remote add upstream https://gitlab.freedesktop.org/virgl/virglrenderer.git
 git fetch upstream
-git checkout main
-git merge upstream/main
-git checkout winq-emu-alpha1
-git rebase main
+git rebase upstream/main
 ```
 
 ## Related Projects
