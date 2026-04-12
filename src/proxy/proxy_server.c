@@ -220,17 +220,7 @@ server_cb_debug_logger(UNUSED enum virgl_log_level_flags log_level,
                        const char *message,
                        UNUSED void *user_data)
 {
-   fputs("vkr: ", stderr);
-   fputs(message, stderr);
-   fflush(stderr);
-
-   FILE *f = fopen("venus-server.log",
-                   "a");
-   if (f) {
-      fputs("vkr: ", f);
-      fputs(message, f);
-      fclose(f);
-   }
+   (void)message;
 }
 
 static const struct vkr_renderer_callbacks server_vkr_cbs = {
@@ -241,17 +231,8 @@ static const struct vkr_renderer_callbacks server_vkr_cbs = {
 static FILE *
 server_dbgf(const char *fmt, ...)
 {
-   static FILE *f = NULL;
-   if (!f)
-      f = fopen("venus-server.log", "a");
-   if (f) {
-      va_list ap;
-      va_start(ap, fmt);
-      vfprintf(f, fmt, ap);
-      va_end(ap);
-      fflush(f);
-   }
-   return f;
+   (void)fmt;
+   return NULL;
 }
 
 static bool
@@ -528,16 +509,6 @@ static int
 server_main_thread(void *arg)
 {
    struct server_thread_state *state = arg;
-
-   {
-      /* Debug: write directly to a file to confirm thread started */
-      FILE *tf = fopen("venus-thread.log", "w");
-      if (tf) {
-         fprintf(tf, "server_main_thread STARTED fd=%d\n", state->socket_fd);
-         fflush(tf);
-         fclose(tf);
-      }
-   }
 
    while (true) {
       struct render_client_op_header hdr;

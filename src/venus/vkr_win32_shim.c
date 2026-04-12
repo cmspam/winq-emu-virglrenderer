@@ -595,12 +595,6 @@ vkr_win32_device_install_shim(struct vkr_device *dev)
    vk->DestroyEvent = vkr_win32_DestroyEvent;
    vk->DestroyQueryPool = vkr_win32_DestroyQueryPool;
 
-   vkr_log("win32 shim: installed for device %p (mem=%d fence=%d sem=%d, "
-           "deferred-destroy=metadata)",
-           (void *)entry->handle,
-           !!dev->GetMemoryWin32HandleKHR,
-           !!dev->GetFenceWin32HandleKHR,
-           !!dev->GetSemaphoreWin32HandleKHR);
 }
 
 void
@@ -631,9 +625,6 @@ vkr_win32_flush_deferred_destroys(struct vkr_device *dev)
       dev->deferred_destroy_capacity = 0;
       return;
    }
-
-   vkr_log("win32 shim: flushing %u deferred object destructions",
-           dev->deferred_destroy_count);
 
    /* At this point the proc table has been restored to real driver
     * functions (by vkr_win32_device_remove_shim) and DeviceWaitIdle
