@@ -75,6 +75,7 @@
 #include "vrend_winsys.h"
 #include "vrend_renderer.h"
 #include "vrend_video.h"
+#include "vrend_iov.h"
 
 /*
  * On Windows we don't have dma-buf / EGL_LINUX_DMA_BUF — the D3D11 video
@@ -428,6 +429,57 @@ static int sync_cpu_planes_to_video_buffer(struct vrend_video_buffer *buf,
         }
 
         glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+
+        /* Mirror the same bytes into the guest-side BO (res->iov). Two
+         * consumers of a pipe_video_buffer plane exist in Mesa's VA
+         * frontend:
+         *   1. vaDeriveImage / vaGetImage — calls pipe->texture_map,
+         *      which on virgl triggers TRANSFER_FROM_HOST to read back
+         *      the host GL texture. The glTexSubImage2D above is what
+         *      this path reads. ✓
+         *   2. vaExportSurfaceHandle — hands the caller a DMA-buf / FD
+         *      pointing directly at the guest-side virtio-gpu BO (what
+         *      we access here as res->iov). It does NOT trigger a
+         *      TRANSFER_FROM_HOST round trip. If we don't also write the
+         *      bytes into res->iov, Chromium's VaapiVideoDecoder
+         *      zero-copy EGLImage samples uninitialized guest VRAM —
+         *      hence "flashes of other applications" reported on Brave.
+         *
+         * Copy line-by-line so we can strip any source pitch padding;
+         * the guest BO is tightly packed at the plane's natural width.
+         * Each plane is its own vrend_resource with its own iov, so
+         * we always write starting at offset 0. `vrend_write_to_iovec`
+         * handles multi-segment iov for us. */
+        if (res->iov && res->num_iovs > 0) {
+            uint32_t bytes_per_row;
+            uint32_t num_rows;
+            uint32_t src_byte_pitch;
+            if (i == 0) {
+                /* Y plane: 1 byte/pixel, full resolution. */
+                bytes_per_row   = dmabuf->width;
+                num_rows        = dmabuf->height;
+                src_byte_pitch  = pitches[0];
+            } else if (!need_split) {
+                /* NV12 UV plane: 2 bytes/pixel-pair, half-height. */
+                bytes_per_row   = dmabuf->width;  /* W/2 pixels * 2 bytes */
+                num_rows        = dmabuf->height / 2;
+                src_byte_pitch  = pitches[1];
+            } else {
+                /* I420 U or V plane from our scratch split: 1 byte/pixel,
+                 * W/2 × H/2, tightly packed in the scratch buffer. */
+                bytes_per_row   = dmabuf->width / 2;
+                num_rows        = dmabuf->height / 2;
+                src_byte_pitch  = dmabuf->width / 2;
+            }
+            const char *src_bytes = (const char *)src;
+            size_t dst_offset = 0;
+            for (uint32_t row = 0; row < num_rows; row++) {
+                vrend_write_to_iovec(res->iov, res->num_iovs, dst_offset,
+                                     src_bytes + (size_t)row * src_byte_pitch,
+                                     bytes_per_row);
+                dst_offset += bytes_per_row;
+            }
+        }
     }
 
     glBindTexture(GL_TEXTURE_2D, 0);
