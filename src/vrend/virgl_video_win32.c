@@ -2219,10 +2219,23 @@ static void fill_dxva_picparams_hevc(struct virgl_video_codec *codec,
     pp->CurrPicOrderCntVal           = desc->CurrPicOrderCntVal;
 
     /* RefPicList: up to 15 entries. DXVA encodes a long-term flag in the
-     * AssociatedFlag bit; we mark unused slots with bPicEntry=0xFF. */
+     * AssociatedFlag bit; we mark unused slots with bPicEntry=0xFF. We
+     * preserve Mesa's positional mapping: desc->ref[i] -> RefPicList[i]
+     * so that desc->RefPicSetStCurr{Before,After,LtCurr}[] indices
+     * (which reference positions in desc->ref[]) remain valid indices
+     * into pp->RefPicList[]. This matches the VA-API ReferenceFrames[]
+     * convention that Mesa serialises one-for-one from.
+     *
+     * PicOrderCntValList[i] must be populated from desc->PicOrderCntVal[i]
+     * unconditionally — even for invalid RefPicList entries. The driver
+     * indexes PicOrderCntValList by the same i it reads RefPicList[] at
+     * when resolving RefPicSetStCurr*, and a stale zero POC for a
+     * supposedly-invalid slot that RefPicSet still references produces
+     * wrong MV scaling on B-frames. This matches ffmpeg dxva2_hevc.c
+     * which copies PicOrderCntVal[] verbatim. */
     for (i = 0; i < 15; i++) {
         dxva_picentry_hevc_invalidate(&pp->RefPicList[i]);
-        pp->PicOrderCntValList[i] = 0;
+        pp->PicOrderCntValList[i] = desc->PicOrderCntVal[i];
     }
     for (i = 0; i < 15; i++) {
         uint32_t bid = desc->ref[i];
@@ -2243,16 +2256,17 @@ static void fill_dxva_picparams_hevc(struct virgl_video_codec *codec,
             slot = refbuf->current_slot_in_codec;
         if (slot < 0 || slot >= VIRGL_VIDEO_WIN32_DPB_SIZE) {
             /* Ref not resident in our DPB — leave the 0xFF sentinel in
-             * place. */
+             * place. PicOrderCntValList[i] is already filled above. */
             continue;
         }
         pp->RefPicList[i].Index7Bits    = (UCHAR)(slot & 0x7F);
         pp->RefPicList[i].AssociatedFlag = desc->IsLongTerm[i] ? 1 : 0;
-        pp->PicOrderCntValList[i] = desc->PicOrderCntVal[i];
     }
 
     /* Ref-pic-set indices into RefPicList[]: curr-before, curr-after,
-     * lt-curr. Each is padded with 0xFF when fewer than 8 entries apply. */
+     * lt-curr. Pad unused positions with 0xFF — Intel's HEVC driver
+     * treats any non-0xFF entry past Num* as a valid reference and
+     * reads phantom refs on B-frames otherwise. */
     memset(pp->RefPicSetStCurrBefore, 0xFF, sizeof(pp->RefPicSetStCurrBefore));
     memset(pp->RefPicSetStCurrAfter,  0xFF, sizeof(pp->RefPicSetStCurrAfter));
     memset(pp->RefPicSetLtCurr,       0xFF, sizeof(pp->RefPicSetLtCurr));
@@ -2305,12 +2319,71 @@ typedef void (*build_sc_entry_fn)(void *sc_array, unsigned idx,
                                   UINT bs_offset, UINT slice_sz,
                                   void *user);
 
+/* Parse-mode for how to split incoming virgl bitstream buffers into DXVA
+ * slice-control entries. Needed because Mesa delivers all slices of a
+ * picture concatenated in one buffer as Annex B bytes; short-format DXVA
+ * wants one slice-control entry per slice NAL. */
+enum virgl_video_parse_mode {
+    VIRGL_VIDEO_PARSE_NONE,    /* one entry per input buffer (VP9, AV1) */
+    VIRGL_VIDEO_PARSE_H264,    /* Annex B, 1-byte NAL header; slice types 1/5/20 */
+    VIRGL_VIDEO_PARSE_HEVC,    /* Annex B, 2-byte NAL header; VCL types 0..31 */
+};
+
+/* Find the next Annex B start code (00 00 01 or 00 00 00 01) starting at
+ * offset `from` within [buf, buf+sz). Returns either the offset of the
+ * start code or `sz` if not found. Writes the start-code length (3 or 4)
+ * to `*sc_len_out` when a code is found. */
+static unsigned annex_b_next_start(const uint8_t *buf, unsigned sz,
+                                   unsigned from, unsigned *sc_len_out)
+{
+    unsigned j;
+    for (j = from; j + 2 < sz; j++) {
+        if (buf[j] != 0 || buf[j+1] != 0)
+            continue;
+        if (buf[j+2] == 1) { if (sc_len_out) *sc_len_out = 3; return j; }
+        if (buf[j+2] == 0 && j + 3 < sz && buf[j+3] == 1) {
+            if (sc_len_out) *sc_len_out = 4;
+            return j;
+        }
+    }
+    return sz;
+}
+
+/* True if this NAL's first byte (H.264) or first two bytes (HEVC) identify
+ * a VCL / slice NAL that should be reported to DXVA as its own slice-
+ * control entry. Non-slice NAL units (SPS/PPS/SEI/VPS/etc.) must remain
+ * embedded in the bitstream blob but are NOT listed in slice control. */
+static int nal_is_slice(enum virgl_video_parse_mode mode,
+                        const uint8_t *nal_bytes, unsigned nal_avail)
+{
+    if (nal_avail < 1)
+        return 0;
+    switch (mode) {
+    case VIRGL_VIDEO_PARSE_H264: {
+        uint8_t t = nal_bytes[0] & 0x1F;
+        return (t == 1 || t == 5 || t == 20);
+    }
+    case VIRGL_VIDEO_PARSE_HEVC: {
+        if (nal_avail < 2) return 0;
+        uint8_t t = (nal_bytes[0] >> 1) & 0x3F;
+        /* HEVC VCL NAL types are 0..31. IRAP (16..21) and non-IRAP (0..9)
+         * are slice NALs; reserved (10..15, 22..31) would also be treated
+         * as VCL. Non-VCL (32..47) are headers etc. */
+        return t <= 31;
+    }
+    case VIRGL_VIDEO_PARSE_NONE:
+    default:
+        return 0;
+    }
+}
+
 static int submit_short_format_decode(struct virgl_video_codec *codec,
                                       const void *pp, UINT pp_size,
                                       const void *qm, UINT qm_size,
                                       UINT sc_elem_size,
                                       build_sc_entry_fn build_sc,
                                       void *build_sc_user,
+                                      enum virgl_video_parse_mode parse_mode,
                                       unsigned num_buffers,
                                       const void * const *buffers,
                                       const unsigned *sizes)
@@ -2396,7 +2469,8 @@ static int submit_short_format_decode(struct virgl_video_codec *codec,
 
     for (i = 0; i < num_buffers && slice_count < VIRGL_VIDEO_WIN32_MAX_SLICES; i++) {
         unsigned sz = sizes[i];
-        if (!buffers[i] || !sz)
+        const uint8_t *buf = (const uint8_t *)buffers[i];
+        if (!buf || !sz)
             continue;
         if (bs_offset + sz > bs_buf_size) {
             virgl_error("virgl_video_win32: bitstream buffer overflow "
@@ -2406,10 +2480,48 @@ static int submit_short_format_decode(struct virgl_video_codec *codec,
                 D3D11_VIDEO_DECODER_BUFFER_BITSTREAM);
             return -1;
         }
-        memcpy((uint8_t *)bs_ptr + bs_offset, buffers[i], sz);
-        build_sc(slice_storage, slice_count, bs_offset, sz, build_sc_user);
+        /* Always copy the whole blob — non-slice NAL units must stay embedded
+         * so the decoder can find SPS/PPS/VPS/SEI. Only the slice-control
+         * table (built below) differs per parse mode. */
+        memcpy((uint8_t *)bs_ptr + bs_offset, buf, sz);
+
+        if (parse_mode == VIRGL_VIDEO_PARSE_NONE) {
+            /* Whole input buffer is one slice to DXVA. Used for VP9 / AV1
+             * where Mesa delivers each frame as a single blob the driver
+             * parses internally. */
+            if (slice_count < VIRGL_VIDEO_WIN32_MAX_SLICES) {
+                build_sc(slice_storage, slice_count, bs_offset, sz,
+                         build_sc_user);
+                slice_count++;
+            }
+        } else {
+            /* Walk Annex B NAL units, emit a slice-control entry per
+             * VCL slice NAL. Preserves start codes in the entry's byte
+             * range — DXVA short-format wants that framing. */
+            unsigned j = 0;
+            while (j + 3 < sz && slice_count < VIRGL_VIDEO_WIN32_MAX_SLICES) {
+                unsigned sc_len = 0;
+                unsigned at = annex_b_next_start(buf, sz, j, &sc_len);
+                if (at >= sz) break;
+                unsigned nal_hdr = at + sc_len;
+                if (nal_hdr >= sz) break;
+                unsigned end = annex_b_next_start(buf, sz, nal_hdr, NULL);
+                if (nal_is_slice(parse_mode, buf + nal_hdr, sz - nal_hdr)) {
+                    build_sc(slice_storage, slice_count,
+                             bs_offset + at, end - at, build_sc_user);
+                    slice_count++;
+                }
+                j = end;
+            }
+            /* Fallback: no slice NAL located — treat the whole buffer as one
+             * slice rather than dropping the picture. */
+            if (slice_count == 0 && sz > 0) {
+                build_sc(slice_storage, slice_count, bs_offset, sz,
+                         build_sc_user);
+                slice_count++;
+            }
+        }
         bs_offset += sz;
-        slice_count++;
     }
 
     if (slice_count == 0) {
@@ -2516,6 +2628,7 @@ static int hevc_decode_bitstream(struct virgl_video_codec *codec,
                                       &qm, (UINT)sizeof(qm),
                                       (UINT)sizeof(DXVA_Slice_HEVC_Short),
                                       build_sc_hevc, NULL,
+                                      VIRGL_VIDEO_PARSE_HEVC,
                                       num_buffers, buffers, sizes);
 }
 
@@ -2621,18 +2734,28 @@ static void fill_dxva_picparams_vp9(struct virgl_video_codec *codec,
         }
     }
 
-    /* frame_refs[3]: last, golden, altref — indices into ref_frame_map. */
+    /* frame_refs[3]: last, golden, altref — indices into ref_frame_map.
+     * Per the DXVA VP9 spec, AssociatedFlag for these entries carries the
+     * reference sign bias for each ref (0 = no bias, 1 = negative bias).
+     * Leaving them at 0 breaks MV scaling on any P-frame where the alt
+     * ref has a positive-direction sign bias (most non-trivial VP9
+     * content), which matches the slight-but-steady degradation we see
+     * from frame 2 onward on multi-ref VP9 streams. Also propagated in
+     * pp->ref_frame_sign_bias[] below; DXVA expects both. */
     for (i = 0; i < 3; i++)
         dxva_picentry_vpx_invalidate(&pp->frame_refs[i]);
     pp->frame_refs[0].Index7Bits =
         (UCHAR)(d->picture_parameter.pic_fields.last_ref_frame & 0x7);
-    pp->frame_refs[0].AssociatedFlag = 0;
+    pp->frame_refs[0].AssociatedFlag =
+        d->picture_parameter.pic_fields.last_ref_frame_sign_bias ? 1 : 0;
     pp->frame_refs[1].Index7Bits =
         (UCHAR)(d->picture_parameter.pic_fields.golden_ref_frame & 0x7);
-    pp->frame_refs[1].AssociatedFlag = 0;
+    pp->frame_refs[1].AssociatedFlag =
+        d->picture_parameter.pic_fields.golden_ref_frame_sign_bias ? 1 : 0;
     pp->frame_refs[2].Index7Bits =
         (UCHAR)(d->picture_parameter.pic_fields.alt_ref_frame & 0x7);
-    pp->frame_refs[2].AssociatedFlag = 0;
+    pp->frame_refs[2].AssociatedFlag =
+        d->picture_parameter.pic_fields.alt_ref_frame_sign_bias ? 1 : 0;
 
     /* ref_frame_sign_bias[4]: VP9 uses 1-indexed refs (0=INTRA, 1=LAST,
      * 2=GOLDEN, 3=ALTREF). */
@@ -2747,6 +2870,7 @@ static int vp9_decode_bitstream(struct virgl_video_codec *codec,
                                       NULL, 0,
                                       (UINT)sizeof(DXVA_Slice_VPx_Short),
                                       build_sc_vpx, NULL,
+                                      VIRGL_VIDEO_PARSE_NONE,
                                       num_buffers, buffers, sizes);
 }
 
@@ -2805,15 +2929,27 @@ static void fill_dxva_picparams_av1(struct virgl_video_codec *codec,
     /* Tile geometry. AV1 allows up to 64x64 tiles; DXVA stores widths and
      * heights per-tile-col / per-tile-row. Only the first tile_cols / tile_rows
      * entries are meaningful; leave the remainder zero (ffmpeg does the same).
-     * virgl's width_in_sbs[i] / height_in_sbs[i] already hold "size in sbs"
-     * (minus_1 + 1), matching what DXVA expects. */
+     *
+     * IMPORTANT: DXVA's tiles.widths[i] / tiles.heights[i] fields are
+     * TileWidthInSbMinus1 / TileHeightInSbMinus1 — that is, the tile size
+     * in superblocks MINUS ONE (per MS-DXVA AV1 spec and ffmpeg's
+     * dxva2_av1.c). Mesa's virgl_av1_picture_desc.width_in_sbs[i] /
+     * height_in_sbs[i] hold the RAW count (TileWidthInSb), matching the
+     * AV1 bitstream order but NOT DXVA's minus-1 convention. Subtract 1
+     * before stuffing into DXVA — without this the driver reads one
+     * extra SB per tile and produces corrupt output across every frame
+     * (intra and inter alike). */
     pp->tiles.cols = d->picture_parameter.tile_cols;
     pp->tiles.rows = d->picture_parameter.tile_rows;
     pp->tiles.context_update_id = d->picture_parameter.context_update_tile_id;
-    for (i = 0; i < pp->tiles.cols && i < 64; i++)
-        pp->tiles.widths[i]  = d->picture_parameter.width_in_sbs[i];
-    for (i = 0; i < pp->tiles.rows && i < 64; i++)
-        pp->tiles.heights[i] = d->picture_parameter.height_in_sbs[i];
+    for (i = 0; i < pp->tiles.cols && i < 64; i++) {
+        uint16_t w = d->picture_parameter.width_in_sbs[i];
+        pp->tiles.widths[i] = (USHORT)(w > 0 ? w - 1 : 0);
+    }
+    for (i = 0; i < pp->tiles.rows && i < 64; i++) {
+        uint16_t h = d->picture_parameter.height_in_sbs[i];
+        pp->tiles.heights[i] = (USHORT)(h > 0 ? h - 1 : 0);
+    }
 
     /* CodingParamToolFlags */
     pp->coding.use_128x128_superblock =
@@ -3216,6 +3352,7 @@ static int av1_decode_bitstream(struct virgl_video_codec *codec,
                                       NULL, 0,
                                       (UINT)sizeof(DXVA_Tile_AV1),
                                       build_sc_av1, &ctx,
+                                      VIRGL_VIDEO_PARSE_NONE,
                                       num_buffers, buffers, sizes);
 }
 
