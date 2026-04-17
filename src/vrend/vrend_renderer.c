@@ -7805,6 +7805,9 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
 
    return 0;
 cleanup_and_fail:
+   if (flags & VREND_USE_THREAD_SYNC)
+      vrend_free_sync_thread();
+
    vrend_renderer_fini();
 fail:
    return EINVAL;
