@@ -2687,23 +2687,29 @@ static int submit_short_format_decode(struct virgl_video_codec *codec,
         return -1;
     }
 
-    /* Pad the bitstream buffer to 128-byte alignment and extend the last
-     * slice's SliceBytesInBuffer by the padding amount. Per ffmpeg
-     * dxva2_hevc.c (lines 312-318), some HEVC drivers silently no-op
-     * non-IDR frames without this padding. The padding bytes are set to
-     * 0; the driver tolerates trailing zeros in the bitstream. */
-    if (parse_mode == VIRGL_VIDEO_PARSE_HEVC ||
-        parse_mode == VIRGL_VIDEO_PARSE_H264) {
+    /* 128-byte bitstream alignment. DXVA HEVC §5.2, DXVA VPx §1.5, and
+     * DXVA AV1 §1.5 all state: "The total quantity of data in any bitstream
+     * data buffer ... shall be an integer multiple of 128 bytes." This is
+     * normative (`shall`). Extend the last slice's SliceBytesInBuffer over
+     * the padding so the driver's length check sees a consistent picture.
+     * AV1 uses a dedicated submission path (av1_decode_bitstream) which
+     * does its own tile-control building; it pads separately.
+     *
+     * VP9 uses `VIRGL_VIDEO_PARSE_NONE` with DXVA_Slice_VPx_Short entries.
+     * `DXVA_Slice_VPx_Short` has the same layout as DXVA_Slice_HEVC_Short
+     * / DXVA_Slice_H264_Short (BSNALunitDataLocation, SliceBytesInBuffer,
+     * wBadSliceChopping), so the extension is uniform across codecs. */
+    {
         UINT aligned = (bs_offset + 127u) & ~127u;
-        if (aligned > bs_offset && aligned <= bs_buf_size) {
+        if (slice_count > 0 && aligned > bs_offset && aligned <= bs_buf_size) {
             memset((uint8_t *)bs_ptr + bs_offset, 0, aligned - bs_offset);
-            if (parse_mode == VIRGL_VIDEO_PARSE_HEVC && sc_elem_size == sizeof(DXVA_Slice_HEVC_Short)) {
-                DXVA_Slice_HEVC_Short *arr = (DXVA_Slice_HEVC_Short *)slice_storage;
-                arr[slice_count - 1].SliceBytesInBuffer += (aligned - bs_offset);
-            } else if (parse_mode == VIRGL_VIDEO_PARSE_H264 && sc_elem_size == sizeof(DXVA_Slice_H264_Short)) {
-                DXVA_Slice_H264_Short *arr = (DXVA_Slice_H264_Short *)slice_storage;
-                arr[slice_count - 1].SliceBytesInBuffer += (aligned - bs_offset);
-            }
+            /* DXVA_Slice_{HEVC,H264,VPx}_Short all share the first two
+             * UINT fields (BSNALunitDataLocation, SliceBytesInBuffer)
+             * followed by USHORT wBadSliceChopping — compatible memory
+             * layout for our purposes. */
+            UINT *last_size_ptr =
+                (UINT *)(slice_storage + (slice_count - 1) * sc_elem_size) + 1;
+            *last_size_ptr += (aligned - bs_offset);
             bs_offset = aligned;
         }
     }
@@ -2922,28 +2928,39 @@ static void fill_dxva_picparams_vp9(struct virgl_video_codec *codec,
         }
     }
 
-    /* frame_refs[3]: last, golden, altref — indices into ref_frame_map.
-     * Per the DXVA VP9 spec, AssociatedFlag for these entries carries the
-     * reference sign bias for each ref (0 = no bias, 1 = negative bias).
-     * Leaving them at 0 breaks MV scaling on any P-frame where the alt
-     * ref has a positive-direction sign bias (most non-trivial VP9
-     * content), which matches the slight-but-steady degradation we see
-     * from frame 2 onward on multi-ref VP9 streams. Also propagated in
-     * pp->ref_frame_sign_bias[] below; DXVA expects both. */
+    /* frame_refs[3]: last, golden, altref — each entry is a DXVA_PicEntry_VPx
+     * pointing into ref_frame_map[]. DXVA_VPx spec §3.2 L585-588 / L903
+     * "AssociatedFlag ... shall be 0" — the earlier comment claiming this
+     * field carries sign bias is wrong. Sign bias lives in
+     * ref_frame_sign_bias[1..3] (populated below). The Mesa radeonsi peer
+     * confirms: si_video_dec.c L947-952 writes sign bias into
+     * ref_frame_sign_bias only.
+     *
+     * Also: Index7Bits here is an INDEX INTO ref_frame_map[] (0..7), not a
+     * DPB texture slot. Mesa's last_ref_frame/golden_ref_frame/alt_ref_frame
+     * fields are already that ref_frame_map index. */
     for (i = 0; i < 3; i++)
         dxva_picentry_vpx_invalidate(&pp->frame_refs[i]);
-    pp->frame_refs[0].Index7Bits =
-        (UCHAR)(d->picture_parameter.pic_fields.last_ref_frame & 0x7);
-    pp->frame_refs[0].AssociatedFlag =
-        d->picture_parameter.pic_fields.last_ref_frame_sign_bias ? 1 : 0;
-    pp->frame_refs[1].Index7Bits =
-        (UCHAR)(d->picture_parameter.pic_fields.golden_ref_frame & 0x7);
-    pp->frame_refs[1].AssociatedFlag =
-        d->picture_parameter.pic_fields.golden_ref_frame_sign_bias ? 1 : 0;
-    pp->frame_refs[2].Index7Bits =
-        (UCHAR)(d->picture_parameter.pic_fields.alt_ref_frame & 0x7);
-    pp->frame_refs[2].AssociatedFlag =
-        d->picture_parameter.pic_fields.alt_ref_frame_sign_bias ? 1 : 0;
+    {
+        UCHAR last_idx   = (UCHAR)(d->picture_parameter.pic_fields.last_ref_frame   & 0x7);
+        UCHAR golden_idx = (UCHAR)(d->picture_parameter.pic_fields.golden_ref_frame & 0x7);
+        UCHAR alt_idx    = (UCHAR)(d->picture_parameter.pic_fields.alt_ref_frame    & 0x7);
+        /* Only populate the entry when the ref_frame_map slot it targets is
+         * a resident DPB ref (i.e. not 0xFF). Otherwise leave the 0xFF
+         * sentinel — the driver treats that as "no ref." */
+        if (pp->ref_frame_map[last_idx].bPicEntry != 0xFF) {
+            pp->frame_refs[0].Index7Bits = last_idx;
+            pp->frame_refs[0].AssociatedFlag = 0;
+        }
+        if (pp->ref_frame_map[golden_idx].bPicEntry != 0xFF) {
+            pp->frame_refs[1].Index7Bits = golden_idx;
+            pp->frame_refs[1].AssociatedFlag = 0;
+        }
+        if (pp->ref_frame_map[alt_idx].bPicEntry != 0xFF) {
+            pp->frame_refs[2].Index7Bits = alt_idx;
+            pp->frame_refs[2].AssociatedFlag = 0;
+        }
+    }
 
     /* ref_frame_sign_bias[4]: VP9 uses 1-indexed refs (0=INTRA, 1=LAST,
      * 2=GOLDEN, 3=ALTREF). */
@@ -3507,38 +3524,29 @@ static void fill_dxva_picparams_av1(struct virgl_video_codec *codec,
             (SHORT)d->picture_parameter.film_grain_info.cr_offset;
     }
 
-    /* AV1 specifically: ffmpeg leaves StatusReportFeedbackNumber = 0 because
-     * setting it breaks decoding on some drivers (tested NVIDIA 457.09).
-     * H.264/HEVC/VP9 set it; AV1 does not. */
-    pp->StatusReportFeedbackNumber = 0;
+    /* DXVA AV1 spec §4.2.11: StatusReportFeedbackNumber "should not be
+     * equal to 0, and should be different in each call to Execute."
+     * Earlier comment cited an ffmpeg workaround for a NVIDIA 457.09 bug,
+     * but ffmpeg's skip is a speculative workaround — the spec is clear.
+     * Provide a monotonic nonzero value like the other codecs. */
+    pp->StatusReportFeedbackNumber = codec->status_report_feedback++;
+    if (pp->StatusReportFeedbackNumber == 0)
+        pp->StatusReportFeedbackNumber = codec->status_report_feedback++;
 }
 
-/* AV1 slice control is a DXVA_Tile_AV1 array, one per submitted OBU-tile.
- * virgl slice_parameter carries 1:1 per-tile offset/size/row/col/anchor. */
-struct av1_sc_ctx {
-    const struct virgl_av1_picture_desc *desc;
-};
-
-static void build_sc_av1(void *sc_array, unsigned idx,
-                         UINT bs_offset, UINT slice_sz, void *user)
-{
-    DXVA_Tile_AV1 *arr = (DXVA_Tile_AV1 *)sc_array;
-    struct av1_sc_ctx *ctx = (struct av1_sc_ctx *)user;
-
-    arr[idx].DataOffset    = bs_offset;
-    arr[idx].DataSize      = slice_sz;
-    arr[idx].row           = (idx < 256) ?
-        ctx->desc->slice_parameter.slice_data_row[idx] : 0;
-    arr[idx].column        = (idx < 256) ?
-        ctx->desc->slice_parameter.slice_data_col[idx] : 0;
-    /* ffmpeg always uses 0xFF as the sentinel here; Mesa's VA-API frontend
-     * does not track anchor frames, so the raw byte can be a stale zero
-     * that confuses the driver. Match ffmpeg unconditionally. */
-    arr[idx].anchor_frame  = 0xFF;
-    arr[idx].Reserved16Bits = 0;
-    arr[idx].Reserved8Bits  = 0;
-}
-
+/* AV1 bitstream submission. Unlike H.264/HEVC (where we use the generic
+ * `submit_short_format_decode` that emits one slice-control entry per
+ * input bitstream buffer), DXVA AV1 §5.1 requires tile-control to
+ * "contain information about all tiles necessary to decode the frame"
+ * — one DXVA_Tile_AV1 per tile, not per input buffer. Mesa's
+ * `slice_parameter.slice_count` is the tile count; `slice_data_offset[i]`
+ * and `slice_data_size[i]` are per-tile byte ranges INTO the concatenated
+ * bitstream. We replicate the common decode-buffer dance directly here so
+ * we can emit the full tile table.
+ *
+ * DXVA AV1 §1.5: bitstream total size MUST be a multiple of 128 bytes.
+ * We pad with zero and extend the final tile's DataSize to cover the
+ * padding (matching the pattern used by the HEVC path). */
 static int av1_decode_bitstream(struct virgl_video_codec *codec,
                                 struct virgl_video_buffer *target,
                                 const struct virgl_av1_picture_desc *desc,
@@ -3547,19 +3555,160 @@ static int av1_decode_bitstream(struct virgl_video_codec *codec,
                                 const unsigned *sizes)
 {
     DXVA_PicParams_AV1 pp;
-    struct av1_sc_ctx ctx = { .desc = desc };
+    HRESULT hr;
+    UINT bs_buf_size = 0, pp_buf_size = 0, sc_buf_size = 0;
+    void *bs_ptr = NULL, *pp_ptr = NULL, *sc_ptr = NULL;
+    UINT bs_offset = 0;
+    D3D11_VIDEO_DECODER_BUFFER_DESC descs[3];
+    unsigned i;
 
+    (void)target;
     fill_dxva_picparams_av1(codec, target, desc, &pp);
 
-    /* AV1 has no IQ-matrix buffer (quantization is per-segment in pic
-     * params). Slice-control element is DXVA_Tile_AV1. */
-    return submit_short_format_decode(codec,
-                                      &pp, (UINT)sizeof(pp),
-                                      NULL, 0,
-                                      (UINT)sizeof(DXVA_Tile_AV1),
-                                      build_sc_av1, &ctx,
-                                      VIRGL_VIDEO_PARSE_NONE,
-                                      num_buffers, buffers, sizes);
+    /* ---- PictureParameters ---- */
+    hr = ID3D11VideoContext_GetDecoderBuffer(
+            g_vid.video_context, codec->decoder,
+            D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS,
+            &pp_buf_size, &pp_ptr);
+    if (FAILED(hr) || !pp_ptr || pp_buf_size < sizeof(pp)) {
+        virgl_error("virgl_video_win32 av1: GetDecoderBuffer(PP) failed "
+                    "hr=0x%lx size=%u/need=%zu\n",
+                    (unsigned long)hr, pp_buf_size, sizeof(pp));
+        return -1;
+    }
+    memcpy(pp_ptr, &pp, sizeof(pp));
+    hr = ID3D11VideoContext_ReleaseDecoderBuffer(
+            g_vid.video_context, codec->decoder,
+            D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS);
+    if (FAILED(hr)) {
+        virgl_error("virgl_video_win32 av1: ReleaseDecoderBuffer(PP) "
+                    "failed hr=0x%lx\n", (unsigned long)hr);
+        return -1;
+    }
+
+    /* ---- Bitstream: concatenate all input buffers verbatim ----
+     * AV1 uses raw OBU format (no Annex B start codes); we just copy. */
+    hr = ID3D11VideoContext_GetDecoderBuffer(
+            g_vid.video_context, codec->decoder,
+            D3D11_VIDEO_DECODER_BUFFER_BITSTREAM,
+            &bs_buf_size, &bs_ptr);
+    if (FAILED(hr) || !bs_ptr) {
+        virgl_error("virgl_video_win32 av1: GetDecoderBuffer(BS) failed "
+                    "hr=0x%lx size=%u\n", (unsigned long)hr, bs_buf_size);
+        return -1;
+    }
+    for (i = 0; i < num_buffers; i++) {
+        if (!buffers[i] || !sizes[i])
+            continue;
+        if (bs_offset + sizes[i] > bs_buf_size) {
+            virgl_error("virgl_video_win32 av1: bitstream overflow "
+                        "%u+%u > %u\n", bs_offset, sizes[i], bs_buf_size);
+            ID3D11VideoContext_ReleaseDecoderBuffer(
+                g_vid.video_context, codec->decoder,
+                D3D11_VIDEO_DECODER_BUFFER_BITSTREAM);
+            return -1;
+        }
+        memcpy((uint8_t *)bs_ptr + bs_offset, buffers[i], sizes[i]);
+        bs_offset += sizes[i];
+    }
+
+    /* Build per-tile DXVA_Tile_AV1 entries from desc->slice_parameter. Mesa
+     * populates slice_data_offset[i] as the byte offset of tile i within
+     * the concatenated bitstream — which matches our bs layout since we
+     * copied the input buffers back-to-back in order. */
+    unsigned tile_count = desc->slice_parameter.slice_count;
+    if (tile_count == 0 || tile_count > 256) {
+        virgl_error("virgl_video_win32 av1: invalid tile_count=%u\n",
+                    tile_count);
+        ID3D11VideoContext_ReleaseDecoderBuffer(
+            g_vid.video_context, codec->decoder,
+            D3D11_VIDEO_DECODER_BUFFER_BITSTREAM);
+        return -1;
+    }
+
+    /* 128-byte bitstream padding per DXVA AV1 §1.5 (normative `shall`). */
+    {
+        UINT aligned = (bs_offset + 127u) & ~127u;
+        if (aligned > bs_offset && aligned <= bs_buf_size) {
+            memset((uint8_t *)bs_ptr + bs_offset, 0, aligned - bs_offset);
+            bs_offset = aligned;
+        }
+    }
+
+    hr = ID3D11VideoContext_ReleaseDecoderBuffer(
+            g_vid.video_context, codec->decoder,
+            D3D11_VIDEO_DECODER_BUFFER_BITSTREAM);
+    if (FAILED(hr)) {
+        virgl_error("virgl_video_win32 av1: ReleaseDecoderBuffer(BS) "
+                    "failed hr=0x%lx\n", (unsigned long)hr);
+        return -1;
+    }
+
+    /* ---- SliceControl: one DXVA_Tile_AV1 per tile ---- */
+    hr = ID3D11VideoContext_GetDecoderBuffer(
+            g_vid.video_context, codec->decoder,
+            D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL,
+            &sc_buf_size, &sc_ptr);
+    if (FAILED(hr) || !sc_ptr ||
+        sc_buf_size < tile_count * sizeof(DXVA_Tile_AV1)) {
+        virgl_error("virgl_video_win32 av1: GetDecoderBuffer(SC) failed "
+                    "hr=0x%lx need=%zu got=%u\n",
+                    (unsigned long)hr,
+                    tile_count * sizeof(DXVA_Tile_AV1), sc_buf_size);
+        return -1;
+    }
+    DXVA_Tile_AV1 *tiles = (DXVA_Tile_AV1 *)sc_ptr;
+    for (i = 0; i < tile_count; i++) {
+        tiles[i].DataOffset = desc->slice_parameter.slice_data_offset[i];
+        tiles[i].DataSize   = desc->slice_parameter.slice_data_size[i];
+        tiles[i].row        = desc->slice_parameter.slice_data_row[i];
+        tiles[i].column     = desc->slice_parameter.slice_data_col[i];
+        /* AV1 anchor_frame is only meaningful for large-scale tile mode;
+         * for the common case Mesa leaves anchor_frame_idx at 0, and the
+         * DXVA spec / ffmpeg use 0xFF as the "no anchor" sentinel. */
+        UCHAR anchor = desc->slice_parameter.slice_data_anchor_frame_idx[i];
+        tiles[i].anchor_frame  = anchor ? anchor : 0xFF;
+        tiles[i].Reserved16Bits = 0;
+        tiles[i].Reserved8Bits  = 0;
+    }
+    /* If we padded, extend the final tile's DataSize over the trailing
+     * zero bytes so the driver's bitstream-length check sees a consistent
+     * picture (DXVA AV1 §1.5 "accelerator ... may treat any additional
+     * padding of zero bytes for 128-byte alignment as ignored"). */
+    {
+        unsigned last = tile_count - 1;
+        UINT tail = tiles[last].DataOffset + tiles[last].DataSize;
+        if (bs_offset > tail)
+            tiles[last].DataSize += (bs_offset - tail);
+    }
+    hr = ID3D11VideoContext_ReleaseDecoderBuffer(
+            g_vid.video_context, codec->decoder,
+            D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL);
+    if (FAILED(hr)) {
+        virgl_error("virgl_video_win32 av1: ReleaseDecoderBuffer(SC) "
+                    "failed hr=0x%lx\n", (unsigned long)hr);
+        return -1;
+    }
+
+    /* ---- SubmitDecoderBuffers: PP, BS, SC (BS before SC matches
+     * ffmpeg / Chromium ordering used for HEVC/H.264). ---- */
+    memset(descs, 0, sizeof(descs));
+    descs[0].BufferType = D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS;
+    descs[0].DataSize   = (UINT)sizeof(pp);
+    descs[1].BufferType = D3D11_VIDEO_DECODER_BUFFER_BITSTREAM;
+    descs[1].DataSize   = bs_offset;
+    descs[2].BufferType = D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL;
+    descs[2].DataSize   = (UINT)(tile_count * sizeof(DXVA_Tile_AV1));
+
+    hr = ID3D11VideoContext_SubmitDecoderBuffers(
+            g_vid.video_context, codec->decoder, 3, descs);
+    vid_drain_info_queue("av1-SubmitDecoderBuffers");
+    if (FAILED(hr)) {
+        virgl_error("virgl_video_win32 av1: SubmitDecoderBuffers failed "
+                    "hr=0x%lx\n", (unsigned long)hr);
+        return -1;
+    }
+    return 0;
 }
 
 int virgl_video_decode_bitstream(struct virgl_video_codec *codec,
