@@ -302,6 +302,10 @@ struct virgl_video_codec {
      * derivation (spec: !error_resilient && !intra_only && prev_size_matches). */
     uint32_t vp9_prev_frame_width;
     uint32_t vp9_prev_frame_height;
+    /* Track whether the previous frame was marked show_frame, so we can
+     * implement the 4-term AND for use_prev_frame_mvs (see fill_dxva_
+     * picparams_vp9 for the rationale). */
+    uint8_t  vp9_prev_show_frame;
 
     /* --------------------------------------------------------------
      * Encode-only state (populated lazily for ENCODE entrypoint codecs).
@@ -3037,17 +3041,27 @@ static void fill_dxva_picparams_vp9(struct virgl_video_codec *codec,
     /* wControlInfoFlags */
     pp->mode_ref_delta_enabled   = d->picture_parameter.mode_ref_delta_enabled ? 1 : 0;
     pp->mode_ref_delta_update    = d->picture_parameter.mode_ref_delta_update ? 1 : 0;
-    /* Per VP9 spec: use_prev_in_find_mv_refs = !error_resilient && !intra_only
-     * && prev_frame_size_matches. Mesa doesn't expose prev_frame_size_matches,
-     * so we track the last frame's coded dimensions on the codec and compare. */
+    /* Per VP9 spec and Mesa's picture_vp9.c: use_prev_frame_mvs is a four-term
+     * AND of (prev_show_frame && !error_resilient_mode && prev_frame_size_matches).
+     * Mesa computes it but the virgl protocol drops it (task #30). We track the
+     * three reachable terms on the codec state: previous frame's show_frame
+     * bit and the previous coded dimensions. Altref / hidden frames have
+     * show_frame=0, so using the stale prev_show_frame from the last shown
+     * frame closes the gap for common streams without a protocol extension. */
     pp->use_prev_in_find_mv_refs =
-        (!d->picture_parameter.pic_fields.error_resilient_mode &&
+        (codec->vp9_prev_show_frame &&
+         !d->picture_parameter.pic_fields.error_resilient_mode &&
          !d->picture_parameter.pic_fields.intra_only &&
          codec->vp9_prev_frame_width  == d->picture_parameter.frame_width &&
          codec->vp9_prev_frame_height == d->picture_parameter.frame_height &&
          codec->vp9_prev_frame_width != 0) ? 1 : 0;
     codec->vp9_prev_frame_width  = d->picture_parameter.frame_width;
     codec->vp9_prev_frame_height = d->picture_parameter.frame_height;
+    /* Mesa sets show_frame=0 on altref/hidden; hidden frames should NOT
+     * update the prev_show_frame tracker (the NEXT real frame's reference
+     * should be to the most recent SHOWN frame). */
+    if (d->picture_parameter.pic_fields.show_frame)
+        codec->vp9_prev_show_frame = 1;
 
     memcpy(pp->ref_deltas,  d->picture_parameter.ref_deltas,  4);
     memcpy(pp->mode_deltas, d->picture_parameter.mode_deltas, 2);
