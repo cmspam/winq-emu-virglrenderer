@@ -126,6 +126,15 @@ struct vrend_video_buffer {
 
     uint32_t num_planes;
     struct vrend_video_plane planes[3];
+
+#ifdef VREND_VIDEO_WIN32_CPU_UPLOAD
+    /* Cached I420 UV-deinterleave scratch. Reused across frames instead of
+     * calloc/free per decode (AUDIT F23). Sized for the current capacity
+     * we've seen; grown on demand, never shrunk. */
+    uint8_t *u_scratch;
+    uint8_t *v_scratch;
+    size_t   uv_scratch_capacity;  /* bytes per plane */
+#endif
 };
 
 static struct vrend_video_codec *vrend_video_codec(
@@ -328,13 +337,26 @@ static int sync_cpu_planes_to_video_buffer(struct vrend_video_buffer *buf,
     if (need_split) {
         unsigned uv_w = dmabuf->width / 2;
         unsigned uv_h = dmabuf->height / 2;
-        u_scratch = calloc((size_t)uv_w * uv_h, 1);
-        v_scratch = calloc((size_t)uv_w * uv_h, 1);
-        if (!u_scratch || !v_scratch) {
-            free(u_scratch); free(v_scratch);
-            virgl_error("%s: UV split scratch alloc failed\n", __func__);
-            return -1;
+        size_t plane_bytes = (size_t)uv_w * uv_h;
+        /* Grow (never shrink) the per-buffer cached scratch. Avoids
+         * allocating ~0.5 MB × 2 per frame at 1080p (AUDIT F23). */
+        if (plane_bytes > buf->uv_scratch_capacity) {
+            uint8_t *nu = realloc(buf->u_scratch, plane_bytes);
+            uint8_t *nv = realloc(buf->v_scratch, plane_bytes);
+            if (!nu || !nv) {
+                /* On realloc failure, keep whatever we had — caller path
+                 * returns -1 below. */
+                if (nu) buf->u_scratch = nu;
+                if (nv) buf->v_scratch = nv;
+                virgl_error("%s: UV split scratch realloc failed\n", __func__);
+                return -1;
+            }
+            buf->u_scratch = nu;
+            buf->v_scratch = nv;
+            buf->uv_scratch_capacity = plane_bytes;
         }
+        u_scratch = buf->u_scratch;
+        v_scratch = buf->v_scratch;
         const uint8_t *uv_src = (const uint8_t *)planes[1];
         uint32_t src_pitch = pitches[1];
         for (unsigned y = 0; y < uv_h; y++) {
@@ -349,27 +371,35 @@ static int sync_cpu_planes_to_video_buffer(struct vrend_video_buffer *buf,
     /* Drain any prior GL errors so our post-upload check is meaningful. */
     while (glGetError() != GL_NO_ERROR) { }
 
-    /* One-shot diagnostic: dump dimensions on the first decode so we can see
-     * what the guest's actual plane layout looks like. */
-    static bool logged_once = false;
-    if (!logged_once) {
-        virgl_warn("vid-diag: num_planes=%u dmabuf %ux%u src_pitches=%u,%u "
-                   "need_split=%d\n",
-                   buf->num_planes, dmabuf->width, dmabuf->height,
-                   pitches[0], pitches[1], need_split ? 1 : 0);
-        for (unsigned p = 0; p < buf->num_planes; p++) {
-            struct vrend_resource *r =
-                vrend_renderer_ctx_res_lookup(buf->ctx->ctx,
-                                              buf->planes[p].res_handle);
-            if (r) {
-                virgl_warn("vid-diag:   plane %u res=%u w0=%u h0=%u "
-                           "target=0x%x gl_id=%u\n",
-                           p, buf->planes[p].res_handle,
-                           r->base.width0, r->base.height0,
-                           r->target, r->gl_id);
+    /* One-shot diagnostic: gated on VIRGL_VIDEO_DIAG=1 in the env. */
+    {
+        static int diag_cached = -1;
+        if (diag_cached < 0) {
+            const char *e = getenv("VIRGL_VIDEO_DIAG");
+            diag_cached = (e && *e && *e != '0') ? 1 : 0;
+        }
+        if (diag_cached) {
+            static bool logged_once = false;
+            if (!logged_once) {
+                virgl_warn("vid-diag: num_planes=%u dmabuf %ux%u src_pitches=%u,%u "
+                           "need_split=%d\n",
+                           buf->num_planes, dmabuf->width, dmabuf->height,
+                           pitches[0], pitches[1], need_split ? 1 : 0);
+                for (unsigned p = 0; p < buf->num_planes; p++) {
+                    struct vrend_resource *r =
+                        vrend_renderer_ctx_res_lookup(buf->ctx->ctx,
+                                                      buf->planes[p].res_handle);
+                    if (r) {
+                        virgl_warn("vid-diag:   plane %u res=%u w0=%u h0=%u "
+                                   "target=0x%x gl_id=%u\n",
+                                   p, buf->planes[p].res_handle,
+                                   r->base.width0, r->base.height0,
+                                   r->target, r->gl_id);
+                    }
+                }
+                logged_once = true;
             }
         }
-        logged_once = true;
     }
 
     for (i = 0; i < buf->num_planes; i++) {
@@ -483,9 +513,7 @@ static int sync_cpu_planes_to_video_buffer(struct vrend_video_buffer *buf,
     }
 
     glBindTexture(GL_TEXTURE_2D, 0);
-
-    free(u_scratch);
-    free(v_scratch);
+    /* u/v_scratch are cached on buf; don't free per-frame. */
     return 0;
 }
 #endif /* VREND_VIDEO_WIN32_CPU_UPLOAD */
@@ -928,13 +956,22 @@ static void destroy_video_buffer(struct vrend_video_buffer *buf)
         glDeleteTextures(1, &plane->texture);
         glDeleteFramebuffers(1, &plane->framebuffer);
 #if !VREND_VIDEO_WIN32_CPU_UPLOAD
-        if (plane->egl_image == EGL_NO_IMAGE_KHR)
+        /* AUDIT F43: upstream had the condition inverted
+         * (`== EGL_NO_IMAGE_KHR`), which meant the EGL image was never
+         * destroyed on live surfaces and destroyed on sentinel values —
+         * the wrong way around. Only destroy when we actually have an
+         * image. */
+        if (plane->egl_image != EGL_NO_IMAGE_KHR)
             eglDestroyImageKHR(eglGetCurrentDisplay(), plane->egl_image);
 #endif
     }
 
     virgl_video_destroy_buffer(buf->buffer);
 
+#ifdef VREND_VIDEO_WIN32_CPU_UPLOAD
+    free(buf->u_scratch);
+    free(buf->v_scratch);
+#endif
     free(buf);
 }
 
