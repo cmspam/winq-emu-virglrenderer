@@ -1117,6 +1117,12 @@ struct virgl_video_codec *virgl_video_create_codec(
     if (!g_vid.initialized || !args)
         return NULL;
 
+    if (vid_diag_enabled())
+        virgl_warn("virgl_video_win32: create_codec profile=%d entry=%d "
+                   "%ux%u max_refs=%u flags=0x%x\n",
+                   (int)args->profile, (int)args->entrypoint,
+                   args->width, args->height, args->max_references, args->flags);
+
     if (args->entrypoint != PIPE_VIDEO_ENTRYPOINT_BITSTREAM &&
         args->entrypoint != PIPE_VIDEO_ENTRYPOINT_ENCODE) {
         virgl_warn("virgl_video_win32: entrypoint %d unsupported\n",
@@ -1339,6 +1345,11 @@ struct virgl_video_buffer *virgl_video_create_buffer(
 
     if (!g_vid.initialized || !args)
         return NULL;
+
+    if (vid_diag_enabled())
+        virgl_warn("virgl_video_win32: create_buffer fmt=%d %ux%u interlaced=%d\n",
+                   (int)args->format, args->width, args->height,
+                   args->interlaced);
 
     fmt = dxgi_format_from_pipe(args->format);
     if (fmt == DXGI_FORMAT_UNKNOWN) {
@@ -1609,6 +1620,15 @@ int virgl_video_begin_frame(struct virgl_video_codec *codec,
 {
     HRESULT hr;
     int slot;
+
+    /* Log only every N frames to avoid spam. */
+    {
+        static unsigned bf_count = 0;
+        if (vid_diag_enabled() && (bf_count < 4 || (bf_count & 63) == 0))
+            virgl_warn("virgl_video_win32: begin_frame #%u codec=%p target=%p\n",
+                       bf_count, (void *)codec, (void *)target);
+        bf_count++;
+    }
 
     if (!g_vid.initialized || !codec || !target || !codec->decoder)
         return -1;
