@@ -70,6 +70,47 @@
 #include <dxgi.h>
 #include <dxgi1_2.h>
 #include <dxva.h>
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mfreadwrite.h>
+#include <mferror.h>
+#include <mftransform.h>
+#include <codecapi.h>
+#include <wmcodecdsp.h>
+
+/* Some MinGW toolchains ship an older Media Foundation header set that
+ * doesn't declare a handful of GUIDs / constants we need. Re-declare them
+ * locally (guarded) so we don't depend on the system version.
+ *
+ * MFVideoFormat_HEVC lives in mfapi.h on recent SDKs but is missing on some
+ * UCRT64 headers. MF_E_TRANSFORM_STREAM_CHANGE is similarly ancient. */
+#ifndef MFVideoFormat_HEVC
+DEFINE_GUID(MFVideoFormat_HEVC_local,
+    0x43564548, 0x0000, 0x0010, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71);
+#define VIRGL_MFVIDEOFORMAT_HEVC MFVideoFormat_HEVC_local
+#else
+#define VIRGL_MFVIDEOFORMAT_HEVC MFVideoFormat_HEVC
+#endif
+
+#ifndef MF_E_TRANSFORM_NEED_MORE_INPUT
+#define MF_E_TRANSFORM_NEED_MORE_INPUT ((HRESULT)0xC00D6D72L)
+#endif
+#ifndef MF_E_TRANSFORM_STREAM_CHANGE
+#define MF_E_TRANSFORM_STREAM_CHANGE   ((HRESULT)0xC00D6D61L)
+#endif
+
+/* MF_LOW_LATENCY attribute — {9C27891A-ED7A-40e1-88E8-B22727A024EE}. Hardware
+ * MFTs interpret this as a hint to minimise internal buffering which in
+ * practice also smooths over a number of "types not advertised until
+ * configured" quirks on Intel/AMD H.264/HEVC encoders. Declared locally
+ * because older MinGW Media Foundation headers don't export it. */
+#ifndef MF_LOW_LATENCY
+DEFINE_GUID(MF_LOW_LATENCY_local,
+    0x9c27891a, 0xed7a, 0x40e1, 0x88, 0xe8, 0xb2, 0x27, 0x27, 0xa0, 0x24, 0xee);
+#define VIRGL_MF_LOW_LATENCY MF_LOW_LATENCY_local
+#else
+#define VIRGL_MF_LOW_LATENCY MF_LOW_LATENCY
+#endif
 
 #include "pipe/p_video_enums.h"
 #include "util/u_formats.h"
@@ -154,6 +195,22 @@ struct virgl_video_buffer {
     /* Used by the decode_completed callback. We populate this once per decode
      * and pass it through virgl_video_callbacks. */
     struct virgl_video_dma_buf dmabuf;
+
+    /*
+     * Encode source-frame staging. On Windows we can't import the guest-side
+     * GL texture into D3D11 directly (no WGL_NV_DX_interop2 yet), so
+     * vrend_video.c reads the guest NV12/I420 planes back into CPU memory
+     * with glGetTexImage and hands them in via
+     * virgl_video_buffer_cpu_writeback(). We latch the bytes here until the
+     * next encode_bitstream call consumes them in encoder_build_sample().
+     *
+     * Layout is canonical NV12: `width * height` bytes of Y, followed by
+     * `width * height / 2` bytes of interleaved UV. Freed in
+     * virgl_video_destroy_buffer().
+     */
+    uint8_t *encode_src_nv12;
+    size_t   encode_src_size;
+    size_t   encode_src_capacity;
 };
 
 struct virgl_video_codec {
@@ -190,6 +247,26 @@ struct virgl_video_codec {
         uint32_t buffer_id;            /* Guest ref id; 0 when slot unused */
         struct virgl_video_buffer *buf;
     } refs[VIRGL_VIDEO_WIN32_MAX_REFS];
+
+    /* --------------------------------------------------------------
+     * Encode-only state (populated lazily for ENCODE entrypoint codecs).
+     * -------------------------------------------------------------- */
+    IMFTransform *encoder_mft;         /* hardware MFT for H.264 / HEVC encode */
+    bool          encoder_stream_started;
+    uint32_t      encoder_bitrate;     /* most recent requested bitrate, bps */
+    uint64_t      encoder_frame_count; /* number of frames fed to ProcessInput */
+    GUID          encoder_output_guid; /* MFVideoFormat_H264 or _HEVC */
+    unsigned      encoder_width;
+    unsigned      encoder_height;
+    unsigned      encoder_fps_num;
+    unsigned      encoder_fps_den;
+    /* Bitstream buffers queued from the most recent ProcessOutput. Cached so
+     * the encode_completed callback can deliver them to the guest in one
+     * shot matching the libva behaviour (which returns one coded buffer per
+     * encode call). */
+    uint8_t      *encoder_coded_buf;
+    unsigned      encoder_coded_size;
+    unsigned      encoder_coded_capacity;
 };
 
 /*
@@ -208,7 +285,26 @@ static struct {
 
     D3D_FEATURE_LEVEL feature_level;
     struct virgl_video_callbacks *callbacks;
+
+    /* Media Foundation refcount. We call MFStartup() the first time an
+     * encoder MFT is created and MFShutdown() when the last encode-capable
+     * codec is destroyed. MFStartup internally refcounts but the
+     * accompanying CoInitializeEx does not, so we track our own count too. */
+    unsigned      mf_refcount;
+    bool          mf_com_initialized;
 } g_vid;
+
+/* Forward decls for the encode helpers defined much further down. We keep
+ * the encode implementation in one contiguous block at the bottom of the
+ * file so the decoder path can ignore it, but fill_caps / create_codec /
+ * destroy_codec need to reach in. */
+static bool  profile_encode_supported(enum pipe_video_profile profile);
+static int   encoder_create_mft(struct virgl_video_codec *codec,
+                                const struct virgl_video_create_codec_args *args);
+static void  encoder_destroy_mft(struct virgl_video_codec *codec);
+static bool  have_hw_encoder_for(const GUID *output_subtype);
+static HRESULT virgl_video_mf_acquire(void);
+static void    virgl_video_mf_release(void);
 
 /*
  * ---------------------------------------------------------------------------
@@ -461,6 +557,72 @@ void virgl_video_destroy(void)
 
 /*
  * ---------------------------------------------------------------------------
+ * Media Foundation init/shutdown — reference-counted. We only pay the cost
+ * of CoInitializeEx / MFStartup on the first encoder created, and tear them
+ * down when the last encoder is destroyed. Decoders don't touch this; they
+ * use D3D11 video directly.
+ * ---------------------------------------------------------------------------
+ */
+
+static HRESULT virgl_video_mf_acquire(void)
+{
+    HRESULT hr;
+
+    if (g_vid.mf_refcount > 0) {
+        g_vid.mf_refcount++;
+        return S_OK;
+    }
+
+    /* MFStartup requires an initialized COM apartment. We use multithreaded
+     * because virglrenderer callers may run on any thread. */
+    hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    /* S_FALSE means someone else has already initialized — not a failure. */
+    if (hr == S_OK) {
+        g_vid.mf_com_initialized = true;
+    } else if (hr == S_FALSE) {
+        /* Still add to our balancing count so teardown is symmetric. */
+        g_vid.mf_com_initialized = true;
+    } else if (hr == RPC_E_CHANGED_MODE) {
+        /* Another component picked a different threading model. We can
+         * still use MF, but must not call CoUninitialize from this thread. */
+        g_vid.mf_com_initialized = false;
+    } else if (FAILED(hr)) {
+        virgl_error("virgl_video_win32: CoInitializeEx failed 0x%lx\n",
+                    (unsigned long)hr);
+        return hr;
+    }
+
+    hr = MFStartup(MF_VERSION, MFSTARTUP_FULL);
+    if (FAILED(hr)) {
+        virgl_error("virgl_video_win32: MFStartup failed 0x%lx\n",
+                    (unsigned long)hr);
+        if (g_vid.mf_com_initialized) {
+            CoUninitialize();
+            g_vid.mf_com_initialized = false;
+        }
+        return hr;
+    }
+
+    g_vid.mf_refcount = 1;
+    return S_OK;
+}
+
+static void virgl_video_mf_release(void)
+{
+    if (g_vid.mf_refcount == 0)
+        return;
+    g_vid.mf_refcount--;
+    if (g_vid.mf_refcount == 0) {
+        MFShutdown();
+        if (g_vid.mf_com_initialized) {
+            CoUninitialize();
+            g_vid.mf_com_initialized = false;
+        }
+    }
+}
+
+/*
+ * ---------------------------------------------------------------------------
  * virgl_video_fill_caps.
  *
  * We enumerate profiles offered by the D3D11 video device, keep only the ones
@@ -543,6 +705,26 @@ static void fill_caps_for_vp9(struct virgl_video_caps *v,
                          PIPE_FORMAT_P010 : PIPE_FORMAT_NV12;
     /* VP9 "superblocks" are 64x64 but Mesa's cap accounting is in 16x16
      * macroblock equivalents, matching what the H.264/HEVC branches do. */
+    v->max_macroblocks = (3840 / 16) * (2160 / 16);
+    v->npot_texture = 1;
+    v->supports_progressive = 1;
+    v->supports_interlaced = 0;
+    v->prefers_interlaced = 0;
+    v->max_temporal_layers = 0;
+}
+
+/* Encode caps — fill an entry advertising the PIPE_VIDEO_ENTRYPOINT_ENCODE
+ * path backed by a Media Foundation hardware MFT. */
+static void fill_caps_for_encode(struct virgl_video_caps *v,
+                                 enum pipe_video_profile profile)
+{
+    v->profile = profile;
+    v->entrypoint = PIPE_VIDEO_ENTRYPOINT_ENCODE;
+    v->max_level = 51;
+    v->stacked_frames = 0;
+    v->max_width = 3840;
+    v->max_height = 2160;
+    v->prefered_format = PIPE_FORMAT_NV12;
     v->max_macroblocks = (3840 / 16) * (2160 / 16);
     v->npot_texture = 1;
     v->supports_progressive = 1;
@@ -690,12 +872,53 @@ int virgl_video_fill_caps(union virgl_caps *caps)
                           PIPE_VIDEO_PROFILE_AV1_MAIN);
     }
 
+    /* Encode: advertise H.264 + HEVC if the host has matching hardware
+     * MFTs. We briefly bring up Media Foundation for the enumeration and
+     * shut it down right after — no need to keep MF alive when no codec is
+     * open. */
+    {
+        bool have_h264_enc = false;
+        bool have_hevc_enc = false;
+
+        if (SUCCEEDED(virgl_video_mf_acquire())) {
+            GUID h264 = MFVideoFormat_H264;
+            GUID hevc = VIRGL_MFVIDEOFORMAT_HEVC;
+            have_h264_enc = have_hw_encoder_for(&h264);
+            have_hevc_enc = have_hw_encoder_for(&hevc);
+            virgl_video_mf_release();
+        }
+
+        if (have_h264_enc) {
+            static const enum pipe_video_profile profiles[] = {
+                PIPE_VIDEO_PROFILE_MPEG4_AVC_BASELINE,
+                PIPE_VIDEO_PROFILE_MPEG4_AVC_CONSTRAINED_BASELINE,
+                PIPE_VIDEO_PROFILE_MPEG4_AVC_MAIN,
+                PIPE_VIDEO_PROFILE_MPEG4_AVC_HIGH,
+            };
+            for (i = 0; i < ARRAY_SIZE(profiles) &&
+                        out < ARRAY_SIZE(caps->v2.video_caps); i++) {
+                fill_caps_for_encode(&caps->v2.video_caps[out++],
+                                     profiles[i]);
+            }
+        }
+        if (have_hevc_enc && out < ARRAY_SIZE(caps->v2.video_caps)) {
+            fill_caps_for_encode(&caps->v2.video_caps[out++],
+                                 PIPE_VIDEO_PROFILE_HEVC_MAIN);
+            if (out < ARRAY_SIZE(caps->v2.video_caps))
+                fill_caps_for_encode(&caps->v2.video_caps[out++],
+                                     PIPE_VIDEO_PROFILE_HEVC_MAIN_10);
+        }
+
+        virgl_warn("virgl_video_win32: fill_caps advertised %u profiles "
+                   "(h264=%d hevc_main=%d hevc_m10=%d vp9_p0=%d vp9_p2=%d "
+                   "av1=%d / enc h264=%d hevc=%d)\n",
+                   out,
+                   have_h264_nofgt, have_hevc_main, have_hevc_main10,
+                   have_vp9_p0, have_vp9_p2, have_av1_p0,
+                   have_h264_enc, have_hevc_enc);
+    }
+
     caps->v2.num_video_caps = out;
-    virgl_warn("virgl_video_win32: fill_caps advertised %u profiles "
-               "(h264=%d hevc_main=%d hevc_m10=%d vp9_p0=%d vp9_p2=%d av1=%d)\n",
-               out,
-               have_h264_nofgt, have_hevc_main, have_hevc_main10,
-               have_vp9_p0, have_vp9_p2, have_av1_p0);
     return 0;
 }
 
@@ -765,8 +988,8 @@ struct virgl_video_codec *virgl_video_create_codec(
     if (!g_vid.initialized || !args)
         return NULL;
 
-    if (args->entrypoint != PIPE_VIDEO_ENTRYPOINT_BITSTREAM) {
-        /* Encode is explicitly out of scope for this first pass. */
+    if (args->entrypoint != PIPE_VIDEO_ENTRYPOINT_BITSTREAM &&
+        args->entrypoint != PIPE_VIDEO_ENTRYPOINT_ENCODE) {
         virgl_warn("virgl_video_win32: entrypoint %d unsupported\n",
                    (int)args->entrypoint);
         return NULL;
@@ -786,6 +1009,17 @@ struct virgl_video_codec *virgl_video_create_codec(
     codec->flags = args->flags;
     codec->opaque = args->opaque;
     codec->status_report_feedback = 1;
+
+    if (args->entrypoint == PIPE_VIDEO_ENTRYPOINT_ENCODE) {
+        if (!profile_encode_supported(args->profile)) {
+            virgl_error("virgl_video_win32: encode profile %d unsupported\n",
+                        (int)args->profile);
+            goto fail;
+        }
+        if (encoder_create_mft(codec, args) != 0)
+            goto fail;
+        return codec;
+    }
 
     if (!map_profile_to_dxva_guid(args->profile, &codec->dxva_profile)) {
         virgl_error("virgl_video_win32: unsupported profile %d\n",
@@ -831,6 +1065,7 @@ void virgl_video_destroy_codec(struct virgl_video_codec *codec)
         ID3D11VideoDecoder_Release(codec->decoder);
         codec->decoder = NULL;
     }
+    encoder_destroy_mft(codec);
     free(codec);
 }
 
@@ -976,6 +1211,12 @@ void virgl_video_destroy_buffer(struct virgl_video_buffer *buffer)
     if (buffer->staging_tex) {
         ID3D11Texture2D_Release(buffer->staging_tex);
         buffer->staging_tex = NULL;
+    }
+    if (buffer->encode_src_nv12) {
+        free(buffer->encode_src_nv12);
+        buffer->encode_src_nv12 = NULL;
+        buffer->encode_src_size = 0;
+        buffer->encode_src_capacity = 0;
     }
     free(buffer);
 }
@@ -2162,6 +2403,8 @@ static void fill_dxva_picparams_av1(struct virgl_video_codec *codec,
     const struct virgl_av1_picture_desc *d = desc;
     unsigned i, j;
     int self_slot;
+    bool uses_lr;
+    bool apply_grain;
 
     memset(pp, 0, sizeof(*pp));
 
@@ -2187,14 +2430,17 @@ static void fill_dxva_picparams_av1(struct virgl_video_codec *codec,
     pp->seq_profile = d->picture_parameter.profile;
 
     /* Tile geometry. AV1 allows up to 64x64 tiles; DXVA stores widths and
-     * heights per-tile-col / per-tile-row. */
+     * heights per-tile-col / per-tile-row. Only the first tile_cols / tile_rows
+     * entries are meaningful; leave the remainder zero (ffmpeg does the same).
+     * virgl's width_in_sbs[i] / height_in_sbs[i] already hold "size in sbs"
+     * (minus_1 + 1), matching what DXVA expects. */
     pp->tiles.cols = d->picture_parameter.tile_cols;
     pp->tiles.rows = d->picture_parameter.tile_rows;
     pp->tiles.context_update_id = d->picture_parameter.context_update_tile_id;
-    for (i = 0; i < 64; i++) {
+    for (i = 0; i < pp->tiles.cols && i < 64; i++)
         pp->tiles.widths[i]  = d->picture_parameter.width_in_sbs[i];
+    for (i = 0; i < pp->tiles.rows && i < 64; i++)
         pp->tiles.heights[i] = d->picture_parameter.height_in_sbs[i];
-    }
 
     /* CodingParamToolFlags */
     pp->coding.use_128x128_superblock =
@@ -2217,7 +2463,11 @@ static void fill_dxva_picparams_av1(struct virgl_video_codec *codec,
         d->picture_parameter.pic_info_fields.force_integer_mv;
     pp->coding.cdef =
         d->picture_parameter.seq_info_fields.enable_cdef;
-    pp->coding.restoration = 0;   /* derived from loop_restoration_fields below */
+    /* restoration is derived from per-plane frame_restoration_type values
+     * further below (uses_lr). virgl doesn't carry seq->enable_restoration
+     * directly, but if any plane has restoration enabled the sequence header
+     * must have enabled it. */
+    pp->coding.restoration = 0;
     pp->coding.film_grain =
         d->picture_parameter.seq_info_fields.film_grain_params_present;
     pp->coding.intrabc =
@@ -2246,9 +2496,9 @@ static void fill_dxva_picparams_av1(struct virgl_video_codec *codec,
         d->picture_parameter.pic_info_fields.use_ref_frame_mvs;
     pp->coding.enable_ref_frame_mvs =
         d->picture_parameter.seq_info_fields.ref_frame_mvs;
-    pp->coding.reference_frame_update = 1;   /* virgl desc lacks a direct
-                                              * signal; conservative 1 tells
-                                              * driver to update ref state */
+    /* ffmpeg always sets reference_frame_update=1 (the driver resolves the
+     * actual ref update from the frame header); matching that for safety. */
+    pp->coding.reference_frame_update = 1;
 
     /* FormatAndPictureInfoFlags */
     pp->format.frame_type =
@@ -2257,37 +2507,44 @@ static void fill_dxva_picparams_av1(struct virgl_video_codec *codec,
         d->picture_parameter.pic_info_fields.show_frame;
     pp->format.showable_frame =
         d->picture_parameter.pic_info_fields.showable_frame;
-    /* AV1 profile 0 => 4:2:0; subsampling_{x,y} = 1. Higher profiles flip
-     * these bits; we pull them from bit_depth_idx / profile for profile 0
-     * and leave the driver to check against its own CheckVideoDecoderFormat
-     * result for other profiles. */
-    pp->format.subsampling_x = 1;
-    pp->format.subsampling_y = 1;
+    /* virgl_av1_picture_desc does not expose seq_info.color_config.subsampling_x/y
+     * (Mesa's VA-API frontend comments them out when filling the desc). Derive
+     * from seq_profile per AV1 spec:
+     *   profile 0 => 4:2:0 (subsampling_x=1, subsampling_y=1)
+     *   profile 1 => 4:4:4 (0, 0)
+     *   profile 2 => varies by bit_depth (12-bit can be 4:2:2, otherwise 4:2:0).
+     * For mono_chrome the subsampling bits are formally (1,1) per spec. */
+    if (d->picture_parameter.seq_info_fields.mono_chrome) {
+        pp->format.subsampling_x = 1;
+        pp->format.subsampling_y = 1;
+    } else if (d->picture_parameter.profile == 1) {
+        pp->format.subsampling_x = 0;
+        pp->format.subsampling_y = 0;
+    } else if (d->picture_parameter.profile == 2 &&
+               d->picture_parameter.bit_depth_idx == 2) {
+        /* Profile 2 / 12-bit can be 4:2:2; without subsampling bits in desc
+         * we conservatively assume 4:2:2 (subsampling_x=1, subsampling_y=0). */
+        pp->format.subsampling_x = 1;
+        pp->format.subsampling_y = 0;
+    } else {
+        /* Profile 0 and Profile 2 at <=10-bit: 4:2:0. */
+        pp->format.subsampling_x = 1;
+        pp->format.subsampling_y = 1;
+    }
     pp->format.mono_chrome =
         d->picture_parameter.seq_info_fields.mono_chrome;
 
     pp->primary_ref_frame = d->picture_parameter.primary_ref_frame;
     pp->order_hint        = d->picture_parameter.order_hint;
+    /* AV1 spec: OrderHintBits is 0 when enable_order_hint is false; otherwise
+     * order_hint_bits_minus_1 + 1. ffmpeg follows this convention. */
     pp->order_hint_bits   =
-        (UCHAR)(d->picture_parameter.order_hint_bits_minus_1 + 1);
-
-    /* frame_refs[7]: per-ref width/height/global-motion. These indices
-     * point at entries in RefFrameMapTextureIndex[]. */
-    for (i = 0; i < 7; i++) {
-        memset(&pp->frame_refs[i], 0, sizeof(pp->frame_refs[i]));
-        pp->frame_refs[i].Index = d->picture_parameter.ref_frame_idx[i];
-        pp->frame_refs[i].wminvalid = d->picture_parameter.wm[i].invalid ? 1 : 0;
-        pp->frame_refs[i].wmtype    = (UCHAR)(d->picture_parameter.wm[i].wmtype & 0x3);
-        for (j = 0; j < 6; j++)
-            pp->frame_refs[i].wmmat[j] = d->picture_parameter.wm[i].wmmat[j];
-        /* Per-ref coded width/height: pull from our tracked ref buffers if
-         * available; otherwise use current-frame size. */
-        pp->frame_refs[i].width  = d->picture_parameter.frame_width;
-        pp->frame_refs[i].height = d->picture_parameter.frame_height;
-    }
+        d->picture_parameter.seq_info_fields.enable_order_hint ?
+        (UCHAR)(d->picture_parameter.order_hint_bits_minus_1 + 1) : 0;
 
     /* RefFrameMapTextureIndex: 8 entries, mapping AV1 ref-slot -> decode
-     * texture slot. */
+     * texture slot. ffmpeg fills this first then uses ref_frame_idx[i] to
+     * index into it for the frame_refs[] entries. */
     for (i = 0; i < 8; i++)
         pp->RefFrameMapTextureIndex[i] = 0xFF;
     for (i = 0; i < 8; i++) {
@@ -2299,6 +2556,54 @@ static void fill_dxva_picparams_av1(struct virgl_video_codec *codec,
         if (slot < 0)
             continue;
         pp->RefFrameMapTextureIndex[i] = (UCHAR)(slot & 0x7F);
+    }
+
+    /* frame_refs[7]: per-ref width/height/global-motion. Index references an
+     * entry in RefFrameMapTextureIndex[] (i.e. the AV1 ref-buffer slot, 0-7),
+     * not a texture slot directly. If the referenced slot has no backing
+     * frame, Index must be 0xFF (sentinel) per the DXVA spec. */
+    for (i = 0; i < 7; i++) {
+        uint8_t ref_idx = d->picture_parameter.ref_frame_idx[i];
+        struct virgl_video_buffer *refbuf = NULL;
+        uint32_t ref_w = 0, ref_h = 0;
+
+        memset(&pp->frame_refs[i], 0, sizeof(pp->frame_refs[i]));
+
+        if (ref_idx < 8) {
+            uint32_t bid = d->ref[ref_idx];
+            /* Find tracked buf to extract coded width/height. */
+            if (bid != 0) {
+                for (j = 0; j < VIRGL_VIDEO_WIN32_MAX_REFS; j++) {
+                    if (codec->refs[j].buffer_id == bid) {
+                        refbuf = codec->refs[j].buf;
+                        break;
+                    }
+                }
+            }
+            if (refbuf) {
+                ref_w = refbuf->width;
+                ref_h = refbuf->height;
+                pp->frame_refs[i].Index = ref_idx;
+            } else if (pp->RefFrameMapTextureIndex[ref_idx] != 0xFF) {
+                /* Slot has a texture entry but we didn't cache dims; fall
+                 * back to current-frame size (same as ffmpeg with a NULL
+                 * AVFrame, but with non-zero dims so driver doesn't trip). */
+                ref_w = d->picture_parameter.frame_width;
+                ref_h = d->picture_parameter.frame_height;
+                pp->frame_refs[i].Index = ref_idx;
+            } else {
+                pp->frame_refs[i].Index = 0xFF;
+            }
+        } else {
+            pp->frame_refs[i].Index = 0xFF;
+        }
+
+        pp->frame_refs[i].width  = ref_w;
+        pp->frame_refs[i].height = ref_h;
+        pp->frame_refs[i].wminvalid = d->picture_parameter.wm[i].invalid ? 1 : 0;
+        pp->frame_refs[i].wmtype    = (UCHAR)(d->picture_parameter.wm[i].wmtype & 0x3);
+        for (j = 0; j < 6; j++)
+            pp->frame_refs[i].wmmat[j] = d->picture_parameter.wm[i].wmmat[j];
     }
 
     /* Loop filter */
@@ -2322,24 +2627,44 @@ static void fill_dxva_picparams_av1(struct virgl_video_codec *codec,
     pp->loop_filter.mode_deltas[1] = d->picture_parameter.mode_deltas[1];
     pp->loop_filter.delta_lf_res =
         (UCHAR)d->picture_parameter.mode_control_fields.log2_delta_lf_res;
+    /* frame_restoration_type: both VA-API and DXVA encode the AV1 spec
+     * enum {NONE=0, WIENER=1, SGRPROJ=2, SWITCHABLE=3} directly. Mesa fills
+     * the virgl desc from the VA-API value, so passthrough is correct (no
+     * lr_type bitstream remap needed here). */
     pp->loop_filter.frame_restoration_type[0] =
         (UCHAR)d->picture_parameter.loop_restoration_fields.yframe_restoration_type;
     pp->loop_filter.frame_restoration_type[1] =
         (UCHAR)d->picture_parameter.loop_restoration_fields.cbframe_restoration_type;
     pp->loop_filter.frame_restoration_type[2] =
         (UCHAR)d->picture_parameter.loop_restoration_fields.crframe_restoration_type;
-    pp->loop_filter.log2_restoration_unit_size[0] =
-        d->picture_parameter.lr_unit_size[0];
-    pp->loop_filter.log2_restoration_unit_size[1] =
-        d->picture_parameter.lr_unit_size[1];
-    pp->loop_filter.log2_restoration_unit_size[2] =
-        d->picture_parameter.lr_unit_size[2];
 
-    /* Set loop-restoration enable bit based on whether any plane has it on. */
-    if (pp->loop_filter.frame_restoration_type[0] ||
-        pp->loop_filter.frame_restoration_type[1] ||
-        pp->loop_filter.frame_restoration_type[2])
-        pp->coding.restoration = 1;
+    /* DXVA wants log2(unit_size), NOT the raw unit size. Mesa stores the
+     * actual size (1 << (6 + lr_unit_shift)) in lr_unit_size[], so we have
+     * to derive log2 from loop_restoration_fields directly (matching the
+     * ffmpeg formula: uses_lr ? (6 + lr_unit_shift) : 8 for Y; subtract
+     * lr_uv_shift for U/V). This is the single biggest AV1 marshalling bug
+     * — passing 128/256 where the driver expected 7/8 was causing systemic
+     * plane corruption across the entire frame. */
+    uses_lr = (pp->loop_filter.frame_restoration_type[0] ||
+               pp->loop_filter.frame_restoration_type[1] ||
+               pp->loop_filter.frame_restoration_type[2]);
+    {
+        uint8_t lr_unit_shift =
+            d->picture_parameter.loop_restoration_fields.lr_unit_shift;
+        uint8_t lr_uv_shift =
+            d->picture_parameter.loop_restoration_fields.lr_uv_shift;
+        pp->loop_filter.log2_restoration_unit_size[0] =
+            uses_lr ? (USHORT)(6 + lr_unit_shift) : 8;
+        pp->loop_filter.log2_restoration_unit_size[1] =
+            uses_lr ? (USHORT)(6 + lr_unit_shift - lr_uv_shift) : 8;
+        pp->loop_filter.log2_restoration_unit_size[2] =
+            pp->loop_filter.log2_restoration_unit_size[1];
+    }
+
+    /* Set loop-restoration enable bit based on whether any plane has it on.
+     * (virgl desc doesn't carry seq->enable_restoration directly, but if any
+     * plane has restoration the sequence header must have enabled it.) */
+    pp->coding.restoration = uses_lr ? 1 : 0;
 
     /* Quantization */
     pp->quantization.delta_q_present =
@@ -2352,9 +2677,17 @@ static void fill_dxva_picparams_av1(struct virgl_video_codec *codec,
     pp->quantization.v_dc_delta_q = d->picture_parameter.v_dc_delta_q;
     pp->quantization.u_ac_delta_q = d->picture_parameter.u_ac_delta_q;
     pp->quantization.v_ac_delta_q = d->picture_parameter.v_ac_delta_q;
-    pp->quantization.qm_y = (UCHAR)d->picture_parameter.qmatrix_fields.qm_y;
-    pp->quantization.qm_u = (UCHAR)d->picture_parameter.qmatrix_fields.qm_u;
-    pp->quantization.qm_v = (UCHAR)d->picture_parameter.qmatrix_fields.qm_v;
+    /* qm_y/u/v must be 0xFF when qmatrix is disabled (ffmpeg convention;
+     * drivers use 0xFF as the "no qmatrix" sentinel). */
+    if (d->picture_parameter.qmatrix_fields.using_qmatrix) {
+        pp->quantization.qm_y = (UCHAR)d->picture_parameter.qmatrix_fields.qm_y;
+        pp->quantization.qm_u = (UCHAR)d->picture_parameter.qmatrix_fields.qm_u;
+        pp->quantization.qm_v = (UCHAR)d->picture_parameter.qmatrix_fields.qm_v;
+    } else {
+        pp->quantization.qm_y = 0xFF;
+        pp->quantization.qm_u = 0xFF;
+        pp->quantization.qm_v = 0xFF;
+    }
 
     /* CDEF */
     pp->cdef.damping = (UCHAR)(d->picture_parameter.cdef_damping_minus_3 & 0x3);
@@ -2383,66 +2716,73 @@ static void fill_dxva_picparams_av1(struct virgl_video_codec *codec,
                 d->picture_parameter.seg_info.feature_data[i][j];
     }
 
-    /* Film grain */
-    pp->film_grain.apply_grain =
+    /* Film grain: only populate when apply_grain is set. ffmpeg zeroes the
+     * whole struct and only fills when apply_grain — driver reads stale AR
+     * coefficients / scaling points otherwise and produces garbage output. */
+    apply_grain =
         d->picture_parameter.film_grain_info.film_grain_info_fields.apply_grain;
-    pp->film_grain.scaling_shift_minus8 =
-        d->picture_parameter.film_grain_info.film_grain_info_fields.grain_scaling_minus_8;
-    pp->film_grain.chroma_scaling_from_luma =
-        d->picture_parameter.film_grain_info.film_grain_info_fields.chroma_scaling_from_luma;
-    pp->film_grain.ar_coeff_lag =
-        d->picture_parameter.film_grain_info.film_grain_info_fields.ar_coeff_lag;
-    pp->film_grain.ar_coeff_shift_minus6 =
-        d->picture_parameter.film_grain_info.film_grain_info_fields.ar_coeff_shift_minus_6;
-    pp->film_grain.grain_scale_shift =
-        d->picture_parameter.film_grain_info.film_grain_info_fields.grain_scale_shift;
-    pp->film_grain.overlap_flag =
-        d->picture_parameter.film_grain_info.film_grain_info_fields.overlap_flag;
-    pp->film_grain.clip_to_restricted_range =
-        d->picture_parameter.film_grain_info.film_grain_info_fields.clip_to_restricted_range;
-    pp->film_grain.matrix_coeff_is_identity = 0;   /* TODO: derive from
-                                                    * matrix_coefficients==AV1_MC_IDENTITY */
-    pp->film_grain.grain_seed =
-        d->picture_parameter.film_grain_info.grain_seed;
-    pp->film_grain.num_y_points =
-        d->picture_parameter.film_grain_info.num_y_points;
-    pp->film_grain.num_cb_points =
-        d->picture_parameter.film_grain_info.num_cb_points;
-    pp->film_grain.num_cr_points =
-        d->picture_parameter.film_grain_info.num_cr_points;
-    for (i = 0; i < 14; i++) {
-        pp->film_grain.scaling_points_y[i][0] =
-            d->picture_parameter.film_grain_info.point_y_value[i];
-        pp->film_grain.scaling_points_y[i][1] =
-            d->picture_parameter.film_grain_info.point_y_scaling[i];
+    if (apply_grain) {
+        pp->film_grain.apply_grain              = 1;
+        pp->film_grain.scaling_shift_minus8 =
+            d->picture_parameter.film_grain_info.film_grain_info_fields.grain_scaling_minus_8;
+        pp->film_grain.chroma_scaling_from_luma =
+            d->picture_parameter.film_grain_info.film_grain_info_fields.chroma_scaling_from_luma;
+        pp->film_grain.ar_coeff_lag =
+            d->picture_parameter.film_grain_info.film_grain_info_fields.ar_coeff_lag;
+        pp->film_grain.ar_coeff_shift_minus6 =
+            d->picture_parameter.film_grain_info.film_grain_info_fields.ar_coeff_shift_minus_6;
+        pp->film_grain.grain_scale_shift =
+            d->picture_parameter.film_grain_info.film_grain_info_fields.grain_scale_shift;
+        pp->film_grain.overlap_flag =
+            d->picture_parameter.film_grain_info.film_grain_info_fields.overlap_flag;
+        pp->film_grain.clip_to_restricted_range =
+            d->picture_parameter.film_grain_info.film_grain_info_fields.clip_to_restricted_range;
+        /* matrix_coeff_is_identity: 1 iff seq->color_config.matrix_coefficients
+         * == AV1_MC_IDENTITY (which maps to AVCOL_SPC_RGB = 0). */
+        pp->film_grain.matrix_coeff_is_identity =
+            (d->picture_parameter.matrix_coefficients == 0) ? 1 : 0;
+        pp->film_grain.grain_seed =
+            d->picture_parameter.film_grain_info.grain_seed;
+        pp->film_grain.num_y_points =
+            d->picture_parameter.film_grain_info.num_y_points;
+        pp->film_grain.num_cb_points =
+            d->picture_parameter.film_grain_info.num_cb_points;
+        pp->film_grain.num_cr_points =
+            d->picture_parameter.film_grain_info.num_cr_points;
+        for (i = 0; i < 14; i++) {
+            pp->film_grain.scaling_points_y[i][0] =
+                d->picture_parameter.film_grain_info.point_y_value[i];
+            pp->film_grain.scaling_points_y[i][1] =
+                d->picture_parameter.film_grain_info.point_y_scaling[i];
+        }
+        for (i = 0; i < 10; i++) {
+            pp->film_grain.scaling_points_cb[i][0] =
+                d->picture_parameter.film_grain_info.point_cb_value[i];
+            pp->film_grain.scaling_points_cb[i][1] =
+                d->picture_parameter.film_grain_info.point_cb_scaling[i];
+            pp->film_grain.scaling_points_cr[i][0] =
+                d->picture_parameter.film_grain_info.point_cr_value[i];
+            pp->film_grain.scaling_points_cr[i][1] =
+                d->picture_parameter.film_grain_info.point_cr_scaling[i];
+        }
+        for (i = 0; i < 24; i++)
+            pp->film_grain.ar_coeffs_y[i] =
+                (UCHAR)d->picture_parameter.film_grain_info.ar_coeffs_y[i];
+        for (i = 0; i < 25; i++) {
+            pp->film_grain.ar_coeffs_cb[i] =
+                (UCHAR)d->picture_parameter.film_grain_info.ar_coeffs_cb[i];
+            pp->film_grain.ar_coeffs_cr[i] =
+                (UCHAR)d->picture_parameter.film_grain_info.ar_coeffs_cr[i];
+        }
+        pp->film_grain.cb_mult      = d->picture_parameter.film_grain_info.cb_mult;
+        pp->film_grain.cb_luma_mult = d->picture_parameter.film_grain_info.cb_luma_mult;
+        pp->film_grain.cr_mult      = d->picture_parameter.film_grain_info.cr_mult;
+        pp->film_grain.cr_luma_mult = d->picture_parameter.film_grain_info.cr_luma_mult;
+        pp->film_grain.cb_offset    =
+            (SHORT)d->picture_parameter.film_grain_info.cb_offset;
+        pp->film_grain.cr_offset    =
+            (SHORT)d->picture_parameter.film_grain_info.cr_offset;
     }
-    for (i = 0; i < 10; i++) {
-        pp->film_grain.scaling_points_cb[i][0] =
-            d->picture_parameter.film_grain_info.point_cb_value[i];
-        pp->film_grain.scaling_points_cb[i][1] =
-            d->picture_parameter.film_grain_info.point_cb_scaling[i];
-        pp->film_grain.scaling_points_cr[i][0] =
-            d->picture_parameter.film_grain_info.point_cr_value[i];
-        pp->film_grain.scaling_points_cr[i][1] =
-            d->picture_parameter.film_grain_info.point_cr_scaling[i];
-    }
-    for (i = 0; i < 24; i++)
-        pp->film_grain.ar_coeffs_y[i] =
-            (UCHAR)d->picture_parameter.film_grain_info.ar_coeffs_y[i];
-    for (i = 0; i < 25; i++) {
-        pp->film_grain.ar_coeffs_cb[i] =
-            (UCHAR)d->picture_parameter.film_grain_info.ar_coeffs_cb[i];
-        pp->film_grain.ar_coeffs_cr[i] =
-            (UCHAR)d->picture_parameter.film_grain_info.ar_coeffs_cr[i];
-    }
-    pp->film_grain.cb_mult      = d->picture_parameter.film_grain_info.cb_mult;
-    pp->film_grain.cb_luma_mult = d->picture_parameter.film_grain_info.cb_luma_mult;
-    pp->film_grain.cr_mult      = d->picture_parameter.film_grain_info.cr_mult;
-    pp->film_grain.cr_luma_mult = d->picture_parameter.film_grain_info.cr_luma_mult;
-    pp->film_grain.cb_offset    =
-        (SHORT)d->picture_parameter.film_grain_info.cb_offset;
-    pp->film_grain.cr_offset    =
-        (SHORT)d->picture_parameter.film_grain_info.cr_offset;
 
     pp->StatusReportFeedbackNumber = codec->status_report_feedback++;
     if (pp->StatusReportFeedbackNumber == 0)
@@ -2467,8 +2807,10 @@ static void build_sc_av1(void *sc_array, unsigned idx,
         ctx->desc->slice_parameter.slice_data_row[idx] : 0;
     arr[idx].column        = (idx < 256) ?
         ctx->desc->slice_parameter.slice_data_col[idx] : 0;
-    arr[idx].anchor_frame  = (idx < 256) ?
-        ctx->desc->slice_parameter.slice_data_anchor_frame_idx[idx] : 0xFF;
+    /* ffmpeg always uses 0xFF as the sentinel here; Mesa's VA-API frontend
+     * does not track anchor frames, so the raw byte can be a stale zero
+     * that confuses the driver. Match ffmpeg unconditionally. */
+    arr[idx].anchor_frame  = 0xFF;
     arr[idx].Reserved16Bits = 0;
     arr[idx].Reserved8Bits  = 0;
 }
@@ -2540,16 +2882,870 @@ int virgl_video_decode_bitstream(struct virgl_video_codec *codec,
     }
 }
 
+/*
+ * ---------------------------------------------------------------------------
+ * Encode implementation — Media Foundation-backed H.264 / HEVC hardware MFT.
+ *
+ * Flow:
+ *   - virgl_video_create_codec() with entrypoint=ENCODE allocates the codec
+ *     shell and calls encoder_create_mft() to enumerate a hardware MFT
+ *     matching the requested profile.
+ *   - On the first virgl_video_encode_bitstream() we set input/output media
+ *     types and send MFT_MESSAGE_NOTIFY_BEGIN_STREAMING.
+ *   - Each call wraps the NV12 source frame into an IMFSample, feeds it to
+ *     ProcessInput, then drains ProcessOutput until the MFT says "need more
+ *     input" and delivers the coded bytes via encode_completed.
+ *   - virgl_video_destroy_codec() releases the MFT and drops the MF refcount.
+ *
+ * NV12 staging texture model: the encode source comes in as a
+ * virgl_video_buffer whose decode_tex is NV12. We CopyResource it into the
+ * existing staging_tex, Map() the staging, and memcpy into an IMFMediaBuffer.
+ * That's the same copy path we already use for decode readback, just in
+ * reverse.
+ * ---------------------------------------------------------------------------
+ */
+
+static bool profile_encode_supported(enum pipe_video_profile profile)
+{
+    /* We advertise H.264 + HEVC encode; AV1/VP9 encoders in Media Foundation
+     * are either nonexistent or flaky on current Intel/AMD drivers. */
+    switch (profile) {
+    case PIPE_VIDEO_PROFILE_MPEG4_AVC_BASELINE:
+    case PIPE_VIDEO_PROFILE_MPEG4_AVC_CONSTRAINED_BASELINE:
+    case PIPE_VIDEO_PROFILE_MPEG4_AVC_MAIN:
+    case PIPE_VIDEO_PROFILE_MPEG4_AVC_EXTENDED:
+    case PIPE_VIDEO_PROFILE_MPEG4_AVC_HIGH:
+    case PIPE_VIDEO_PROFILE_HEVC_MAIN:
+    case PIPE_VIDEO_PROFILE_HEVC_MAIN_10:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool profile_encode_output_guid(enum pipe_video_profile profile,
+                                       GUID *out)
+{
+    switch (profile) {
+    case PIPE_VIDEO_PROFILE_MPEG4_AVC_BASELINE:
+    case PIPE_VIDEO_PROFILE_MPEG4_AVC_CONSTRAINED_BASELINE:
+    case PIPE_VIDEO_PROFILE_MPEG4_AVC_MAIN:
+    case PIPE_VIDEO_PROFILE_MPEG4_AVC_EXTENDED:
+    case PIPE_VIDEO_PROFILE_MPEG4_AVC_HIGH:
+        *out = MFVideoFormat_H264;
+        return true;
+    case PIPE_VIDEO_PROFILE_HEVC_MAIN:
+    case PIPE_VIDEO_PROFILE_HEVC_MAIN_10:
+        *out = VIRGL_MFVIDEOFORMAT_HEVC;
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* Pack frame_rate_num/den into the upper/lower 32-bits of a UINT64 per MF
+ * conventions (MFFrameRate). The MFSetAttributeSize / MFSetAttributeRatio
+ * helpers in mfapi.h are C++-only inline functions on MinGW — we have to
+ * reimplement them as a raw SetUINT64 call. */
+static UINT64 mf_pack_ratio(UINT32 high, UINT32 low)
+{
+    return (((UINT64)high) << 32) | (UINT64)low;
+}
+
+static HRESULT mf_set_attr_size(IMFAttributes *attrs, REFGUID key,
+                                UINT32 width, UINT32 height)
+{
+    return IMFAttributes_SetUINT64(attrs, key, mf_pack_ratio(width, height));
+}
+
+static HRESULT mf_set_attr_ratio(IMFAttributes *attrs, REFGUID key,
+                                 UINT32 num, UINT32 den)
+{
+    return IMFAttributes_SetUINT64(attrs, key, mf_pack_ratio(num, den));
+}
+
+/* Enumerate hardware MFTs for the given output codec and return the first
+ * one. Caller releases. */
+static HRESULT find_hw_encoder_mft(const GUID *output_subtype,
+                                   IMFTransform **out_mft)
+{
+    HRESULT hr;
+    MFT_REGISTER_TYPE_INFO in_info  = { MFMediaType_Video, MFVideoFormat_NV12 };
+    MFT_REGISTER_TYPE_INFO out_info = { MFMediaType_Video, *output_subtype };
+    IMFActivate **activates = NULL;
+    UINT32 count = 0;
+    UINT32 i;
+
+    *out_mft = NULL;
+
+    hr = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
+                   MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+                   &in_info, &out_info,
+                   &activates, &count);
+    if (FAILED(hr))
+        return hr;
+    if (count == 0) {
+        CoTaskMemFree(activates);
+        return E_FAIL;
+    }
+
+    for (i = 0; i < count; i++) {
+        IMFTransform *mft = NULL;
+        hr = IMFActivate_ActivateObject(activates[i], &IID_IMFTransform,
+                                        (void **)&mft);
+        if (SUCCEEDED(hr) && mft) {
+            *out_mft = mft;
+            /* Detach remaining activates and release them. */
+            IMFActivate_Release(activates[i]);
+            i++;
+            break;
+        }
+        IMFActivate_Release(activates[i]);
+    }
+    for (; i < count; i++)
+        IMFActivate_Release(activates[i]);
+    CoTaskMemFree(activates);
+
+    if (!*out_mft)
+        return E_FAIL;
+    return S_OK;
+}
+
+/* Query MFTEnumEx without instantiating anything, to answer "does the host
+ * expose a hardware MFT for (NV12 -> output_subtype)?". */
+static bool have_hw_encoder_for(const GUID *output_subtype)
+{
+    HRESULT hr;
+    MFT_REGISTER_TYPE_INFO in_info  = { MFMediaType_Video, MFVideoFormat_NV12 };
+    MFT_REGISTER_TYPE_INFO out_info = { MFMediaType_Video, *output_subtype };
+    IMFActivate **activates = NULL;
+    UINT32 count = 0;
+
+    hr = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
+                   MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+                   &in_info, &out_info,
+                   &activates, &count);
+    if (FAILED(hr))
+        return false;
+    if (activates) {
+        UINT32 i;
+        for (i = 0; i < count; i++)
+            IMFActivate_Release(activates[i]);
+        CoTaskMemFree(activates);
+    }
+    return count > 0;
+}
+
+/* Enumerate the MFT's available types on `stream_id` until we find one whose
+ * MF_MT_SUBTYPE matches `want_subtype`, clone it into a fresh IMFMediaType,
+ * and return it. The caller owns the returned reference.
+ *
+ * Why clone instead of hand-crafting: hardware MFTs (especially Intel/AMD
+ * HEVC) advertise mandatory vendor-specific attributes on their available
+ * types (NominalRange, ChromaSubsampling, VideoPrimaries, TransferFunction,
+ * plus undocumented driver-private attributes). If any of those are missing
+ * on the type we pass to SetInputType/SetOutputType, the MFT returns
+ * MF_E_INVALIDMEDIATYPE (0xc00d6d77). Cloning the MFT's own advertised type
+ * and only overwriting the attributes we *must* change (frame size, frame
+ * rate, interlace mode, aspect ratio, bitrate, profile) preserves every
+ * driver-specific attribute verbatim. */
+static HRESULT encoder_clone_available_type(IMFTransform *mft,
+                                            DWORD stream_id,
+                                            bool is_input,
+                                            const GUID *want_subtype,
+                                            IMFMediaType **out_type)
+{
+    HRESULT hr;
+    DWORD i;
+    IMFMediaType *found = NULL;
+    IMFMediaType *cloned = NULL;
+
+    *out_type = NULL;
+
+    for (i = 0; ; i++) {
+        IMFMediaType *avail = NULL;
+        GUID sub;
+
+        if (is_input)
+            hr = IMFTransform_GetInputAvailableType(mft, stream_id, i, &avail);
+        else
+            hr = IMFTransform_GetOutputAvailableType(mft, stream_id, i, &avail);
+
+        if (hr == MF_E_NO_MORE_TYPES || hr == E_NOTIMPL)
+            break;
+        if (FAILED(hr))
+            return hr;
+
+        hr = IMFMediaType_GetGUID(avail, &MF_MT_SUBTYPE, &sub);
+        if (SUCCEEDED(hr) && IsEqualGUID(&sub, want_subtype)) {
+            found = avail;
+            break;
+        }
+        IMFMediaType_Release(avail);
+    }
+
+    if (!found)
+        return MF_E_INVALIDMEDIATYPE;
+
+    hr = MFCreateMediaType(&cloned);
+    if (FAILED(hr)) {
+        IMFMediaType_Release(found);
+        return hr;
+    }
+    hr = IMFMediaType_CopyAllItems(found, (IMFAttributes *)cloned);
+    IMFMediaType_Release(found);
+    if (FAILED(hr)) {
+        IMFMediaType_Release(cloned);
+        return hr;
+    }
+
+    *out_type = cloned;
+    return S_OK;
+}
+
+static HRESULT encoder_set_types(struct virgl_video_codec *codec)
+{
+    HRESULT hr;
+    IMFMediaType *in_type = NULL;
+    IMFMediaType *out_type = NULL;
+    IMFAttributes *mft_attrs = NULL;
+    const GUID in_subtype = MFVideoFormat_NV12;
+
+    if (codec->encoder_fps_num == 0 || codec->encoder_fps_den == 0) {
+        codec->encoder_fps_num = 30;
+        codec->encoder_fps_den = 1;
+    }
+
+    /* Enable low-latency mode on the MFT itself before any SetOutputType
+     * call. Hardware H.264/HEVC encoders tend to behave more predictably
+     * (and, crucially, some will start enumerating input types only once
+     * the output side is fully configured) when MF_LOW_LATENCY=1 is set.
+     * Any failure here is non-fatal — the attribute is a hint. */
+    if (SUCCEEDED(IMFTransform_GetAttributes(codec->encoder_mft,
+                                             &mft_attrs)) && mft_attrs) {
+        IMFAttributes_SetUINT32(mft_attrs, &VIRGL_MF_LOW_LATENCY, 1);
+        IMFAttributes_Release(mft_attrs);
+    }
+
+    /* OUTPUT type — hand-constructed.
+     *
+     * Hardware MFTs for H.264/HEVC (Intel QuickSync, AMD AMF, NVENC via MF)
+     * frequently do NOT enumerate any output types via GetOutputAvailableType
+     * until after SetOutputType has been called at least once: their
+     * available-type list is only populated once the encoder is
+     * parameter-configured, which is a chicken-and-egg problem for our
+     * earlier clone-based approach. The workaround used by ffmpeg's
+     * libavcodec/mfenc.c and the Microsoft SDK samples is to hand-construct
+     * the output type from scratch with just the mandatory framing /
+     * bitrate / subtype attributes — that set is universally accepted. */
+    hr = MFCreateMediaType(&out_type);
+    if (FAILED(hr))
+        goto done;
+    IMFMediaType_SetGUID(out_type, &MF_MT_MAJOR_TYPE, &MFMediaType_Video);
+    IMFMediaType_SetGUID(out_type, &MF_MT_SUBTYPE, &codec->encoder_output_guid);
+    IMFMediaType_SetUINT32(out_type, &MF_MT_AVG_BITRATE,
+                           codec->encoder_bitrate > 0 ?
+                           codec->encoder_bitrate : 8 * 1000 * 1000);
+    IMFMediaType_SetUINT32(out_type, &MF_MT_INTERLACE_MODE,
+                           MFVideoInterlace_Progressive);
+    mf_set_attr_size((IMFAttributes *)out_type, &MF_MT_FRAME_SIZE,
+                     codec->encoder_width, codec->encoder_height);
+    mf_set_attr_ratio((IMFAttributes *)out_type, &MF_MT_FRAME_RATE,
+                      codec->encoder_fps_num, codec->encoder_fps_den);
+    mf_set_attr_ratio((IMFAttributes *)out_type, &MF_MT_PIXEL_ASPECT_RATIO,
+                      1, 1);
+    /* Pin H.264 to Main profile; HEVC gets its default (Main 8-bit 4:2:0). */
+    if (IsEqualGUID(&codec->encoder_output_guid, &MFVideoFormat_H264))
+        IMFMediaType_SetUINT32(out_type, &MF_MT_MPEG2_PROFILE,
+                               eAVEncH264VProfile_Main);
+    hr = IMFTransform_SetOutputType(codec->encoder_mft, 0, out_type, 0);
+    if (FAILED(hr)) {
+        virgl_error("virgl_video_win32: SetOutputType failed 0x%lx\n",
+                    (unsigned long)hr);
+        goto done;
+    }
+
+    /* INPUT type — enumerate-and-clone.
+     *
+     * Unlike the output side, hardware MFT input types carry vendor-private
+     * attributes (NominalRange, ChromaSubsampling, VideoPrimaries,
+     * TransferFunction, and undocumented driver-private items) whose absence
+     * yields MF_E_INVALIDMEDIATYPE (0xc00d6d77) from SetInputType. Cloning
+     * an MFT-advertised NV12 type and overriding only frame size / rate /
+     * interlace / aspect preserves those attributes intact. Input types
+     * are only reliably enumerable AFTER SetOutputType has succeeded,
+     * which is why this must stay in this order. */
+    hr = encoder_clone_available_type(codec->encoder_mft, 0, true,
+                                      &in_subtype, &in_type);
+    if (FAILED(hr) || !in_type) {
+        /* Some hardware MFTs don't enumerate input types even after the output
+         * type is set. Fall back to a hand-constructed NV12 type including
+         * colorimetry hints — Intel/NVIDIA H.264 and HEVC encoders typically
+         * accept this form. */
+        virgl_warn("virgl_video_win32: input enum empty, hand-constructing NV12 "
+                   "type (prev hr=0x%lx)\n", (unsigned long)hr);
+        if (in_type) { IMFMediaType_Release(in_type); in_type = NULL; }
+        hr = MFCreateMediaType(&in_type);
+        if (FAILED(hr)) goto done;
+        IMFMediaType_SetGUID(in_type, &MF_MT_MAJOR_TYPE, &MFMediaType_Video);
+        IMFMediaType_SetGUID(in_type, &MF_MT_SUBTYPE, &in_subtype);
+        /* Rec. 709 progressive SDR — safe default accepted by all major
+         * hardware encoders. */
+        IMFMediaType_SetUINT32(in_type, &MF_MT_VIDEO_NOMINAL_RANGE,
+                               MFNominalRange_16_235);
+        IMFMediaType_SetUINT32(in_type, &MF_MT_VIDEO_PRIMARIES,
+                               MFVideoPrimaries_BT709);
+        IMFMediaType_SetUINT32(in_type, &MF_MT_TRANSFER_FUNCTION,
+                               MFVideoTransFunc_709);
+        IMFMediaType_SetUINT32(in_type, &MF_MT_YUV_MATRIX,
+                               MFVideoTransferMatrix_BT709);
+        IMFMediaType_SetUINT32(in_type, &MF_MT_VIDEO_CHROMA_SITING,
+                               MFVideoChromaSubsampling_MPEG2);
+    }
+    IMFMediaType_SetUINT32(in_type, &MF_MT_INTERLACE_MODE,
+                           MFVideoInterlace_Progressive);
+    mf_set_attr_size((IMFAttributes *)in_type, &MF_MT_FRAME_SIZE,
+                     codec->encoder_width, codec->encoder_height);
+    mf_set_attr_ratio((IMFAttributes *)in_type, &MF_MT_FRAME_RATE,
+                      codec->encoder_fps_num, codec->encoder_fps_den);
+    mf_set_attr_ratio((IMFAttributes *)in_type, &MF_MT_PIXEL_ASPECT_RATIO,
+                      1, 1);
+    hr = IMFTransform_SetInputType(codec->encoder_mft, 0, in_type, 0);
+    if (FAILED(hr)) {
+        virgl_error("virgl_video_win32: SetInputType failed 0x%lx\n",
+                    (unsigned long)hr);
+        goto done;
+    }
+
+done:
+    if (in_type)  IMFMediaType_Release(in_type);
+    if (out_type) IMFMediaType_Release(out_type);
+    return hr;
+}
+
+/* Lazily (on first encode call) transition the MFT from "types set" to
+ * "streaming" by issuing the required MFT_MESSAGE sequence. */
+static HRESULT encoder_start_streaming(struct virgl_video_codec *codec)
+{
+    HRESULT hr;
+
+    if (codec->encoder_stream_started)
+        return S_OK;
+
+    hr = IMFTransform_ProcessMessage(codec->encoder_mft,
+                                     MFT_MESSAGE_COMMAND_FLUSH, 0);
+    if (FAILED(hr))
+        return hr;
+    hr = IMFTransform_ProcessMessage(codec->encoder_mft,
+                                     MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+    if (FAILED(hr))
+        return hr;
+    hr = IMFTransform_ProcessMessage(codec->encoder_mft,
+                                     MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+    if (FAILED(hr))
+        return hr;
+
+    codec->encoder_stream_started = true;
+    return S_OK;
+}
+
+/* Copy the NV12 pixels for `source` into an IMFMediaBuffer, then wrap in an
+ * IMFSample with the requested sample time and keyframe flag.
+ *
+ * Preferred source is the CPU slab latched by virgl_video_buffer_cpu_writeback
+ * (populated by vrend_video.c reading the guest's GL textures with
+ * glGetTexImage). If that slab is absent for any reason we fall back to
+ * staging the backend's own decode_tex — this only produces meaningful pixels
+ * when `source` was filled by a prior decode on the same buffer; for the
+ * normal guest-side encode path, relying on that fallback would feed garbage
+ * to the MFT, so it exists purely for robustness. */
+static HRESULT encoder_build_sample(struct virgl_video_codec *codec,
+                                    struct virgl_video_buffer *source,
+                                    bool force_keyframe,
+                                    IMFSample **out_sample)
+{
+    HRESULT hr;
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    IMFSample *sample = NULL;
+    IMFMediaBuffer *mbuf = NULL;
+    BYTE *mdata = NULL;
+    DWORD mcap = 0;
+    BYTE *y_dst;
+    BYTE *uv_dst;
+    unsigned row;
+    UINT64 sample_time_100ns;
+    UINT64 sample_dur_100ns;
+    bool mapped_staging = false;
+
+    *out_sample = NULL;
+
+    /* NV12 has 1.5 bytes per pixel (Y plane full res + UV half-height). */
+    DWORD total = source->width * source->height * 3 / 2;
+    hr = MFCreateMemoryBuffer(total, &mbuf);
+    if (FAILED(hr)) goto fail;
+    hr = IMFMediaBuffer_Lock(mbuf, &mdata, &mcap, NULL);
+    if (FAILED(hr)) goto fail;
+
+    if (source->encode_src_nv12 && source->encode_src_size >= total) {
+        /* Fast path: vrend_video.c already handed us a densely packed NV12
+         * blob. Just memcpy it straight into the MF media buffer. */
+        memcpy(mdata, source->encode_src_nv12, total);
+    } else {
+        /* Fallback: read from the backend's decode_tex via the staging
+         * texture. This yields real pixels only if the same buffer was the
+         * target of a recent decode on this host — not the typical encode
+         * scenario, so if we hit this path during an encoder-only workload
+         * the MFT will see whatever happens to be in the decode_tex (usually
+         * zeroes, i.e. a green frame). */
+        UINT y_pitch;
+        UINT uv_pitch;
+        BYTE *y_src;
+        BYTE *uv_src;
+
+        ID3D11DeviceContext_CopyResource(g_vid.context,
+                                         (ID3D11Resource *)source->staging_tex,
+                                         (ID3D11Resource *)source->decode_tex);
+        hr = ID3D11DeviceContext_Map(g_vid.context,
+                                     (ID3D11Resource *)source->staging_tex,
+                                     0, D3D11_MAP_READ, 0, &mapped);
+        if (FAILED(hr)) {
+            IMFMediaBuffer_Unlock(mbuf);
+            goto fail;
+        }
+        mapped_staging = true;
+
+        y_pitch  = mapped.RowPitch;
+        uv_pitch = mapped.RowPitch;   /* NV12 interleaved UV uses same pitch */
+        y_src    = (BYTE *)mapped.pData;
+        uv_src   = y_src + (size_t)y_pitch * source->height;
+
+        /* Pack row-by-row to get rid of the D3D RowPitch padding. */
+        y_dst  = mdata;
+        uv_dst = mdata + (size_t)source->width * source->height;
+        for (row = 0; row < source->height; row++)
+            memcpy(y_dst + (size_t)row * source->width,
+                   y_src + (size_t)row * y_pitch,
+                   source->width);
+        for (row = 0; row < source->height / 2u; row++)
+            memcpy(uv_dst + (size_t)row * source->width,
+                   uv_src + (size_t)row * uv_pitch,
+                   source->width);
+    }
+
+    IMFMediaBuffer_Unlock(mbuf);
+    IMFMediaBuffer_SetCurrentLength(mbuf, total);
+
+    if (mapped_staging) {
+        ID3D11DeviceContext_Unmap(g_vid.context,
+                                  (ID3D11Resource *)source->staging_tex, 0);
+        mapped_staging = false;
+    }
+
+    hr = MFCreateSample(&sample);
+    if (FAILED(hr)) goto fail;
+    IMFSample_AddBuffer(sample, mbuf);
+
+    /* Monotonic presentation time. 100ns units; frame period = 1e7 *
+     * fps_den / fps_num. */
+    sample_dur_100ns  = (UINT64)10000000ULL *
+                       (codec->encoder_fps_den ? codec->encoder_fps_den : 1) /
+                       (codec->encoder_fps_num ? codec->encoder_fps_num : 30);
+    sample_time_100ns = codec->encoder_frame_count * sample_dur_100ns;
+    IMFSample_SetSampleTime(sample, (LONGLONG)sample_time_100ns);
+    IMFSample_SetSampleDuration(sample, (LONGLONG)sample_dur_100ns);
+
+    /* Keyframe hint. MFSampleExtension_CleanPoint marks a sample as a
+     * random-access point; most hardware MFTs interpret that as "emit an
+     * IDR here". MFSampleExtension_ForceKeyFrame would be more forceful
+     * but isn't declared in MSYS2 MinGW headers, so we rely on CleanPoint
+     * plus implicit IDR-at-frame-0 behaviour. */
+    if (force_keyframe || codec->encoder_frame_count == 0) {
+        IMFSample_SetUINT32(sample, &MFSampleExtension_CleanPoint, 1);
+    }
+
+    IMFMediaBuffer_Release(mbuf);
+    *out_sample = sample;
+    return S_OK;
+
+fail:
+    if (mbuf)   IMFMediaBuffer_Release(mbuf);
+    if (sample) IMFSample_Release(sample);
+    if (mapped_staging)
+        ID3D11DeviceContext_Unmap(g_vid.context,
+                                  (ID3D11Resource *)source->staging_tex, 0);
+    return FAILED(hr) ? hr : E_FAIL;
+}
+
+/* Append the bytes from an output IMFSample into the codec's coded buffer,
+ * growing it on demand. */
+static HRESULT encoder_collect_output(struct virgl_video_codec *codec,
+                                      IMFSample *sample)
+{
+    HRESULT hr;
+    DWORD total_len = 0;
+    DWORD i;
+    DWORD buffer_count = 0;
+
+    IMFSample_GetBufferCount(sample, &buffer_count);
+    for (i = 0; i < buffer_count; i++) {
+        IMFMediaBuffer *mb = NULL;
+        BYTE *data = NULL;
+        DWORD cap = 0, cur = 0;
+
+        hr = IMFSample_GetBufferByIndex(sample, i, &mb);
+        if (FAILED(hr)) return hr;
+        hr = IMFMediaBuffer_Lock(mb, &data, &cap, &cur);
+        if (FAILED(hr)) { IMFMediaBuffer_Release(mb); return hr; }
+
+        if (codec->encoder_coded_size + cur > codec->encoder_coded_capacity) {
+            unsigned new_cap = codec->encoder_coded_capacity ?
+                               codec->encoder_coded_capacity * 2 : 65536;
+            while (new_cap < codec->encoder_coded_size + cur)
+                new_cap *= 2;
+            uint8_t *grown = realloc(codec->encoder_coded_buf, new_cap);
+            if (!grown) {
+                IMFMediaBuffer_Unlock(mb);
+                IMFMediaBuffer_Release(mb);
+                return E_OUTOFMEMORY;
+            }
+            codec->encoder_coded_buf      = grown;
+            codec->encoder_coded_capacity = new_cap;
+        }
+        memcpy(codec->encoder_coded_buf + codec->encoder_coded_size, data, cur);
+        codec->encoder_coded_size += cur;
+
+        IMFMediaBuffer_Unlock(mb);
+        IMFMediaBuffer_Release(mb);
+        total_len += cur;
+    }
+    (void)total_len;
+    return S_OK;
+}
+
+/* Drain ProcessOutput until it signals MF_E_TRANSFORM_NEED_MORE_INPUT. */
+static HRESULT encoder_drain_output(struct virgl_video_codec *codec)
+{
+    HRESULT hr;
+    MFT_OUTPUT_STREAM_INFO stream_info;
+    IMFSample *out_sample = NULL;
+
+    memset(&stream_info, 0, sizeof(stream_info));
+    hr = IMFTransform_GetOutputStreamInfo(codec->encoder_mft, 0, &stream_info);
+    if (FAILED(hr))
+        return hr;
+
+    for (;;) {
+        MFT_OUTPUT_DATA_BUFFER out_buf;
+        DWORD status = 0;
+        bool provided_sample = false;
+
+        memset(&out_buf, 0, sizeof(out_buf));
+        out_buf.dwStreamID = 0;
+
+        /* If the MFT does not provide its own output samples, we have to
+         * supply one. Hardware MFTs on Windows 10+ typically provide
+         * samples themselves, but check the flag. */
+        if (!(stream_info.dwFlags &
+              (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES |
+               MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES))) {
+            IMFMediaBuffer *buf = NULL;
+            hr = MFCreateMemoryBuffer(stream_info.cbSize ?
+                                      stream_info.cbSize : 1024 * 1024,
+                                      &buf);
+            if (FAILED(hr)) return hr;
+            hr = MFCreateSample(&out_sample);
+            if (FAILED(hr)) { IMFMediaBuffer_Release(buf); return hr; }
+            IMFSample_AddBuffer(out_sample, buf);
+            IMFMediaBuffer_Release(buf);
+            out_buf.pSample = out_sample;
+            provided_sample = true;
+        }
+
+        hr = IMFTransform_ProcessOutput(codec->encoder_mft, 0, 1,
+                                        &out_buf, &status);
+        if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
+            if (provided_sample && out_sample)
+                IMFSample_Release(out_sample);
+            if (out_buf.pEvents)
+                IUnknown_Release((IUnknown *)out_buf.pEvents);
+            return S_OK;
+        }
+        if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
+            /* Renegotiate output type silently; re-set and retry. */
+            if (provided_sample && out_sample)
+                IMFSample_Release(out_sample);
+            if (out_buf.pEvents)
+                IUnknown_Release((IUnknown *)out_buf.pEvents);
+            encoder_set_types(codec);
+            continue;
+        }
+        if (FAILED(hr)) {
+            if (provided_sample && out_sample)
+                IMFSample_Release(out_sample);
+            if (out_buf.pEvents)
+                IUnknown_Release((IUnknown *)out_buf.pEvents);
+            return hr;
+        }
+
+        if (out_buf.pSample) {
+            encoder_collect_output(codec, out_buf.pSample);
+            IMFSample_Release(out_buf.pSample);
+        }
+        if (out_buf.pEvents)
+            IUnknown_Release((IUnknown *)out_buf.pEvents);
+        out_sample = NULL;
+    }
+}
+
+static int encoder_create_mft(struct virgl_video_codec *codec,
+                              const struct virgl_video_create_codec_args *args)
+{
+    HRESULT hr;
+
+    if (!profile_encode_output_guid(args->profile, &codec->encoder_output_guid)) {
+        virgl_error("virgl_video_win32: profile %d has no MF encoder guid\n",
+                    (int)args->profile);
+        return -1;
+    }
+
+    hr = virgl_video_mf_acquire();
+    if (FAILED(hr))
+        return -1;
+
+    hr = find_hw_encoder_mft(&codec->encoder_output_guid, &codec->encoder_mft);
+    if (FAILED(hr) || !codec->encoder_mft) {
+        virgl_error("virgl_video_win32: no hardware MFT for profile %d "
+                    "(hr=0x%lx)\n", (int)args->profile, (unsigned long)hr);
+        virgl_video_mf_release();
+        return -1;
+    }
+
+    codec->encoder_width  = args->width;
+    codec->encoder_height = args->height;
+    codec->encoder_fps_num = 30;
+    codec->encoder_fps_den = 1;
+    codec->encoder_bitrate = 8 * 1000 * 1000;   /* 8 Mbps placeholder */
+
+    hr = encoder_set_types(codec);
+    if (FAILED(hr)) {
+        IMFTransform_Release(codec->encoder_mft);
+        codec->encoder_mft = NULL;
+        virgl_video_mf_release();
+        return -1;
+    }
+
+    virgl_info("virgl_video_win32: encoder MFT ready for profile %d "
+               "(%ux%u)\n", (int)args->profile, args->width, args->height);
+    return 0;
+}
+
+static void encoder_destroy_mft(struct virgl_video_codec *codec)
+{
+    if (codec->encoder_mft) {
+        /* Drain anything pending (best-effort). COMMAND_DRAIN tells the MFT
+         * "no more input"; we then must pull ProcessOutput until it returns
+         * MF_E_TRANSFORM_NEED_MORE_INPUT before NOTIFY_END_STREAMING — ffmpeg
+         * mfenc.c follows the same sequence. */
+        if (codec->encoder_stream_started) {
+            IMFTransform_ProcessMessage(codec->encoder_mft,
+                                        MFT_MESSAGE_COMMAND_DRAIN, 0);
+            encoder_drain_output(codec);
+            IMFTransform_ProcessMessage(codec->encoder_mft,
+                                        MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+            IMFTransform_ProcessMessage(codec->encoder_mft,
+                                        MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+        }
+        IMFTransform_Release(codec->encoder_mft);
+        codec->encoder_mft = NULL;
+        virgl_video_mf_release();
+    }
+    if (codec->encoder_coded_buf) {
+        free(codec->encoder_coded_buf);
+        codec->encoder_coded_buf = NULL;
+    }
+    codec->encoder_coded_size = 0;
+    codec->encoder_coded_capacity = 0;
+    codec->encoder_stream_started = false;
+}
+
+/* Extract bitrate / keyframe hints from the virgl encoder picture desc.
+ * h264_enc_picture_desc and h265_enc_picture_desc have parallel-ish layouts:
+ * both carry a rate_ctrl struct and a picture_type flag. */
+static void encoder_extract_hints(struct virgl_video_codec *codec,
+                                  const union virgl_picture_desc *desc,
+                                  uint32_t *out_bitrate,
+                                  uint32_t *out_fps_num,
+                                  uint32_t *out_fps_den,
+                                  bool *out_force_keyframe)
+{
+    uint32_t bitrate = codec->encoder_bitrate;
+    uint32_t num = codec->encoder_fps_num;
+    uint32_t den = codec->encoder_fps_den;
+    bool kf = false;
+
+    switch (codec->profile) {
+    case PIPE_VIDEO_PROFILE_MPEG4_AVC_BASELINE:
+    case PIPE_VIDEO_PROFILE_MPEG4_AVC_CONSTRAINED_BASELINE:
+    case PIPE_VIDEO_PROFILE_MPEG4_AVC_MAIN:
+    case PIPE_VIDEO_PROFILE_MPEG4_AVC_EXTENDED:
+    case PIPE_VIDEO_PROFILE_MPEG4_AVC_HIGH: {
+        const struct virgl_h264_enc_picture_desc *d = &desc->h264_enc;
+        if (d->rate_ctrl[0].target_bitrate)
+            bitrate = d->rate_ctrl[0].target_bitrate;
+        if (d->rate_ctrl[0].frame_rate_num && d->rate_ctrl[0].frame_rate_den) {
+            num = d->rate_ctrl[0].frame_rate_num;
+            den = d->rate_ctrl[0].frame_rate_den;
+        }
+        /* pipe_h2645_enc_picture_type: 0=P,1=B,2=I,3=IDR,4=SKIP (per Mesa) */
+        if (d->picture_type == 2 /* I */ || d->picture_type == 3 /* IDR */)
+            kf = true;
+        break;
+    }
+    case PIPE_VIDEO_PROFILE_HEVC_MAIN:
+    case PIPE_VIDEO_PROFILE_HEVC_MAIN_10: {
+        const struct virgl_h265_enc_picture_desc *d = &desc->h265_enc;
+        if (d->rc.target_bitrate)
+            bitrate = d->rc.target_bitrate;
+        if (d->rc.frame_rate_num && d->rc.frame_rate_den) {
+            num = d->rc.frame_rate_num;
+            den = d->rc.frame_rate_den;
+        }
+        if (d->picture_type == 2 || d->picture_type == 3)
+            kf = true;
+        break;
+    }
+    default:
+        break;
+    }
+
+    *out_bitrate = bitrate;
+    *out_fps_num = num;
+    *out_fps_den = den;
+    *out_force_keyframe = kf;
+}
+
+static int encode_one_frame(struct virgl_video_codec *codec,
+                            struct virgl_video_buffer *source,
+                            const union virgl_picture_desc *desc)
+{
+    HRESULT hr;
+    IMFSample *in_sample = NULL;
+    uint32_t bitrate, fps_num, fps_den;
+    bool kf = false;
+
+    if (!codec->encoder_mft)
+        return -ENOSYS;
+
+    encoder_extract_hints(codec, desc, &bitrate, &fps_num, &fps_den, &kf);
+
+    /* Re-negotiate output type if the rate/fps changed appreciably. The MFT
+     * will reject SetOutputType once streaming has begun on most drivers; we
+     * only update if still pre-stream, and cache for future runs otherwise. */
+    if (!codec->encoder_stream_started) {
+        bool changed = false;
+        if (bitrate != codec->encoder_bitrate) {
+            codec->encoder_bitrate = bitrate;
+            changed = true;
+        }
+        if (fps_num != codec->encoder_fps_num ||
+            fps_den != codec->encoder_fps_den) {
+            codec->encoder_fps_num = fps_num;
+            codec->encoder_fps_den = fps_den;
+            changed = true;
+        }
+        if (changed)
+            encoder_set_types(codec);
+        hr = encoder_start_streaming(codec);
+        if (FAILED(hr)) {
+            virgl_error("virgl_video_win32: encoder_start_streaming failed "
+                        "0x%lx\n", (unsigned long)hr);
+            return -1;
+        }
+    }
+
+    /*
+     * Ask vrend_video.c to copy the guest-side source NV12 bytes into our
+     * per-buffer CPU slab via virgl_video_buffer_cpu_writeback(). Without
+     * this, encoder_build_sample() would fall back to reading the backend's
+     * decode_tex (which is never written on the encode-only path) and the
+     * MFT would see a solid green/zeroed frame every time.
+     *
+     * The callback shape matches the libva side (virgl_video_dma_buf), but
+     * on Windows the fd fields are unused — vrend_video.c just needs the
+     * buffer pointer to find its GL-side planes.
+     */
+    if (g_vid.callbacks && g_vid.callbacks->encode_upload_picture) {
+        struct virgl_video_dma_buf upload_dmabuf;
+        memset(&upload_dmabuf, 0, sizeof(upload_dmabuf));
+        upload_dmabuf.buf = source;
+        upload_dmabuf.drm_format = drm_fourcc_nv12();
+        upload_dmabuf.width = source->width;
+        upload_dmabuf.height = source->height;
+        upload_dmabuf.flags = VIRGL_VIDEO_DMABUF_WRITE_ONLY;
+        upload_dmabuf.num_planes = 0;
+        g_vid.callbacks->encode_upload_picture(codec, &upload_dmabuf);
+    }
+
+    hr = encoder_build_sample(codec, source, kf, &in_sample);
+    if (FAILED(hr) || !in_sample) {
+        virgl_error("virgl_video_win32: encoder_build_sample failed 0x%lx\n",
+                    (unsigned long)hr);
+        return -1;
+    }
+
+    /* Drop any residue from a prior call. */
+    codec->encoder_coded_size = 0;
+
+    hr = IMFTransform_ProcessInput(codec->encoder_mft, 0, in_sample, 0);
+    IMFSample_Release(in_sample);
+    if (FAILED(hr)) {
+        virgl_error("virgl_video_win32: ProcessInput failed 0x%lx\n",
+                    (unsigned long)hr);
+        return -1;
+    }
+    codec->encoder_frame_count++;
+
+    hr = encoder_drain_output(codec);
+    if (FAILED(hr)) {
+        virgl_error("virgl_video_win32: encoder_drain_output failed 0x%lx\n",
+                    (unsigned long)hr);
+        return -1;
+    }
+
+    /* Hand the coded bytes back to vrend_video.c. The callback signature
+     * wants num_coded_bufs + coded_bufs + coded_sizes arrays; we publish a
+     * single buffer (the concatenated AU/NALU stream from this frame). */
+    if (g_vid.callbacks && g_vid.callbacks->encode_completed &&
+        codec->encoder_coded_size > 0) {
+        struct virgl_video_dma_buf dmabuf;
+        const void *bufs[1]    = { codec->encoder_coded_buf };
+        const unsigned sizes[1] = { codec->encoder_coded_size };
+
+        memset(&dmabuf, 0, sizeof(dmabuf));
+        dmabuf.buf = source;
+        dmabuf.drm_format = drm_fourcc_nv12();
+        dmabuf.width = source->width;
+        dmabuf.height = source->height;
+        dmabuf.flags = VIRGL_VIDEO_DMABUF_READ_ONLY;
+        dmabuf.num_planes = 0;   /* src buffer is opaque to the guest here */
+
+        g_vid.callbacks->encode_completed(codec, &dmabuf, NULL,
+                                          1, bufs, sizes);
+    }
+
+    return 0;
+}
+
 int virgl_video_encode_bitstream(struct virgl_video_codec *codec,
                                  struct virgl_video_buffer *source,
                                  const union virgl_picture_desc *desc)
 {
-    /* Encode is out of scope for the Windows backend. Return ENOSYS so Mesa
-     * marks the path as unsupported and falls back to CPU encoders. */
-    (void)codec;
-    (void)source;
-    (void)desc;
-    return -ENOSYS;
+    if (!g_vid.initialized || !codec || !source || !desc)
+        return -EINVAL;
+    if (codec->entrypoint != PIPE_VIDEO_ENTRYPOINT_ENCODE)
+        return -ENOSYS;
+
+    return encode_one_frame(codec, source, desc);
 }
 
 /*
@@ -2694,4 +3890,37 @@ unsigned virgl_video_buffer_cpu_readback(struct virgl_video_buffer *buffer,
     planes_out[3] = NULL; pitches_out[3] = 0;
 
     return 2;
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * virgl_video_buffer_cpu_writeback.
+ *
+ * Mirror of the readback helper, used by vrend_video.c on the encode path.
+ * The vrend layer reads the guest's GL textures back to CPU with
+ * glGetTexImage, rearranges the planes into NV12 (Y followed by interleaved
+ * UV), and hands us the packed blob here. We stash it on the buffer so
+ * encoder_build_sample() can copy it straight into the MF media buffer on
+ * the next ProcessInput.
+ * ---------------------------------------------------------------------------
+ */
+
+int virgl_video_buffer_cpu_writeback(struct virgl_video_buffer *buf,
+                                     const void *nv12_data,
+                                     uint32_t nv12_size)
+{
+    if (!buf || !nv12_data || nv12_size == 0)
+        return -1;
+
+    if (nv12_size > buf->encode_src_capacity) {
+        uint8_t *grown = realloc(buf->encode_src_nv12, nv12_size);
+        if (!grown)
+            return -1;
+        buf->encode_src_nv12     = grown;
+        buf->encode_src_capacity = nv12_size;
+    }
+
+    memcpy(buf->encode_src_nv12, nv12_data, nv12_size);
+    buf->encode_src_size = nv12_size;
+    return 0;
 }

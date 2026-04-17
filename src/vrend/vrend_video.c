@@ -455,6 +455,169 @@ static void vrend_video_decode_completed(
 }
 
 
+#if VREND_VIDEO_WIN32_CPU_UPLOAD
+/*
+ * Mirror of sync_cpu_planes_to_video_buffer() for the encode direction. The
+ * Windows backend cannot reach the guest's GL textures directly (no DMA-BUF,
+ * no WGL_NV_DX_interop2 yet), so we pull each plane back to CPU with
+ * glGetTexImage, interleave the chroma if the guest laid it out as I420, and
+ * hand the packed NV12 blob off to the backend via
+ * virgl_video_buffer_cpu_writeback(). The backend then has everything
+ * encoder_build_sample() needs on its next ProcessInput.
+ *
+ * Assumes 4:2:0 chroma subsampling (NV12 or I420/YV12). 4:2:2 / 4:4:4
+ * encoder surfaces are not expected here — Mesa's gallium video frontend
+ * currently hard-codes NV12 / I420 for virgl encode paths, and the MFT input
+ * type is already set to MFVideoFormat_NV12, so any other layout would
+ * mis-encode regardless. If the guest ever sends YV12 (V before U), the
+ * interleave loop below would swap chroma channels; detecting that would
+ * require inspecting the pipe_format on the guest-side resource, which isn't
+ * plumbed through to this layer.
+ */
+static int sync_video_buffer_to_cpu_slab(struct vrend_video_buffer *buf)
+{
+    struct vrend_resource *y_res;
+    unsigned y_w, y_h;
+    size_t y_size, uv_size, nv12_size;
+    uint8_t *nv12 = NULL;
+    uint8_t *y_scratch = NULL;
+    uint8_t *uv_scratch = NULL;
+    uint8_t *u_scratch = NULL;
+    uint8_t *v_scratch = NULL;
+    int ret = -1;
+
+    if (buf->num_planes == 0)
+        return -1;
+
+    /* Size the encode source off the Y-plane resource so we pick up the
+     * guest's true coded dimensions even if the backend rounded them. */
+    y_res = vrend_renderer_ctx_res_lookup(buf->ctx->ctx,
+                                          buf->planes[0].res_handle);
+    if (!y_res) {
+        virgl_error("%s: Y plane res %d not found\n",
+                    __func__, buf->planes[0].res_handle);
+        return -1;
+    }
+    y_w = y_res->base.width0;
+    y_h = y_res->base.height0;
+    if (!y_w || !y_h)
+        return -1;
+
+    y_size   = (size_t)y_w * y_h;
+    uv_size  = y_size / 2;            /* 4:2:0 NV12: UV is half-height, 2BPP */
+    nv12_size = y_size + uv_size;
+
+    nv12 = malloc(nv12_size);
+    if (!nv12)
+        return -1;
+
+    /* Drain any pre-existing GL errors so our post-read checks are valid. */
+    while (glGetError() != GL_NO_ERROR) { }
+
+    /* Plane 0: Y. Read directly into nv12[0..y_size). */
+    {
+        struct vrend_video_plane *plane = &buf->planes[0];
+        GLenum gl_target = y_res->target ? y_res->target : GL_TEXTURE_2D;
+        GLenum err;
+
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+        glBindTexture(gl_target, y_res->gl_id);
+        glGetTexImage(gl_target, 0, GL_RED, GL_UNSIGNED_BYTE, nv12);
+        err = glGetError();
+        if (err != GL_NO_ERROR) {
+            virgl_warn("%s: Y glGetTexImage error 0x%x (target=0x%x w=%u h=%u "
+                       "gl_id=%u)\n",
+                       __func__, err, gl_target, y_w, y_h, y_res->gl_id);
+            /* Keep going — partially read Y is still better than the
+             * decode_tex fallback producing solid green. */
+        }
+        (void)plane;
+    }
+
+    if (buf->num_planes >= 3) {
+        /* I420/YV12 guest layout: planes 1 and 2 are single-channel U and V,
+         * each half-resolution. Read into scratch, then interleave. */
+        struct vrend_resource *u_res = vrend_renderer_ctx_res_lookup(
+                buf->ctx->ctx, buf->planes[1].res_handle);
+        struct vrend_resource *v_res = vrend_renderer_ctx_res_lookup(
+                buf->ctx->ctx, buf->planes[2].res_handle);
+        unsigned uv_w = y_w / 2;
+        unsigned uv_h = y_h / 2;
+        size_t plane_size = (size_t)uv_w * uv_h;
+
+        u_scratch = malloc(plane_size);
+        v_scratch = malloc(plane_size);
+        if (!u_scratch || !v_scratch || !u_res || !v_res) {
+            virgl_error("%s: I420 chroma plane lookup/alloc failed\n",
+                        __func__);
+            goto out;
+        }
+
+        GLenum u_target = u_res->target ? u_res->target : GL_TEXTURE_2D;
+        GLenum v_target = v_res->target ? v_res->target : GL_TEXTURE_2D;
+
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+        glBindTexture(u_target, u_res->gl_id);
+        glGetTexImage(u_target, 0, GL_RED, GL_UNSIGNED_BYTE, u_scratch);
+        glBindTexture(v_target, v_res->gl_id);
+        glGetTexImage(v_target, 0, GL_RED, GL_UNSIGNED_BYTE, v_scratch);
+
+        /* Interleave U and V byte-by-byte into the back of the NV12 blob. */
+        {
+            uint8_t *uv_dst = nv12 + y_size;
+            size_t i;
+            for (i = 0; i < plane_size; i++) {
+                uv_dst[2 * i + 0] = u_scratch[i];
+                uv_dst[2 * i + 1] = v_scratch[i];
+            }
+        }
+    } else if (buf->num_planes == 2) {
+        /* NV12 guest layout: plane 1 is already interleaved UV at half-res
+         * with 2 bytes per pixel. GL_RG / R8G8 reads straight into the UV
+         * section of the NV12 blob. */
+        struct vrend_resource *uv_res = vrend_renderer_ctx_res_lookup(
+                buf->ctx->ctx, buf->planes[1].res_handle);
+        if (!uv_res) {
+            virgl_error("%s: UV plane res %d not found\n",
+                        __func__, buf->planes[1].res_handle);
+            goto out;
+        }
+        GLenum uv_target = uv_res->target ? uv_res->target : GL_TEXTURE_2D;
+
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+        glBindTexture(uv_target, uv_res->gl_id);
+        glGetTexImage(uv_target, 0, GL_RG, GL_UNSIGNED_BYTE,
+                      nv12 + y_size);
+    } else {
+        /* Single-plane guest buffer — unexpected for NV12/I420 encode sources.
+         * Leave the UV section of nv12 zeroed (black chroma) so at least the
+         * luma makes it through. */
+        memset(nv12 + y_size, 0x80, uv_size);
+    }
+
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    if (virgl_video_buffer_cpu_writeback(buf->buffer, nv12,
+                                         (uint32_t)nv12_size) != 0) {
+        virgl_error("%s: backend writeback failed\n", __func__);
+        goto out;
+    }
+
+    ret = 0;
+
+out:
+    free(y_scratch);
+    free(uv_scratch);
+    free(u_scratch);
+    free(v_scratch);
+    free(nv12);
+    return ret;
+}
+#endif /* VREND_VIDEO_WIN32_CPU_UPLOAD */
+
 static void vrend_video_enocde_upload_picture(
                                 struct virgl_video_codec *codec,
                                 const struct virgl_video_dma_buf *dmabuf)
@@ -464,11 +627,8 @@ static void vrend_video_enocde_upload_picture(
     (void)codec;
 
 #if VREND_VIDEO_WIN32_CPU_UPLOAD
-    /* Encode is unimplemented on Windows — the backend returns -ENOSYS from
-     * virgl_video_encode_bitstream() and this callback never fires. Keeping
-     * the stub here avoids an unused-symbol warning. */
-    (void)buf;
     (void)dmabuf;
+    sync_video_buffer_to_cpu_slab(buf);
 #else
     sync_video_buffer_to_dmabuf(buf, dmabuf);
 #endif

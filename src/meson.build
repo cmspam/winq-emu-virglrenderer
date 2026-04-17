@@ -248,6 +248,14 @@ if with_video
       cc.find_library('dxgi'),
       cc.find_library('dxguid'),
       cc.find_library('uuid'),
+      # Media Foundation — required for the hardware MFT-backed H.264/HEVC
+      # encode path in virgl_video_win32.c.
+      cc.find_library('mfplat'),
+      cc.find_library('mfuuid'),
+      cc.find_library('mf'),
+      cc.find_library('mfreadwrite'),
+      cc.find_library('ole32'),
+      cc.find_library('strmiids'),
     ]
   else
     virgl_depends += [libva_dep, libvadrm_dep]
