@@ -901,6 +901,21 @@ void *virgl_video_buffer_opaque_data(struct virgl_video_buffer *buffer)
     return buffer ? buffer->opaque : NULL;
 }
 
+/*
+ * CPU readback path is only used by the Windows D3D11 backend. Under libva we
+ * always export a dmabuf, so return 0 (no CPU planes available) to let
+ * vrend_video.c know it should follow the dmabuf path.
+ */
+unsigned virgl_video_buffer_cpu_readback(struct virgl_video_buffer *buffer,
+                                         void *planes_out[4],
+                                         uint32_t pitches_out[4])
+{
+    (void)buffer;
+    (void)planes_out;
+    (void)pitches_out;
+    return 0;
+}
+
 int virgl_video_begin_frame(struct virgl_video_codec *codec,
                             struct virgl_video_buffer *target)
 {

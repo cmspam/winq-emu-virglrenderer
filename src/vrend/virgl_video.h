@@ -145,6 +145,27 @@ void virgl_video_destroy_buffer(struct virgl_video_buffer *buffer);
 uint32_t virgl_video_buffer_id(const struct virgl_video_buffer *buffer);
 void *virgl_video_buffer_opaque_data(struct virgl_video_buffer *buffer);
 
+/*
+ * Windows D3D11-backed readback helper. On backends that cannot export a
+ * dmabuf (like the Windows D3D11 Video Decoder) the decode_completed callback
+ * delivers a virgl_video_dma_buf with plane fds set to -1. The caller is
+ * expected to obtain the actual CPU-visible pixel data through this helper.
+ *
+ * On success:
+ *  - planes_out[i]   receives a pointer to plane i's pixel data (valid until
+ *                    the next begin_frame/end_frame/decode_bitstream call on
+ *                    this buffer).
+ *  - pitches_out[i]  receives the row stride in bytes for plane i.
+ *  - returns the number of valid planes (typically 2 for NV12).
+ *
+ * Returns 0 when the underlying backend does not support CPU readback (e.g.,
+ * the libva implementation on Linux). That lets a single vrend_video.c file
+ * be written to gracefully fall back to the dmabuf path.
+ */
+unsigned virgl_video_buffer_cpu_readback(struct virgl_video_buffer *buffer,
+                                         void *planes_out[4],
+                                         uint32_t pitches_out[4]);
+
 int virgl_video_begin_frame(struct virgl_video_codec *codec,
                             struct virgl_video_buffer *target);
 int virgl_video_decode_bitstream(struct virgl_video_codec *codec,
