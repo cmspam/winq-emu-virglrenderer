@@ -121,16 +121,17 @@ struct virgl_video_buffer {
     ID3D11Texture2D *decode_tex;
     ID3D11VideoDecoderOutputView *decode_view;
 
-    /* A matching CPU-readable NV12 staging texture. We CopyResource() from the
-     * decode texture into this one after DecoderEndFrame() and Map() it to
-     * hand CPU plane pointers up to vrend_video.c. */
+    /* Single NV12 staging texture we Map to read Y+UV data back. Y lives
+     * at mapped.pData, UV at an offset the driver chooses (queried via
+     * DepthPitch on drivers that honour the planar-subresource layout). */
     ID3D11Texture2D *staging_tex;
 
     /* Latched CPU pointers from the most recent Map(). They are only valid
      * between end_frame() and the next decode call; vrend_video.c copies out
      * the bytes in the decode_completed callback before we unmap. */
     bool staging_mapped;
-    D3D11_MAPPED_SUBRESOURCE mapped;
+    D3D11_MAPPED_SUBRESOURCE mapped_y;
+    D3D11_MAPPED_SUBRESOURCE mapped_uv;
 
     /* Used by the decode_completed callback. We populate this once per decode
      * and pass it through virgl_video_callbacks. */
@@ -234,8 +235,20 @@ static bool map_profile_to_dxva_guid(enum pipe_video_profile profile,
 
 static DXGI_FORMAT dxgi_format_from_pipe(enum pipe_format f)
 {
+    /*
+     * D3D11 video decode output is almost always NV12 regardless of what
+     * gallium format the guest requested for the surface. Map the common
+     * 4:2:0 pipe formats (NV12, I420/IYUV, YV12, NV21) to DXGI_FORMAT_NV12
+     * and let the cpu-readback path repack into the guest's plane layout.
+     *
+     * The libva-based path on Linux does the same thing: it accepts any
+     * pipe_format and just allocates VA_RT_FORMAT_YUV420 surfaces.
+     */
     switch (f) {
     case PIPE_FORMAT_NV12:
+    case PIPE_FORMAT_NV21:
+    case PIPE_FORMAT_IYUV:   /* aka PIPE_FORMAT_Y8_U8_V8_420_UNORM / I420 */
+    case PIPE_FORMAT_YV12:
         return DXGI_FORMAT_NV12;
     case PIPE_FORMAT_P010:
         return DXGI_FORMAT_P010;
@@ -605,7 +618,8 @@ static void unmap_staging_if_needed(struct virgl_video_buffer *buf)
         ID3D11DeviceContext_Unmap(g_vid.context,
                                   (ID3D11Resource *)buf->staging_tex, 0);
         buf->staging_mapped = false;
-        memset(&buf->mapped, 0, sizeof(buf->mapped));
+        memset(&buf->mapped_y,  0, sizeof(buf->mapped_y));
+        memset(&buf->mapped_uv, 0, sizeof(buf->mapped_uv));
     }
 }
 
@@ -668,7 +682,7 @@ struct virgl_video_buffer *virgl_video_create_buffer(
         goto fail;
     }
 
-    /* Staging NV12 texture used for CPU readback post-decode. */
+    /* Single NV12 staging texture matching the decoder output layout. */
     memset(&tex, 0, sizeof(tex));
     tex.Width = buf->width;
     tex.Height = buf->height;
@@ -680,11 +694,10 @@ struct virgl_video_buffer *virgl_video_create_buffer(
     tex.BindFlags = 0;
     tex.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     tex.MiscFlags = 0;
-
     hr = ID3D11Device_CreateTexture2D(g_vid.device, &tex, NULL,
                                       &buf->staging_tex);
     if (FAILED(hr)) {
-        virgl_error("virgl_video_win32: CreateTexture2D(staging) "
+        virgl_error("virgl_video_win32: CreateTexture2D(staging NV12) "
                     "%ux%u failed: 0x%lx\n",
                     buf->width, buf->height, (unsigned long)hr);
         goto fail;
@@ -1295,34 +1308,57 @@ int virgl_video_end_frame(struct virgl_video_codec *codec,
         return -1;
     }
 
-    /* CopyResource from the decoder output (GPU-only) to the staging texture
-     * we can Map. CopyResource is a queued operation; Map() below will block
-     * until it completes. */
+    unmap_staging_if_needed(target);
+
     ID3D11DeviceContext_CopyResource(g_vid.context,
                                      (ID3D11Resource *)target->staging_tex,
                                      (ID3D11Resource *)target->decode_tex);
 
-    unmap_staging_if_needed(target);
-    memset(&target->mapped, 0, sizeof(target->mapped));
     hr = ID3D11DeviceContext_Map(g_vid.context,
                                  (ID3D11Resource *)target->staging_tex,
-                                 0, D3D11_MAP_READ, 0, &target->mapped);
+                                 0, D3D11_MAP_READ, 0, &target->mapped_y);
     if (FAILED(hr)) {
         virgl_error("virgl_video_win32: staging Map failed: 0x%lx\n",
                     (unsigned long)hr);
         return -1;
     }
+    /*
+     * Single-subresource NV12 staging: Y plane lives at pData, UV plane
+     * at pData + height*RowPitch (the documented DXGI NV12 layout).
+     * `mapped_uv` shares the underlying mapping; we only use its pData
+     * and RowPitch fields as a convenience carrier for the UV pointer.
+     */
+    target->mapped_uv = target->mapped_y;
+    target->mapped_uv.pData =
+        (uint8_t *)target->mapped_y.pData +
+        (size_t)target->mapped_y.RowPitch * target->height;
     target->staging_mapped = true;
+
+    /* One-shot diagnostic: show what's actually landing in the staging
+     * textures. If Y and UV are both zeroed, CopySubresourceRegion is
+     * silently failing (likely a format-compatibility rejection) and the
+     * visible output will be YUV (Y=0, UV=0) — a solid green screen. */
+    {
+        static bool logged = false;
+        if (!logged) {
+            const uint8_t *yp = target->mapped_y.pData;
+            const uint8_t *uvp = target->mapped_uv.pData;
+            virgl_warn("vid-diag end_frame: Y pitch=%u first=%02x %02x %02x %02x %02x %02x %02x %02x; "
+                       "UV pitch=%u first=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+                       target->mapped_y.RowPitch,
+                       yp[0], yp[1], yp[2], yp[3], yp[4], yp[5], yp[6], yp[7],
+                       target->mapped_uv.RowPitch,
+                       uvp[0], uvp[1], uvp[2], uvp[3], uvp[4], uvp[5], uvp[6], uvp[7]);
+            logged = true;
+        }
+    }
 
     /* Build a dma-buf-shaped descriptor with fd=-1. vrend_video.c uses
      * virgl_video_buffer_cpu_readback() instead of the fd when it sees the
      * sentinel. */
     fill_dma_buf_metadata(target);
-    target->dmabuf.planes[0].pitch = target->mapped.RowPitch;
-    /* The UV plane on D3D11 NV12 uses the same row pitch (bytes per row of
-     * the interleaved UV data) as the Y plane; this matches what Windows
-     * drivers document. */
-    target->dmabuf.planes[1].pitch = target->mapped.RowPitch;
+    target->dmabuf.planes[0].pitch = target->mapped_y.RowPitch;
+    target->dmabuf.planes[1].pitch = target->mapped_uv.RowPitch;
 
     if (g_vid.callbacks && g_vid.callbacks->decode_completed)
         g_vid.callbacks->decode_completed(codec, &target->dmabuf);
@@ -1350,27 +1386,20 @@ unsigned virgl_video_buffer_cpu_readback(struct virgl_video_buffer *buffer,
                                          void *planes_out[4],
                                          uint32_t pitches_out[4])
 {
-    uint8_t *base;
-    uint32_t row_pitch;
-
     if (!buffer || !planes_out || !pitches_out)
         return 0;
-    if (!buffer->staging_mapped || !buffer->mapped.pData)
+    if (!buffer->staging_mapped ||
+        !buffer->mapped_y.pData || !buffer->mapped_uv.pData)
         return 0;
 
-    base = (uint8_t *)buffer->mapped.pData;
-    row_pitch = buffer->mapped.RowPitch;
-
-    /* NV12 layout: Y plane first (height rows), UV interleaved plane
-     * immediately after at offset = height * RowPitch. */
-    planes_out[0] = base;
-    pitches_out[0] = row_pitch;
-    planes_out[1] = base + (size_t)row_pitch * buffer->height;
-    pitches_out[1] = row_pitch;
-    planes_out[2] = NULL;
-    pitches_out[2] = 0;
-    planes_out[3] = NULL;
-    pitches_out[3] = 0;
+    /* Y and UV come from independent Map() calls — their pitches and base
+     * pointers are not required to be related. */
+    planes_out[0]  = buffer->mapped_y.pData;
+    pitches_out[0] = buffer->mapped_y.RowPitch;
+    planes_out[1]  = buffer->mapped_uv.pData;
+    pitches_out[1] = buffer->mapped_uv.RowPitch;
+    planes_out[2] = NULL; pitches_out[2] = 0;
+    planes_out[3] = NULL; pitches_out[3] = 0;
 
     return 2;
 }

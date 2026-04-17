@@ -315,11 +315,70 @@ static int sync_cpu_planes_to_video_buffer(struct vrend_video_buffer *buf,
         return -1;
     }
 
-    for (i = 0; i < n && i < buf->num_planes; i++) {
+    /*
+     * The D3D11 backend always delivers NV12 (2 planes: Y + interleaved UV).
+     * The guest may have allocated the surface as NV12 (2 GL planes: R8 Y +
+     * RG8 UV) or as I420/YV12 (3 GL planes: R8 Y + R8 U + R8 V). Split the
+     * UV plane if the guest expects three planes. Assumes IYUV/I420 order
+     * (Y, U, V) which is the common default in Mesa's VA-API frontend.
+     */
+    uint8_t *u_scratch = NULL, *v_scratch = NULL;
+    bool need_split = (buf->num_planes == 3 && n == 2);
+    if (need_split) {
+        unsigned uv_w = dmabuf->width / 2;
+        unsigned uv_h = dmabuf->height / 2;
+        u_scratch = calloc((size_t)uv_w * uv_h, 1);
+        v_scratch = calloc((size_t)uv_w * uv_h, 1);
+        if (!u_scratch || !v_scratch) {
+            free(u_scratch); free(v_scratch);
+            virgl_error("%s: UV split scratch alloc failed\n", __func__);
+            return -1;
+        }
+        const uint8_t *uv_src = (const uint8_t *)planes[1];
+        uint32_t src_pitch = pitches[1];
+        for (unsigned y = 0; y < uv_h; y++) {
+            const uint8_t *row = uv_src + (size_t)y * src_pitch;
+            for (unsigned x = 0; x < uv_w; x++) {
+                u_scratch[y * uv_w + x] = row[2 * x];
+                v_scratch[y * uv_w + x] = row[2 * x + 1];
+            }
+        }
+    }
+
+    /* Drain any prior GL errors so our post-upload check is meaningful. */
+    while (glGetError() != GL_NO_ERROR) { }
+
+    /* One-shot diagnostic: dump dimensions on the first decode so we can see
+     * what the guest's actual plane layout looks like. */
+    static bool logged_once = false;
+    if (!logged_once) {
+        virgl_warn("vid-diag: num_planes=%u dmabuf %ux%u src_pitches=%u,%u "
+                   "need_split=%d\n",
+                   buf->num_planes, dmabuf->width, dmabuf->height,
+                   pitches[0], pitches[1], need_split ? 1 : 0);
+        for (unsigned p = 0; p < buf->num_planes; p++) {
+            struct vrend_resource *r =
+                vrend_renderer_ctx_res_lookup(buf->ctx->ctx,
+                                              buf->planes[p].res_handle);
+            if (r) {
+                virgl_warn("vid-diag:   plane %u res=%u w0=%u h0=%u "
+                           "target=0x%x gl_id=%u\n",
+                           p, buf->planes[p].res_handle,
+                           r->base.width0, r->base.height0,
+                           r->target, r->gl_id);
+            }
+        }
+        logged_once = true;
+    }
+
+    for (i = 0; i < buf->num_planes; i++) {
         struct vrend_video_plane *plane = &buf->planes[i];
         struct vrend_resource *res;
-        GLenum ext_format;
-        unsigned width, height, row_bytes_per_px;
+        GLenum ext_format, gl_target;
+        GLsizei width, height;
+        const void *src;
+        GLint row_stride_elems;     /* UNPACK_ROW_LENGTH value */
+        GLenum err;
 
         res = vrend_renderer_ctx_res_lookup(buf->ctx->ctx, plane->res_handle);
         if (!res) {
@@ -327,35 +386,54 @@ static int sync_cpu_planes_to_video_buffer(struct vrend_video_buffer *buf,
             continue;
         }
 
+        gl_target = res->target ? res->target : GL_TEXTURE_2D;
+        width  = (GLsizei)res->base.width0;
+        height = (GLsizei)res->base.height0;
+
         if (i == 0) {
-            /* Y plane: full resolution, 1 byte per pixel. */
+            /* Y plane: R8 full-res, source is NV12's Y plane. */
             ext_format = GL_RED;
-            width = dmabuf->width;
-            height = dmabuf->height;
-            row_bytes_per_px = 1;
-        } else {
-            /* UV plane: half resolution each axis, 2 bytes per pixel. */
+            src = planes[0];
+            row_stride_elems = (GLint)pitches[0];   /* 1 byte/element */
+        } else if (!need_split) {
+            /* 2-plane NV12 guest buffer: source is the NV12 UV plane. */
             ext_format = GL_RG;
-            width = dmabuf->width / 2;
-            height = dmabuf->height / 2;
-            row_bytes_per_px = 2;
+            src = planes[1];
+            row_stride_elems = (GLint)(pitches[1] / 2);  /* 2 bytes/element */
+        } else if (i == 1) {
+            /* 3-plane I420 guest buffer: U plane from our split. */
+            ext_format = GL_RED;
+            src = u_scratch;
+            row_stride_elems = (GLint)(dmabuf->width / 2);
+        } else {
+            /* 3-plane I420 guest buffer: V plane from our split. */
+            ext_format = GL_RED;
+            src = v_scratch;
+            row_stride_elems = (GLint)(dmabuf->width / 2);
         }
 
-        /* Account for any gap between bytes-per-row in the source and the
-         * destination upload width. pitches[i] is bytes-per-row of source. */
-        glPixelStorei(GL_UNPACK_ROW_LENGTH,
-                      (GLint)(pitches[i] / row_bytes_per_px));
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, row_stride_elems);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 
-        glBindTexture(GL_TEXTURE_2D, res->gl_id);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
-                        (GLsizei)width, (GLsizei)height,
-                        ext_format, GL_UNSIGNED_BYTE, planes[i]);
+        glBindTexture(gl_target, res->gl_id);
+        glTexSubImage2D(gl_target, 0, 0, 0, width, height,
+                        ext_format, GL_UNSIGNED_BYTE, src);
+
+        err = glGetError();
+        if (err != GL_NO_ERROR) {
+            virgl_warn("%s: plane %u glTexSubImage2D error 0x%x "
+                       "(target=0x%x w=%d h=%d fmt=0x%x stride=%d)\n",
+                       __func__, i, err, gl_target, width, height,
+                       ext_format, row_stride_elems);
+        }
 
         glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
     }
 
     glBindTexture(GL_TEXTURE_2D, 0);
+
+    free(u_scratch);
+    free(v_scratch);
     return 0;
 }
 #endif /* VREND_VIDEO_WIN32_CPU_UPLOAD */
