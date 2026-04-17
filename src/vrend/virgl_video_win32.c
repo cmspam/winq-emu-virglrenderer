@@ -67,6 +67,7 @@
 #include <windows.h>
 #include <initguid.h>
 #include <d3d11.h>
+#include <d3d11_4.h>           /* ID3D11Multithread */
 #include <d3d11sdklayers.h>
 #include <dxgi.h>
 #include <dxgi1_2.h>
@@ -329,6 +330,28 @@ struct virgl_video_codec {
  * ---------------------------------------------------------------------------
  */
 
+/* Cached decision for one-shot diagnostic prints. Enabled when
+ * VIRGL_VIDEO_DIAG=1 in the environment, so production runs (the
+ * common case) incur zero per-frame logging cost. AUDIT F31/F32. */
+static bool vid_diag_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("VIRGL_VIDEO_DIAG");
+        cached = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+/* Global live-codec registry. Populated by virgl_video_create_codec,
+ * drained by virgl_video_destroy_codec. On buffer destroy we walk
+ * this list and invalidate any codec refs[] entry still pointing at
+ * the buffer — without this, a buffer destroyed while a non-current
+ * codec still has a cached pointer in refs[] produces a use-after-
+ * free on the next ref lookup (AUDIT F5). */
+#define VIRGL_VIDEO_WIN32_MAX_LIVE_CODECS 32
+static struct virgl_video_codec *g_codecs[VIRGL_VIDEO_WIN32_MAX_LIVE_CODECS];
+
 static struct {
     bool initialized;
 
@@ -394,37 +417,6 @@ static bool is_supported_h264_profile(enum pipe_video_profile profile)
     default:
         return false;
     }
-}
-
-/* True for the HEVC profiles we map to D3D11 decoder GUIDs. Main goes to
- * HEVC_VLD_MAIN (NV12); Main10 goes to HEVC_VLD_MAIN10 (P010). Other Main12,
- * Main444, etc. profiles exist in pipe but we don't advertise them. */
-static bool is_supported_hevc_profile(enum pipe_video_profile profile)
-{
-    switch (profile) {
-    case PIPE_VIDEO_PROFILE_HEVC_MAIN:
-    case PIPE_VIDEO_PROFILE_HEVC_MAIN_STILL:
-    case PIPE_VIDEO_PROFILE_HEVC_MAIN_10:
-        return true;
-    default:
-        return false;
-    }
-}
-
-static bool is_supported_vp9_profile(enum pipe_video_profile profile)
-{
-    switch (profile) {
-    case PIPE_VIDEO_PROFILE_VP9_PROFILE0:
-    case PIPE_VIDEO_PROFILE_VP9_PROFILE2:
-        return true;
-    default:
-        return false;
-    }
-}
-
-static bool is_supported_av1_profile(enum pipe_video_profile profile)
-{
-    return profile == PIPE_VIDEO_PROFILE_AV1_MAIN;
 }
 
 static bool map_profile_to_dxva_guid(enum pipe_video_profile profile,
@@ -603,6 +595,21 @@ int virgl_video_init(int drm_fd,
             virgl_warn("virgl_video_win32: debug device created but "
                        "QI(ID3D11InfoQueue) failed: 0x%lx\n",
                        (unsigned long)iq_hr);
+        }
+    }
+
+    /* Enable driver-managed multithread protection on the immediate
+     * context. Per MSDN: ID3D11DeviceContext methods are not thread-safe
+     * without this. virglrenderer dispatch is single-threaded per-context
+     * in the main decode path, but video `decode_completed` callbacks
+     * and future parallel submission paths can race; SetMultithreadProtected
+     * makes the driver serialize for us with minimal overhead. */
+    {
+        ID3D11Multithread *mt = NULL;
+        if (SUCCEEDED(ID3D11DeviceContext_QueryInterface(
+                g_vid.context, &IID_ID3D11Multithread, (void **)&mt)) && mt) {
+            ID3D11Multithread_SetMultithreadProtected(mt, TRUE);
+            ID3D11Multithread_Release(mt);
         }
     }
 
@@ -1228,6 +1235,15 @@ struct virgl_video_codec *virgl_video_create_codec(
         codec->lru_tick = 0;
     }
 
+    /* Register in the global live-codec list so buffer-destroy can walk
+     * all codecs and invalidate stale refs[] entries (AUDIT F5). */
+    for (unsigned k = 0; k < VIRGL_VIDEO_WIN32_MAX_LIVE_CODECS; k++) {
+        if (g_codecs[k] == NULL) {
+            g_codecs[k] = codec;
+            break;
+        }
+    }
+
     return codec;
 
 fail:
@@ -1241,6 +1257,14 @@ void virgl_video_destroy_codec(struct virgl_video_codec *codec)
 
     if (!codec)
         return;
+
+    /* Unregister from the live-codec list. */
+    for (unsigned k = 0; k < VIRGL_VIDEO_WIN32_MAX_LIVE_CODECS; k++) {
+        if (g_codecs[k] == codec) {
+            g_codecs[k] = NULL;
+            break;
+        }
+    }
 
     /* Detach each slot from its occupant buffer so subsequent codecs can
      * reassign the buffer without a stale slot index hanging around. */
@@ -1339,7 +1363,13 @@ struct virgl_video_buffer *virgl_video_create_buffer(
     buf->height = (args->height + 1) & ~1u;
     buf->interlaced = args->interlaced;
     buf->opaque = args->opaque;
-    buf->id = (uint32_t)(uintptr_t)buf;   /* stable while buf lives */
+    /* Monotonic counter. Using the buffer pointer address was unsafe:
+     * calloc can return the same address after free(), so a newly-
+     * created buffer could reuse the id of a destroyed one still
+     * cached in some codec's refs[] table. A 32-bit counter gives
+     * ~4 billion unique ids — plenty for realistic session lengths. */
+    static uint32_t g_next_buffer_id = 1;
+    buf->id = __atomic_fetch_add(&g_next_buffer_id, 1, __ATOMIC_RELAXED);
     buf->current_slot_in_codec = -1;
 
     /* Single NV12 staging texture matching the decoder output layout. */
@@ -1378,27 +1408,37 @@ void virgl_video_destroy_buffer(struct virgl_video_buffer *buffer)
     unmap_staging_if_needed(buffer);
 
     /* If this buffer currently occupies a slot in a codec's DPB, punch out
-     * the codec's back-reference so the slot is freed (and doesn't point at
-     * released memory on the next LRU scan). The codec's refs[] table also
-     * caches buffer pointers; clear matching entries there too. */
+     * the codec's back-reference so the slot is freed on the next LRU scan.
+     * Then walk ALL live codecs (not just the current holder) and clear
+     * any refs[] entry still pointing at this buffer — a buffer may have
+     * been cached in a different codec's refs[] in a previous decode
+     * session, and that pointer would dangle after we free() the buffer
+     * below (AUDIT F5). */
     if (buffer->current_codec_holder) {
         struct virgl_video_codec *c = buffer->current_codec_holder;
-        unsigned i;
         if (buffer->current_slot_in_codec >= 0 &&
             buffer->current_slot_in_codec < VIRGL_VIDEO_WIN32_DPB_SIZE &&
             c->slot_buffer[buffer->current_slot_in_codec] == buffer) {
             c->slot_buffer[buffer->current_slot_in_codec] = NULL;
         }
-        for (i = 0; i < VIRGL_VIDEO_WIN32_MAX_REFS; i++) {
-            if (c->refs[i].buf == buffer) {
-                c->refs[i].buf = NULL;
-                /* buffer_id stays — the id-to-nonexistent-buf mapping will
-                 * be skipped by the "buf must be live" guard in picparam
-                 * fills. */
-            }
-        }
         buffer->current_codec_holder = NULL;
         buffer->current_slot_in_codec = -1;
+    }
+    for (unsigned k = 0; k < VIRGL_VIDEO_WIN32_MAX_LIVE_CODECS; k++) {
+        struct virgl_video_codec *c = g_codecs[k];
+        if (!c)
+            continue;
+        for (unsigned i = 0; i < VIRGL_VIDEO_WIN32_MAX_REFS; i++) {
+            if (c->refs[i].buf == buffer) {
+                c->refs[i].buf = NULL;
+                c->refs[i].buffer_id = 0;  /* forget the id, freeing the slot */
+            }
+        }
+        for (unsigned s = 0; s < VIRGL_VIDEO_WIN32_DPB_SIZE; s++) {
+            if (c->slot_buffer[s] == buffer) {
+                c->slot_buffer[s] = NULL;
+            }
+        }
     }
 
     if (buffer->staging_tex) {
@@ -1781,9 +1821,8 @@ static void fill_dxva_picparams_h264(struct virgl_video_codec *codec,
     }
 
     /* One-shot diagnostic: first few decodes, dump refs to confirm the DPB
-     * array slices map correctly. Gate on a static counter — logging every
-     * frame drowns the log with tens of KB. */
-    {
+     * array slices map correctly. Gated on VIRGL_VIDEO_DIAG=1. */
+    if (vid_diag_enabled()) {
         static unsigned logged = 0;
         if (logged < 6) {
             char rl[256] = {0};
@@ -1803,7 +1842,7 @@ static void fill_dxva_picparams_h264(struct virgl_video_codec *codec,
                 pp->UsedForReferenceFlags, rl);
             logged++;
         }
-    }
+    } /* vid_diag_enabled */
 
     /* Quantization / deblocking parameters. */
     pp->pic_init_qp_minus26 = desc->pps.pic_init_qp_minus26;
@@ -4262,7 +4301,9 @@ static HRESULT encoder_collect_output(struct virgl_video_codec *codec,
     DWORD i;
     DWORD buffer_count = 0;
 
-    IMFSample_GetBufferCount(sample, &buffer_count);
+    hr = IMFSample_GetBufferCount(sample, &buffer_count);
+    if (FAILED(hr))
+        return hr;
     for (i = 0; i < buffer_count; i++) {
         IMFMediaBuffer *mb = NULL;
         BYTE *data = NULL;
@@ -4310,6 +4351,11 @@ static HRESULT encoder_drain_output(struct virgl_video_codec *codec)
     if (FAILED(hr))
         return hr;
 
+    /* Cap STREAM_CHANGE retries. An MFT that keeps re-emitting STREAM_CHANGE
+     * without accepting our renegotiated output type would otherwise spin
+     * forever (AUDIT F9). Three retries is enough for legitimate mid-stream
+     * resolution/format changes; beyond that we bail out with an error. */
+    unsigned stream_change_retries = 0;
     for (;;) {
         MFT_OUTPUT_DATA_BUFFER out_buf;
         DWORD status = 0;
@@ -4347,12 +4393,20 @@ static HRESULT encoder_drain_output(struct virgl_video_codec *codec)
             return S_OK;
         }
         if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
-            /* Renegotiate output type silently; re-set and retry. */
+            /* Renegotiate output type silently; re-set and retry. Cap
+             * retries to avoid spinning on a non-cooperative MFT. */
             if (provided_sample && out_sample)
                 IMFSample_Release(out_sample);
             if (out_buf.pEvents)
                 IUnknown_Release((IUnknown *)out_buf.pEvents);
-            encoder_set_types(codec);
+            if (++stream_change_retries > 3) {
+                virgl_error("virgl_video_win32: MFT stuck in "
+                            "STREAM_CHANGE loop (>3 retries); giving up\n");
+                return MF_E_TRANSFORM_STREAM_CHANGE;
+            }
+            HRESULT set_hr = encoder_set_types(codec);
+            if (FAILED(set_hr))
+                return set_hr;
             continue;
         }
         if (FAILED(hr)) {
@@ -4722,7 +4776,7 @@ int virgl_video_end_frame(struct virgl_video_codec *codec,
      * textures. If Y and UV are both zeroed, CopySubresourceRegion is
      * silently failing (likely a format-compatibility rejection) and the
      * visible output will be YUV (Y=0, UV=0) — a solid green screen. */
-    {
+    if (vid_diag_enabled()) {
         static bool logged = false;
         if (!logged) {
             const uint8_t *yp = target->mapped_y.pData;
