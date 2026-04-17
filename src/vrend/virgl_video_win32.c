@@ -87,12 +87,30 @@
 #endif
 
 /* The DXVA spec caps slice controls per SubmitDecoderBuffers call; 256 is
- * well above what Mesa's H.264 frontend will hand us. */
+ * well above what Mesa's H.264 frontend will hand us, and also matches the
+ * AV1 per-frame tile limit (virgl_av1_picture_desc::slice_parameter arrays
+ * are sized [256]). */
 #define VIRGL_VIDEO_WIN32_MAX_SLICES 256
 
 /* Upper bound on how many reference frames we will track per codec. The DXVA
- * H.264 RefFrameList is 16 long, which is also the max in the H.264 spec. */
+ * H.264 RefFrameList is 16 long, which is also the max in the H.264 spec.
+ * HEVC uses 15 entries, VP9 has 8 ref_frame_map slots, AV1 has 8 slots with
+ * 7 active frame_refs — 16 is sufficient for all four codecs. */
 #define VIRGL_VIDEO_WIN32_MAX_REFS 16
+
+/* AV1 VLD Profile 0 GUID. The D3D11 public headers bundled with MinGW don't
+ * always expose D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0, so we define the
+ * value here. dxva.h does provide DXVA_ModeAV1_VLD_Profile0 with the same
+ * byte-for-byte GUID {b8be4ccb-cf53-46ba-8d59-d6b8a6da5d2a}. */
+#ifndef D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0
+DEFINE_GUID(D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0_LOCAL,
+    0xb8be4ccb, 0xcf53, 0x46ba, 0x8d, 0x59, 0xd6, 0xb8, 0xa6, 0xda, 0x5d, 0x2a);
+#define VIRGL_VIDEO_WIN32_AV1_PROFILE0_GUID \
+        D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0_LOCAL
+#else
+#define VIRGL_VIDEO_WIN32_AV1_PROFILE0_GUID \
+        D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0
+#endif
 
 /*
  * ---------------------------------------------------------------------------
@@ -213,12 +231,43 @@ static bool is_supported_h264_profile(enum pipe_video_profile profile)
     case PIPE_VIDEO_PROFILE_MPEG4_AVC_HIGH10:
     case PIPE_VIDEO_PROFILE_MPEG4_AVC_HIGH422:
     case PIPE_VIDEO_PROFILE_MPEG4_AVC_HIGH444:
-        /* TODO future codec: add D3D11_DECODER_PROFILE_H264_VLD_WITHFMOASO
-         * / _VLD_STEREO_PROGRESSIVE variants and P010 output for HIGH_10. */
+        /* TODO: add P010 output for HIGH_10 — would need a separate GUID
+         * (HEVC_VLD_MAIN10 is the 10-bit surrogate we already handle). */
         return false;
     default:
         return false;
     }
+}
+
+/* True for the HEVC profiles we map to D3D11 decoder GUIDs. Main goes to
+ * HEVC_VLD_MAIN (NV12); Main10 goes to HEVC_VLD_MAIN10 (P010). Other Main12,
+ * Main444, etc. profiles exist in pipe but we don't advertise them. */
+static bool is_supported_hevc_profile(enum pipe_video_profile profile)
+{
+    switch (profile) {
+    case PIPE_VIDEO_PROFILE_HEVC_MAIN:
+    case PIPE_VIDEO_PROFILE_HEVC_MAIN_STILL:
+    case PIPE_VIDEO_PROFILE_HEVC_MAIN_10:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool is_supported_vp9_profile(enum pipe_video_profile profile)
+{
+    switch (profile) {
+    case PIPE_VIDEO_PROFILE_VP9_PROFILE0:
+    case PIPE_VIDEO_PROFILE_VP9_PROFILE2:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool is_supported_av1_profile(enum pipe_video_profile profile)
+{
+    return profile == PIPE_VIDEO_PROFILE_AV1_MAIN;
 }
 
 static bool map_profile_to_dxva_guid(enum pipe_video_profile profile,
@@ -228,9 +277,43 @@ static bool map_profile_to_dxva_guid(enum pipe_video_profile profile,
         *out = D3D11_DECODER_PROFILE_H264_VLD_NOFGT;
         return true;
     }
-    /* TODO future codec: HEVC (D3D11_DECODER_PROFILE_HEVC_VLD_MAIN), VP9,
-     * AV1, MPEG2. */
+    switch (profile) {
+    case PIPE_VIDEO_PROFILE_HEVC_MAIN:
+    case PIPE_VIDEO_PROFILE_HEVC_MAIN_STILL:
+        *out = D3D11_DECODER_PROFILE_HEVC_VLD_MAIN;
+        return true;
+    case PIPE_VIDEO_PROFILE_HEVC_MAIN_10:
+        *out = D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10;
+        return true;
+    case PIPE_VIDEO_PROFILE_VP9_PROFILE0:
+        *out = D3D11_DECODER_PROFILE_VP9_VLD_PROFILE0;
+        return true;
+    case PIPE_VIDEO_PROFILE_VP9_PROFILE2:
+        *out = D3D11_DECODER_PROFILE_VP9_VLD_10BIT_PROFILE2;
+        return true;
+    case PIPE_VIDEO_PROFILE_AV1_MAIN:
+        *out = VIRGL_VIDEO_WIN32_AV1_PROFILE0_GUID;
+        return true;
+    default:
+        break;
+    }
+    /* TODO future codec: MPEG2 (DXVA_ModeMPEG2and1_VLD). */
     return false;
+}
+
+/* True if the given pipe profile expects a 10-bit (or higher) output
+ * surface. D3D11 expects DXGI_FORMAT_P010 for these; dxgi_format_from_pipe()
+ * produces P010 when the guest has requested PIPE_FORMAT_P010, so the main
+ * effect is on the CreateVideoDecoder() OutputFormat we pass. */
+static bool profile_wants_10bit_output(enum pipe_video_profile profile)
+{
+    switch (profile) {
+    case PIPE_VIDEO_PROFILE_HEVC_MAIN_10:
+    case PIPE_VIDEO_PROFILE_VP9_PROFILE2:
+        return true;
+    default:
+        return false;
+    }
 }
 
 static DXGI_FORMAT dxgi_format_from_pipe(enum pipe_format f)
@@ -411,31 +494,138 @@ static void fill_caps_for_h264(struct virgl_video_caps *v,
     v->max_temporal_layers = 0;
 }
 
+/* HEVC / H.265: Mesa VA-API exposes Main and Main10; the spec allows much
+ * larger pictures than H.264 (8K common). D3D11 HEVC CTBs are effectively
+ * 16x16 for the purposes of "max_macroblocks" bookkeeping. */
+static void fill_caps_for_hevc(struct virgl_video_caps *v,
+                               enum pipe_video_profile profile)
+{
+    v->profile = profile;
+    v->entrypoint = PIPE_VIDEO_ENTRYPOINT_BITSTREAM;
+    v->max_level = 153;             /* HEVC Level 5.1 encoded as 30*level */
+    v->stacked_frames = 0;
+    /* Advertise up to 8K decode so guest Mesa can pick through. Actual
+     * support is gated by CheckVideoDecoderFormat + CreateVideoDecoder. */
+    v->max_width = 7680;
+    v->max_height = 4320;
+    v->prefered_format = (profile == PIPE_VIDEO_PROFILE_HEVC_MAIN_10) ?
+                         PIPE_FORMAT_P010 : PIPE_FORMAT_NV12;
+    v->max_macroblocks = (7680 / 16) * (4320 / 16);
+    v->npot_texture = 1;
+    v->supports_progressive = 1;
+    v->supports_interlaced = 0;
+    v->prefers_interlaced = 0;
+    v->max_temporal_layers = 0;
+}
+
+static void fill_caps_for_vp9(struct virgl_video_caps *v,
+                              enum pipe_video_profile profile)
+{
+    v->profile = profile;
+    v->entrypoint = PIPE_VIDEO_ENTRYPOINT_BITSTREAM;
+    v->max_level = 51;              /* VP9 uses a 0..6.2 level range; the
+                                     * cap is advisory for the guest */
+    v->stacked_frames = 0;
+    v->max_width = 7680;
+    v->max_height = 4320;
+    v->prefered_format = (profile == PIPE_VIDEO_PROFILE_VP9_PROFILE2) ?
+                         PIPE_FORMAT_P010 : PIPE_FORMAT_NV12;
+    /* VP9 "superblocks" are 64x64 but Mesa's cap accounting is in 16x16
+     * macroblock equivalents, matching what the H.264/HEVC branches do. */
+    v->max_macroblocks = (7680 / 16) * (4320 / 16);
+    v->npot_texture = 1;
+    v->supports_progressive = 1;
+    v->supports_interlaced = 0;
+    v->prefers_interlaced = 0;
+    v->max_temporal_layers = 0;
+}
+
+static void fill_caps_for_av1(struct virgl_video_caps *v,
+                              enum pipe_video_profile profile)
+{
+    v->profile = profile;
+    v->entrypoint = PIPE_VIDEO_ENTRYPOINT_BITSTREAM;
+    v->max_level = 51;              /* AV1 level 5.1 */
+    v->stacked_frames = 0;
+    v->max_width = 7680;
+    v->max_height = 4320;
+    /* Profile 0 is 8-bit 4:2:0; output is always NV12 here. */
+    v->prefered_format = PIPE_FORMAT_NV12;
+    v->max_macroblocks = (7680 / 16) * (4320 / 16);
+    v->npot_texture = 1;
+    v->supports_progressive = 1;
+    v->supports_interlaced = 0;
+    v->prefers_interlaced = 0;
+    v->max_temporal_layers = 0;
+}
+
 int virgl_video_fill_caps(union virgl_caps *caps)
 {
     UINT i, profile_count;
     GUID guid;
     bool have_h264_nofgt = false;
+    bool have_hevc_main = false;
+    bool have_hevc_main10 = false;
+    bool have_vp9_p0 = false;
+    bool have_vp9_p2 = false;
+    bool have_av1_p0 = false;
     unsigned out = 0;
 
     if (!g_vid.initialized || !caps)
         return -1;
 
+    /*
+     * Walk every profile GUID the D3D11 driver claims to support, then
+     * filter to the ones we know how to drive. CheckVideoDecoderFormat
+     * (NV12 for 8-bit / P010 for 10-bit) is a cheap sanity check that the
+     * driver will actually accept the output format we'd create the decoder
+     * with.
+     */
     profile_count = ID3D11VideoDevice_GetVideoDecoderProfileCount(
                             g_vid.video_device);
     for (i = 0; i < profile_count; i++) {
+        WINBOOL nv12_ok = FALSE, p010_ok = FALSE;
+        HRESULT hr;
+
         if (FAILED(ID3D11VideoDevice_GetVideoDecoderProfile(
                         g_vid.video_device, i, &guid)))
             continue;
 
+        hr = ID3D11VideoDevice_CheckVideoDecoderFormat(
+                        g_vid.video_device, &guid, DXGI_FORMAT_NV12,
+                        &nv12_ok);
+        if (FAILED(hr))
+            nv12_ok = FALSE;
+        hr = ID3D11VideoDevice_CheckVideoDecoderFormat(
+                        g_vid.video_device, &guid, DXGI_FORMAT_P010,
+                        &p010_ok);
+        if (FAILED(hr))
+            p010_ok = FALSE;
+
         if (profile_guid_matches(&guid,
                                  &D3D11_DECODER_PROFILE_H264_VLD_NOFGT)) {
-            WINBOOL nv12_ok = FALSE;
-            HRESULT hr = ID3D11VideoDevice_CheckVideoDecoderFormat(
-                            g_vid.video_device, &guid, DXGI_FORMAT_NV12,
-                            &nv12_ok);
-            if (SUCCEEDED(hr) && nv12_ok)
+            if (nv12_ok)
                 have_h264_nofgt = true;
+        } else if (profile_guid_matches(&guid,
+                                 &D3D11_DECODER_PROFILE_HEVC_VLD_MAIN)) {
+            if (nv12_ok)
+                have_hevc_main = true;
+        } else if (profile_guid_matches(&guid,
+                                 &D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10)) {
+            if (p010_ok)
+                have_hevc_main10 = true;
+        } else if (profile_guid_matches(&guid,
+                                 &D3D11_DECODER_PROFILE_VP9_VLD_PROFILE0)) {
+            if (nv12_ok)
+                have_vp9_p0 = true;
+        } else if (profile_guid_matches(&guid,
+                                 &D3D11_DECODER_PROFILE_VP9_VLD_10BIT_PROFILE2)) {
+            if (p010_ok)
+                have_vp9_p2 = true;
+        } else if (profile_guid_matches(&guid,
+                                 &VIRGL_VIDEO_WIN32_AV1_PROFILE0_GUID)) {
+            if (nv12_ok)
+                have_av1_p0 = true;
         }
     }
 
@@ -455,6 +645,32 @@ int virgl_video_fill_caps(union virgl_caps *caps)
                     out < ARRAY_SIZE(caps->v2.video_caps); i++) {
             fill_caps_for_h264(&caps->v2.video_caps[out++], profiles[i]);
         }
+    }
+
+    if (have_hevc_main && out < ARRAY_SIZE(caps->v2.video_caps)) {
+        fill_caps_for_hevc(&caps->v2.video_caps[out++],
+                           PIPE_VIDEO_PROFILE_HEVC_MAIN);
+        if (out < ARRAY_SIZE(caps->v2.video_caps))
+            fill_caps_for_hevc(&caps->v2.video_caps[out++],
+                               PIPE_VIDEO_PROFILE_HEVC_MAIN_STILL);
+    }
+    if (have_hevc_main10 && out < ARRAY_SIZE(caps->v2.video_caps)) {
+        fill_caps_for_hevc(&caps->v2.video_caps[out++],
+                           PIPE_VIDEO_PROFILE_HEVC_MAIN_10);
+    }
+
+    if (have_vp9_p0 && out < ARRAY_SIZE(caps->v2.video_caps)) {
+        fill_caps_for_vp9(&caps->v2.video_caps[out++],
+                          PIPE_VIDEO_PROFILE_VP9_PROFILE0);
+    }
+    if (have_vp9_p2 && out < ARRAY_SIZE(caps->v2.video_caps)) {
+        fill_caps_for_vp9(&caps->v2.video_caps[out++],
+                          PIPE_VIDEO_PROFILE_VP9_PROFILE2);
+    }
+
+    if (have_av1_p0 && out < ARRAY_SIZE(caps->v2.video_caps)) {
+        fill_caps_for_av1(&caps->v2.video_caps[out++],
+                          PIPE_VIDEO_PROFILE_AV1_MAIN);
     }
 
     caps->v2.num_video_caps = out;
@@ -559,7 +775,12 @@ struct virgl_video_codec *virgl_video_create_codec(
     desc.Guid = codec->dxva_profile;
     desc.SampleWidth = args->width;
     desc.SampleHeight = args->height;
-    desc.OutputFormat = DXGI_FORMAT_NV12;
+    /* 10-bit profiles (HEVC Main10, VP9 Profile2) decode into P010. Everything
+     * else stays on NV12. The guest still creates the virgl video buffer with
+     * its chosen pipe format — virgl_video_create_buffer maps NV12/P010 to
+     * the matching DXGI format independently. */
+    desc.OutputFormat = profile_wants_10bit_output(args->profile) ?
+                        DXGI_FORMAT_P010 : DXGI_FORMAT_NV12;
 
     if (pick_decoder_config(codec, &desc, &codec->config) != 0)
         goto fail;
@@ -1215,6 +1436,1043 @@ static int h264_decode_bitstream(struct virgl_video_codec *codec,
     return submit_h264_decode(codec, &pp, &qm, num_buffers, buffers, sizes);
 }
 
+/*
+ * ---------------------------------------------------------------------------
+ * HEVC / H.265 picture-parameter marshalling.
+ *
+ * DXVA_PicParams_HEVC is considerably larger than the H.264 equivalent: it
+ * carries the full SPS/PPS-derived state plus per-ref POC and ref-pic-set
+ * indices. We pack it from virgl_h265_picture_desc, which Mesa fills from
+ * VA-API's VAPictureParameterBufferHEVC / VAIQMatrixBufferHEVC / VASlice*.
+ *
+ * See [MS-DXVA]: "DirectX Video Acceleration HEVC Specification" and the
+ * ffmpeg libavcodec/dxva2_hevc.c as a cross-check.
+ * ---------------------------------------------------------------------------
+ */
+
+static void dxva_picentry_hevc_invalidate(DXVA_PicEntry_HEVC *e)
+{
+    e->bPicEntry = 0xFF;     /* Index7Bits=0x7F + AssociatedFlag=1 => invalid */
+}
+
+static void fill_dxva_picparams_hevc(struct virgl_video_codec *codec,
+                                     struct virgl_video_buffer *target,
+                                     const struct virgl_h265_picture_desc *desc,
+                                     DXVA_PicParams_HEVC *pp)
+{
+    const struct virgl_h265_pps *pps = &desc->pps;
+    const struct virgl_h265_sps *sps = &pps->sps;
+    unsigned i;
+    int self_slot;
+    UCHAR min_cb_size;
+
+    memset(pp, 0, sizeof(*pp));
+
+    /* Picture size is expressed in multiples of the minimum luma coding
+     * block size (which is 2^(log2_min_luma_coding_block_size_minus3 + 3)).
+     * PicWidthInMinCbsY / PicHeightInMinCbsY are unitless block counts. */
+    min_cb_size =
+        (UCHAR)(1u << (sps->log2_min_luma_coding_block_size_minus3 + 3));
+    if (min_cb_size == 0)
+        min_cb_size = 8;   /* defensive against a bad SPS */
+    pp->PicWidthInMinCbsY  = (USHORT)(sps->pic_width_in_luma_samples / min_cb_size);
+    pp->PicHeightInMinCbsY = (USHORT)(sps->pic_height_in_luma_samples / min_cb_size);
+
+    /* wFormatAndSequenceInfoFlags */
+    pp->chroma_format_idc              = sps->chroma_format_idc;
+    pp->separate_colour_plane_flag     = sps->separate_colour_plane_flag;
+    pp->bit_depth_luma_minus8          = sps->bit_depth_luma_minus8;
+    pp->bit_depth_chroma_minus8        = sps->bit_depth_chroma_minus8;
+    pp->log2_max_pic_order_cnt_lsb_minus4 =
+        sps->log2_max_pic_order_cnt_lsb_minus4;
+    /* NoPicReorderingFlag / NoBiPredFlag are conservative hints — leaving
+     * them 0 (the driver will reorder / bipred as needed). */
+    pp->NoPicReorderingFlag = 0;
+    pp->NoBiPredFlag        = 0;
+
+    /* CurrPic */
+    self_slot = codec_find_or_add_ref_slot(codec, target->id, target);
+    if (self_slot < 0)
+        self_slot = 0;
+    pp->CurrPic.Index7Bits   = (UCHAR)(self_slot & 0x7F);
+    pp->CurrPic.AssociatedFlag = 0;
+
+    /* SPS-derived scalars. */
+    pp->sps_max_dec_pic_buffering_minus1 =
+        sps->sps_max_dec_pic_buffering_minus1;
+    pp->log2_min_luma_coding_block_size_minus3 =
+        sps->log2_min_luma_coding_block_size_minus3;
+    pp->log2_diff_max_min_luma_coding_block_size =
+        sps->log2_diff_max_min_luma_coding_block_size;
+    pp->log2_min_transform_block_size_minus2 =
+        sps->log2_min_transform_block_size_minus2;
+    pp->log2_diff_max_min_transform_block_size =
+        sps->log2_diff_max_min_transform_block_size;
+    pp->max_transform_hierarchy_depth_inter =
+        sps->max_transform_hierarchy_depth_inter;
+    pp->max_transform_hierarchy_depth_intra =
+        sps->max_transform_hierarchy_depth_intra;
+    pp->num_short_term_ref_pic_sets = sps->num_short_term_ref_pic_sets;
+    pp->num_long_term_ref_pics_sps  = sps->num_long_term_ref_pics_sps;
+
+    /* PPS-derived scalars. */
+    pp->num_ref_idx_l0_default_active_minus1 =
+        pps->num_ref_idx_l0_default_active_minus1;
+    pp->num_ref_idx_l1_default_active_minus1 =
+        pps->num_ref_idx_l1_default_active_minus1;
+    pp->init_qp_minus26            = pps->init_qp_minus26;
+    pp->ucNumDeltaPocsOfRefRpsIdx  = (UCHAR)desc->NumDeltaPocsOfRefRpsIdx;
+    pp->wNumBitsForShortTermRPSInSlice =
+        desc->UseStRpsBits ? (USHORT)desc->NumShortTermPictureSliceHeaderBits
+                           : (USHORT)pps->st_rps_bits;
+
+    /* dwCodingParamToolFlags (SPS-ish) */
+    pp->scaling_list_enabled_flag         = sps->scaling_list_enabled_flag;
+    pp->amp_enabled_flag                  = sps->amp_enabled_flag;
+    pp->sample_adaptive_offset_enabled_flag =
+        sps->sample_adaptive_offset_enabled_flag;
+    pp->pcm_enabled_flag                  = sps->pcm_enabled_flag;
+    pp->pcm_sample_bit_depth_luma_minus1  = sps->pcm_sample_bit_depth_luma_minus1;
+    pp->pcm_sample_bit_depth_chroma_minus1 =
+        sps->pcm_sample_bit_depth_chroma_minus1;
+    pp->log2_min_pcm_luma_coding_block_size_minus3 =
+        sps->log2_min_pcm_luma_coding_block_size_minus3;
+    pp->log2_diff_max_min_pcm_luma_coding_block_size =
+        sps->log2_diff_max_min_pcm_luma_coding_block_size;
+    pp->pcm_loop_filter_disabled_flag     = sps->pcm_loop_filter_disabled_flag;
+    pp->long_term_ref_pics_present_flag   = sps->long_term_ref_pics_present_flag;
+    pp->sps_temporal_mvp_enabled_flag     = sps->sps_temporal_mvp_enabled_flag;
+    pp->strong_intra_smoothing_enabled_flag =
+        sps->strong_intra_smoothing_enabled_flag;
+    pp->dependent_slice_segments_enabled_flag =
+        pps->dependent_slice_segments_enabled_flag;
+    pp->output_flag_present_flag          = pps->output_flag_present_flag;
+    pp->num_extra_slice_header_bits       = pps->num_extra_slice_header_bits;
+    pp->sign_data_hiding_enabled_flag     = pps->sign_data_hiding_enabled_flag;
+    pp->cabac_init_present_flag           = pps->cabac_init_present_flag;
+
+    /* dwCodingSettingPicturePropertyFlags (PPS-ish + current-pic flags) */
+    pp->constrained_intra_pred_flag       = pps->constrained_intra_pred_flag;
+    pp->transform_skip_enabled_flag       = pps->transform_skip_enabled_flag;
+    pp->cu_qp_delta_enabled_flag          = pps->cu_qp_delta_enabled_flag;
+    pp->pps_slice_chroma_qp_offsets_present_flag =
+        pps->pps_slice_chroma_qp_offsets_present_flag;
+    pp->weighted_pred_flag                = pps->weighted_pred_flag;
+    pp->weighted_bipred_flag              = pps->weighted_bipred_flag;
+    pp->transquant_bypass_enabled_flag    = pps->transquant_bypass_enabled_flag;
+    pp->tiles_enabled_flag                = pps->tiles_enabled_flag;
+    pp->entropy_coding_sync_enabled_flag  = pps->entropy_coding_sync_enabled_flag;
+    pp->uniform_spacing_flag              = pps->uniform_spacing_flag;
+    pp->loop_filter_across_tiles_enabled_flag =
+        pps->loop_filter_across_tiles_enabled_flag;
+    pp->pps_loop_filter_across_slices_enabled_flag =
+        pps->pps_loop_filter_across_slices_enabled_flag;
+    pp->deblocking_filter_override_enabled_flag =
+        pps->deblocking_filter_override_enabled_flag;
+    pp->pps_deblocking_filter_disabled_flag =
+        pps->pps_deblocking_filter_disabled_flag;
+    pp->lists_modification_present_flag   = pps->lists_modification_present_flag;
+    pp->slice_segment_header_extension_present_flag =
+        pps->slice_segment_header_extension_present_flag;
+    pp->IrapPicFlag                       = desc->RAPPicFlag ? 1 : 0;
+    pp->IdrPicFlag                        = desc->IDRPicFlag ? 1 : 0;
+    /* IntraPicFlag is a hint for intra-only frames; derive conservatively
+     * from IDR. TODO: virgl desc doesn't expose a distinct intra-only bit,
+     * so non-IDR I-frames report 0 and the driver will resolve from slice
+     * headers. */
+    pp->IntraPicFlag                      = desc->IDRPicFlag ? 1 : 0;
+
+    pp->pps_cb_qp_offset        = pps->pps_cb_qp_offset;
+    pp->pps_cr_qp_offset        = pps->pps_cr_qp_offset;
+    pp->num_tile_columns_minus1 = pps->num_tile_columns_minus1;
+    pp->num_tile_rows_minus1    = pps->num_tile_rows_minus1;
+
+    /* DXVA carries 19 columns / 21 rows worth of sizes; virgl has 20/22.
+     * We only copy as many as the PPS says are present, which is bounded
+     * by num_tile_{columns,rows}_minus1 <= DXVA's array size. */
+    for (i = 0; i < 19 && i < 20; i++)
+        pp->column_width_minus1[i] = pps->column_width_minus1[i];
+    for (i = 0; i < 21 && i < 22; i++)
+        pp->row_height_minus1[i]   = pps->row_height_minus1[i];
+
+    pp->diff_cu_qp_delta_depth       = pps->diff_cu_qp_delta_depth;
+    pp->pps_beta_offset_div2         = pps->pps_beta_offset_div2;
+    pp->pps_tc_offset_div2           = pps->pps_tc_offset_div2;
+    pp->log2_parallel_merge_level_minus2 =
+        pps->log2_parallel_merge_level_minus2;
+    pp->CurrPicOrderCntVal           = desc->CurrPicOrderCntVal;
+
+    /* RefPicList: up to 15 entries. DXVA encodes a long-term flag in the
+     * AssociatedFlag bit; we mark unused slots with bPicEntry=0xFF. */
+    for (i = 0; i < 15; i++) {
+        dxva_picentry_hevc_invalidate(&pp->RefPicList[i]);
+        pp->PicOrderCntValList[i] = 0;
+    }
+    for (i = 0; i < 15; i++) {
+        uint32_t bid = desc->ref[i];
+        int slot;
+
+        if (bid == 0)
+            continue;
+
+        slot = codec_find_or_add_ref_slot(codec, bid, NULL);
+        if (slot < 0)
+            continue;
+        pp->RefPicList[i].Index7Bits    = (UCHAR)(slot & 0x7F);
+        pp->RefPicList[i].AssociatedFlag = desc->IsLongTerm[i] ? 1 : 0;
+        pp->PicOrderCntValList[i] = desc->PicOrderCntVal[i];
+    }
+
+    /* Ref-pic-set indices into RefPicList[]: curr-before, curr-after,
+     * lt-curr. Each is padded with 0xFF when fewer than 8 entries apply. */
+    memset(pp->RefPicSetStCurrBefore, 0xFF, sizeof(pp->RefPicSetStCurrBefore));
+    memset(pp->RefPicSetStCurrAfter,  0xFF, sizeof(pp->RefPicSetStCurrAfter));
+    memset(pp->RefPicSetLtCurr,       0xFF, sizeof(pp->RefPicSetLtCurr));
+    for (i = 0; i < desc->NumPocStCurrBefore && i < 8; i++)
+        pp->RefPicSetStCurrBefore[i] = desc->RefPicSetStCurrBefore[i];
+    for (i = 0; i < desc->NumPocStCurrAfter && i < 8; i++)
+        pp->RefPicSetStCurrAfter[i]  = desc->RefPicSetStCurrAfter[i];
+    for (i = 0; i < desc->NumPocLtCurr && i < 8; i++)
+        pp->RefPicSetLtCurr[i]       = desc->RefPicSetLtCurr[i];
+
+    pp->StatusReportFeedbackNumber = codec->status_report_feedback++;
+    if (pp->StatusReportFeedbackNumber == 0)
+        pp->StatusReportFeedbackNumber = codec->status_report_feedback++;
+}
+
+static void fill_dxva_qmatrix_hevc(const struct virgl_h265_picture_desc *desc,
+                                   DXVA_Qmatrix_HEVC *qm)
+{
+    const struct virgl_h265_sps *sps = &desc->pps.sps;
+
+    /* HEVC has four block-size classes of scaling lists. virgl packs them
+     * in the same zig-zag order DXVA expects (matching VA-API semantics). */
+    memcpy(qm->ucScalingLists0, sps->ScalingList4x4,
+           sizeof(qm->ucScalingLists0));
+    memcpy(qm->ucScalingLists1, sps->ScalingList8x8,
+           sizeof(qm->ucScalingLists1));
+    memcpy(qm->ucScalingLists2, sps->ScalingList16x16,
+           sizeof(qm->ucScalingLists2));
+    memcpy(qm->ucScalingLists3, sps->ScalingList32x32,
+           sizeof(qm->ucScalingLists3));
+    memcpy(qm->ucScalingListDCCoefSizeID2, sps->ScalingListDCCoeff16x16,
+           sizeof(qm->ucScalingListDCCoefSizeID2));
+    memcpy(qm->ucScalingListDCCoefSizeID3, sps->ScalingListDCCoeff32x32,
+           sizeof(qm->ucScalingListDCCoefSizeID3));
+}
+
+/* Shared short-format slice/bitstream submission for HEVC / VP9 / AV1.
+ * All three use DXVA_Slice_*_Short with the same byte layout (offset, size,
+ * chopping), so one helper handles all of them.
+ *
+ * pp/pp_size  : picture-params blob (already filled).
+ * qm/qm_size  : inverse-quantization-matrix blob, or NULL when the codec
+ *               doesn't use one (VP9, AV1).
+ * sc/sc_elem  : slice-control entry size (sizeof(DXVA_Slice_*_Short) or
+ *               sizeof(DXVA_Tile_AV1) for AV1).
+ * build_sc    : callback that fills one slice/tile entry given its index,
+ *               offset and size; returns void.
+ */
+typedef void (*build_sc_entry_fn)(void *sc_array, unsigned idx,
+                                  UINT bs_offset, UINT slice_sz,
+                                  void *user);
+
+static int submit_short_format_decode(struct virgl_video_codec *codec,
+                                      const void *pp, UINT pp_size,
+                                      const void *qm, UINT qm_size,
+                                      UINT sc_elem_size,
+                                      build_sc_entry_fn build_sc,
+                                      void *build_sc_user,
+                                      unsigned num_buffers,
+                                      const void * const *buffers,
+                                      const unsigned *sizes)
+{
+    HRESULT hr;
+    UINT bs_buf_size = 0;
+    void *bs_ptr = NULL;
+    UINT pp_buf_size = 0;
+    void *pp_ptr = NULL;
+    UINT iq_buf_size = 0;
+    void *iq_ptr = NULL;
+    UINT sc_buf_size = 0;
+    void *sc_ptr = NULL;
+    uint8_t slice_storage[VIRGL_VIDEO_WIN32_MAX_SLICES * 64];
+    unsigned i, slice_count = 0;
+    UINT bs_offset = 0;
+    D3D11_VIDEO_DECODER_BUFFER_DESC descs[4];
+    UINT ret_desc = 0;
+
+    if (sc_elem_size > 64 ||
+        sc_elem_size * VIRGL_VIDEO_WIN32_MAX_SLICES > sizeof(slice_storage)) {
+        virgl_error("virgl_video_win32: slice control elem size %u too big\n",
+                    sc_elem_size);
+        return -1;
+    }
+    memset(slice_storage, 0, sizeof(slice_storage));
+
+    /* --- PictureParameters --- */
+    hr = ID3D11VideoContext_GetDecoderBuffer(
+            g_vid.video_context, codec->decoder,
+            D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS,
+            &pp_buf_size, &pp_ptr);
+    if (FAILED(hr) || !pp_ptr || pp_buf_size < pp_size) {
+        virgl_error("virgl_video_win32: GetDecoderBuffer(PP) "
+                    "failed (hr=0x%lx, size=%u/need=%u)\n",
+                    (unsigned long)hr, pp_buf_size, pp_size);
+        return -1;
+    }
+    memcpy(pp_ptr, pp, pp_size);
+    hr = ID3D11VideoContext_ReleaseDecoderBuffer(
+            g_vid.video_context, codec->decoder,
+            D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS);
+    if (FAILED(hr)) {
+        virgl_error("virgl_video_win32: ReleaseDecoderBuffer(PP) failed: "
+                    "0x%lx\n", (unsigned long)hr);
+        return -1;
+    }
+
+    /* --- InverseQuantizationMatrix (optional) --- */
+    if (qm && qm_size) {
+        hr = ID3D11VideoContext_GetDecoderBuffer(
+                g_vid.video_context, codec->decoder,
+                D3D11_VIDEO_DECODER_BUFFER_INVERSE_QUANTIZATION_MATRIX,
+                &iq_buf_size, &iq_ptr);
+        if (FAILED(hr) || !iq_ptr || iq_buf_size < qm_size) {
+            virgl_error("virgl_video_win32: GetDecoderBuffer(IQ) "
+                        "failed (hr=0x%lx, size=%u/need=%u)\n",
+                        (unsigned long)hr, iq_buf_size, qm_size);
+            return -1;
+        }
+        memcpy(iq_ptr, qm, qm_size);
+        hr = ID3D11VideoContext_ReleaseDecoderBuffer(
+                g_vid.video_context, codec->decoder,
+                D3D11_VIDEO_DECODER_BUFFER_INVERSE_QUANTIZATION_MATRIX);
+        if (FAILED(hr)) {
+            virgl_error("virgl_video_win32: ReleaseDecoderBuffer(IQ) failed: "
+                        "0x%lx\n", (unsigned long)hr);
+            return -1;
+        }
+    }
+
+    /* --- Bitstream --- */
+    hr = ID3D11VideoContext_GetDecoderBuffer(
+            g_vid.video_context, codec->decoder,
+            D3D11_VIDEO_DECODER_BUFFER_BITSTREAM,
+            &bs_buf_size, &bs_ptr);
+    if (FAILED(hr) || !bs_ptr) {
+        virgl_error("virgl_video_win32: GetDecoderBuffer(BS) "
+                    "failed (hr=0x%lx, size=%u)\n",
+                    (unsigned long)hr, bs_buf_size);
+        return -1;
+    }
+
+    for (i = 0; i < num_buffers && slice_count < VIRGL_VIDEO_WIN32_MAX_SLICES; i++) {
+        unsigned sz = sizes[i];
+        if (!buffers[i] || !sz)
+            continue;
+        if (bs_offset + sz > bs_buf_size) {
+            virgl_error("virgl_video_win32: bitstream buffer overflow "
+                        "(%u + %u > %u)\n", bs_offset, sz, bs_buf_size);
+            ID3D11VideoContext_ReleaseDecoderBuffer(
+                g_vid.video_context, codec->decoder,
+                D3D11_VIDEO_DECODER_BUFFER_BITSTREAM);
+            return -1;
+        }
+        memcpy((uint8_t *)bs_ptr + bs_offset, buffers[i], sz);
+        build_sc(slice_storage, slice_count, bs_offset, sz, build_sc_user);
+        bs_offset += sz;
+        slice_count++;
+    }
+
+    if (slice_count == 0) {
+        virgl_warn("virgl_video_win32: no slice data submitted\n");
+        ID3D11VideoContext_ReleaseDecoderBuffer(
+            g_vid.video_context, codec->decoder,
+            D3D11_VIDEO_DECODER_BUFFER_BITSTREAM);
+        return -1;
+    }
+
+    hr = ID3D11VideoContext_ReleaseDecoderBuffer(
+            g_vid.video_context, codec->decoder,
+            D3D11_VIDEO_DECODER_BUFFER_BITSTREAM);
+    if (FAILED(hr)) {
+        virgl_error("virgl_video_win32: ReleaseDecoderBuffer(BS) failed: "
+                    "0x%lx\n", (unsigned long)hr);
+        return -1;
+    }
+
+    /* --- SliceControl --- */
+    hr = ID3D11VideoContext_GetDecoderBuffer(
+            g_vid.video_context, codec->decoder,
+            D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL,
+            &sc_buf_size, &sc_ptr);
+    if (FAILED(hr) || !sc_ptr ||
+        sc_buf_size < slice_count * sc_elem_size) {
+        virgl_error("virgl_video_win32: GetDecoderBuffer(SC) "
+                    "failed (hr=0x%lx, need=%u, got=%u)\n",
+                    (unsigned long)hr,
+                    (unsigned)(slice_count * sc_elem_size),
+                    sc_buf_size);
+        return -1;
+    }
+    memcpy(sc_ptr, slice_storage, slice_count * sc_elem_size);
+    hr = ID3D11VideoContext_ReleaseDecoderBuffer(
+            g_vid.video_context, codec->decoder,
+            D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL);
+    if (FAILED(hr)) {
+        virgl_error("virgl_video_win32: ReleaseDecoderBuffer(SC) failed: "
+                    "0x%lx\n", (unsigned long)hr);
+        return -1;
+    }
+
+    /* --- SubmitDecoderBuffers --- */
+    memset(descs, 0, sizeof(descs));
+
+    descs[ret_desc].BufferType =
+        D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS;
+    descs[ret_desc].DataSize = pp_size;
+    ret_desc++;
+
+    if (qm && qm_size) {
+        descs[ret_desc].BufferType =
+            D3D11_VIDEO_DECODER_BUFFER_INVERSE_QUANTIZATION_MATRIX;
+        descs[ret_desc].DataSize = qm_size;
+        ret_desc++;
+    }
+
+    descs[ret_desc].BufferType =
+        D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL;
+    descs[ret_desc].DataSize = (UINT)(slice_count * sc_elem_size);
+    ret_desc++;
+
+    descs[ret_desc].BufferType = D3D11_VIDEO_DECODER_BUFFER_BITSTREAM;
+    descs[ret_desc].DataSize = bs_offset;
+    ret_desc++;
+
+    hr = ID3D11VideoContext_SubmitDecoderBuffers(
+            g_vid.video_context, codec->decoder, ret_desc, descs);
+    if (FAILED(hr)) {
+        virgl_error("virgl_video_win32: SubmitDecoderBuffers failed: 0x%lx\n",
+                    (unsigned long)hr);
+        return -1;
+    }
+
+    return 0;
+}
+
+static void build_sc_hevc(void *sc_array, unsigned idx,
+                          UINT bs_offset, UINT slice_sz, void *user)
+{
+    DXVA_Slice_HEVC_Short *arr = (DXVA_Slice_HEVC_Short *)sc_array;
+    (void)user;
+    arr[idx].BSNALunitDataLocation = bs_offset;
+    arr[idx].SliceBytesInBuffer    = slice_sz;
+    arr[idx].wBadSliceChopping     = DXVA_SLICE_CHOPPING_NONE;
+}
+
+static int hevc_decode_bitstream(struct virgl_video_codec *codec,
+                                 struct virgl_video_buffer *target,
+                                 const struct virgl_h265_picture_desc *desc,
+                                 unsigned num_buffers,
+                                 const void * const *buffers,
+                                 const unsigned *sizes)
+{
+    DXVA_PicParams_HEVC pp;
+    DXVA_Qmatrix_HEVC   qm;
+
+    fill_dxva_picparams_hevc(codec, target, desc, &pp);
+    fill_dxva_qmatrix_hevc(desc, &qm);
+
+    return submit_short_format_decode(codec,
+                                      &pp, (UINT)sizeof(pp),
+                                      &qm, (UINT)sizeof(qm),
+                                      (UINT)sizeof(DXVA_Slice_HEVC_Short),
+                                      build_sc_hevc, NULL,
+                                      num_buffers, buffers, sizes);
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * VP9 picture-parameter marshalling.
+ *
+ * virgl_vp9_picture_desc is considerably slimmer than the DXVA struct but
+ * carries everything DXVA needs: the uncompressed-header-derived frame
+ * flags, segmentation data, base QP and ref_frame_map. DXVA additionally
+ * wants coded width/height per reference slot, which we can get from the
+ * referenced virgl buffers we've tracked.
+ * ---------------------------------------------------------------------------
+ */
+
+static void dxva_picentry_vpx_invalidate(DXVA_PicEntry_VPx *e)
+{
+    e->bPicEntry = 0xFF;
+}
+
+static void fill_dxva_picparams_vp9(struct virgl_video_codec *codec,
+                                    struct virgl_video_buffer *target,
+                                    const struct virgl_vp9_picture_desc *desc,
+                                    DXVA_PicParams_VP9 *pp)
+{
+    const struct virgl_vp9_picture_desc *d = desc;
+    unsigned i;
+    int self_slot;
+
+    memset(pp, 0, sizeof(*pp));
+
+    self_slot = codec_find_or_add_ref_slot(codec, target->id, target);
+    if (self_slot < 0)
+        self_slot = 0;
+    pp->CurrPic.Index7Bits     = (UCHAR)(self_slot & 0x7F);
+    pp->CurrPic.AssociatedFlag = 0;
+
+    pp->profile = d->picture_parameter.profile;
+
+    /* wFormatAndPictureInfoFlags */
+    pp->frame_type                   = d->picture_parameter.pic_fields.frame_type;
+    pp->show_frame                   = d->picture_parameter.pic_fields.show_frame;
+    pp->error_resilient_mode         = d->picture_parameter.pic_fields.error_resilient_mode;
+    pp->subsampling_x                = d->picture_parameter.pic_fields.subsampling_x;
+    pp->subsampling_y                = d->picture_parameter.pic_fields.subsampling_y;
+    pp->extra_plane                  = 0;   /* TODO: not signalled in desc */
+    pp->refresh_frame_context        = d->picture_parameter.pic_fields.refresh_frame_context;
+    pp->frame_parallel_decoding_mode =
+        d->picture_parameter.pic_fields.frame_parallel_decoding_mode;
+    pp->intra_only                   = d->picture_parameter.pic_fields.intra_only;
+    pp->frame_context_idx            = d->picture_parameter.pic_fields.frame_context_idx;
+    pp->reset_frame_context          = d->picture_parameter.pic_fields.reset_frame_context;
+    pp->allow_high_precision_mv      = d->picture_parameter.pic_fields.allow_high_precision_mv;
+
+    pp->width  = d->picture_parameter.frame_width;
+    pp->height = d->picture_parameter.frame_height;
+
+    pp->BitDepthMinus8Luma   = (UCHAR)(d->picture_parameter.bit_depth - 8);
+    pp->BitDepthMinus8Chroma = (UCHAR)(d->picture_parameter.bit_depth - 8);
+    pp->interp_filter        = d->picture_parameter.pic_fields.mcomp_filter_type;
+
+    /* ref_frame_map: virgl packs 16 guest buffer ids, DXVA wants 8 slots
+     * (VP9 has 8 reference-buffer slots). Map by looking the buffer up in
+     * our per-codec refs[] table. */
+    for (i = 0; i < 8; i++) {
+        dxva_picentry_vpx_invalidate(&pp->ref_frame_map[i]);
+        pp->ref_frame_coded_width[i]  = 0;
+        pp->ref_frame_coded_height[i] = 0;
+    }
+    for (i = 0; i < 8; i++) {
+        uint32_t bid = d->ref[i];
+        int slot;
+        struct virgl_video_buffer *refbuf = NULL;
+
+        if (bid == 0)
+            continue;
+
+        /* Find tracked buf to extract coded width/height. */
+        for (unsigned j = 0; j < VIRGL_VIDEO_WIN32_MAX_REFS; j++) {
+            if (codec->refs[j].buffer_id == bid) {
+                refbuf = codec->refs[j].buf;
+                break;
+            }
+        }
+        slot = codec_find_or_add_ref_slot(codec, bid, refbuf);
+        if (slot < 0)
+            continue;
+        pp->ref_frame_map[i].Index7Bits = (UCHAR)(slot & 0x7F);
+        pp->ref_frame_map[i].AssociatedFlag = 0;
+        if (refbuf) {
+            pp->ref_frame_coded_width[i]  = refbuf->width;
+            pp->ref_frame_coded_height[i] = refbuf->height;
+        } else {
+            /* Fallback to current-frame size if we don't have the ref buf
+             * cached (first ref of the first P-frame sometimes). */
+            pp->ref_frame_coded_width[i]  = d->picture_parameter.frame_width;
+            pp->ref_frame_coded_height[i] = d->picture_parameter.frame_height;
+        }
+    }
+
+    /* frame_refs[3]: last, golden, altref — indices into ref_frame_map. */
+    for (i = 0; i < 3; i++)
+        dxva_picentry_vpx_invalidate(&pp->frame_refs[i]);
+    pp->frame_refs[0].Index7Bits =
+        (UCHAR)(d->picture_parameter.pic_fields.last_ref_frame & 0x7);
+    pp->frame_refs[0].AssociatedFlag = 0;
+    pp->frame_refs[1].Index7Bits =
+        (UCHAR)(d->picture_parameter.pic_fields.golden_ref_frame & 0x7);
+    pp->frame_refs[1].AssociatedFlag = 0;
+    pp->frame_refs[2].Index7Bits =
+        (UCHAR)(d->picture_parameter.pic_fields.alt_ref_frame & 0x7);
+    pp->frame_refs[2].AssociatedFlag = 0;
+
+    /* ref_frame_sign_bias[4]: VP9 uses 1-indexed refs (0=INTRA, 1=LAST,
+     * 2=GOLDEN, 3=ALTREF). */
+    pp->ref_frame_sign_bias[0] = 0;
+    pp->ref_frame_sign_bias[1] =
+        d->picture_parameter.pic_fields.last_ref_frame_sign_bias;
+    pp->ref_frame_sign_bias[2] =
+        d->picture_parameter.pic_fields.golden_ref_frame_sign_bias;
+    pp->ref_frame_sign_bias[3] =
+        d->picture_parameter.pic_fields.alt_ref_frame_sign_bias;
+
+    pp->filter_level    = d->picture_parameter.filter_level;
+    pp->sharpness_level = d->picture_parameter.sharpness_level;
+
+    /* wControlInfoFlags */
+    pp->mode_ref_delta_enabled   = d->picture_parameter.mode_ref_delta_enabled ? 1 : 0;
+    pp->mode_ref_delta_update    = d->picture_parameter.mode_ref_delta_update ? 1 : 0;
+    pp->use_prev_in_find_mv_refs = 0;   /* TODO: not signalled in virgl desc */
+
+    memcpy(pp->ref_deltas,  d->picture_parameter.ref_deltas,  4);
+    memcpy(pp->mode_deltas, d->picture_parameter.mode_deltas, 2);
+
+    pp->base_qindex   = d->picture_parameter.base_qindex;
+    pp->y_dc_delta_q  = d->picture_parameter.y_dc_delta_q;
+    pp->uv_dc_delta_q = d->picture_parameter.uv_dc_delta_q;
+    pp->uv_ac_delta_q = d->picture_parameter.uv_ac_delta_q;
+
+    /* Segmentation */
+    pp->stVP9Segments.enabled =
+        d->picture_parameter.pic_fields.segmentation_enabled;
+    pp->stVP9Segments.update_map =
+        d->picture_parameter.pic_fields.segmentation_update_map;
+    pp->stVP9Segments.temporal_update =
+        d->picture_parameter.pic_fields.segmentation_temporal_update;
+    pp->stVP9Segments.abs_delta = d->picture_parameter.abs_delta;
+    memcpy(pp->stVP9Segments.tree_probs,
+           d->picture_parameter.mb_segment_tree_probs, 7);
+    memcpy(pp->stVP9Segments.pred_probs,
+           d->picture_parameter.segment_pred_probs, 3);
+    /* Per-segment filter_level / QP deltas: virgl packs in seg_param[].
+     * DXVA DXVA_segmentation_VP9.feature_data is SHORT[8][4]:
+     *   [seg][0] = luma AC QP delta
+     *   [seg][1] = luma loop-filter delta
+     *   [seg][2] = ref frame (used only when ref-enabled bit set)
+     *   [seg][3] = skip (0/1)
+     * virgl's per-seg filter/QP deltas come from slice_parameter.seg_param;
+     * the DXVA mask encodes which features are active per segment. */
+    for (i = 0; i < 8; i++) {
+        const struct virgl_vp9_segment_parameter *sp =
+            &d->slice_parameter.seg_param[i];
+        UCHAR mask = 0;
+
+        pp->stVP9Segments.feature_data[i][0] = sp->luma_ac_quant_scale;
+        /* The "loop-filter-level" DXVA field expects a signed delta; virgl
+         * stores per-(ref,mode) 4x2 level array. Pick ref=0/mode=0 (intra)
+         * as the primary loop filter level delta. */
+        pp->stVP9Segments.feature_data[i][1] = (SHORT)sp->filter_level[0][0];
+        pp->stVP9Segments.feature_data[i][2] =
+            sp->segment_flags.segment_reference;
+        pp->stVP9Segments.feature_data[i][3] =
+            sp->segment_flags.segment_reference_skipped;
+
+        /* feature_mask bits (per DXVA): alt_q, alt_lf, ref, skip. */
+        if (sp->luma_ac_quant_scale || sp->luma_dc_quant_scale ||
+            sp->chroma_ac_quant_scale || sp->chroma_dc_quant_scale)
+            mask |= 0x1;
+        if (sp->filter_level[0][0])
+            mask |= 0x2;
+        if (sp->segment_flags.segment_reference_enabled)
+            mask |= 0x4;
+        if (sp->segment_flags.segment_reference_skipped)
+            mask |= 0x8;
+        pp->stVP9Segments.feature_mask[i] = mask;
+    }
+
+    pp->log2_tile_cols = d->picture_parameter.log2_tile_columns;
+    pp->log2_tile_rows = d->picture_parameter.log2_tile_rows;
+    pp->uncompressed_header_size_byte_aligned =
+        d->picture_parameter.frame_header_length_in_bytes;
+    pp->first_partition_size = d->picture_parameter.first_partition_size;
+
+    pp->StatusReportFeedbackNumber = codec->status_report_feedback++;
+    if (pp->StatusReportFeedbackNumber == 0)
+        pp->StatusReportFeedbackNumber = codec->status_report_feedback++;
+}
+
+static void build_sc_vpx(void *sc_array, unsigned idx,
+                         UINT bs_offset, UINT slice_sz, void *user)
+{
+    DXVA_Slice_VPx_Short *arr = (DXVA_Slice_VPx_Short *)sc_array;
+    (void)user;
+    arr[idx].BSNALunitDataLocation = bs_offset;
+    arr[idx].SliceBytesInBuffer    = slice_sz;
+    arr[idx].wBadSliceChopping     = DXVA_SLICE_CHOPPING_NONE;
+}
+
+static int vp9_decode_bitstream(struct virgl_video_codec *codec,
+                                struct virgl_video_buffer *target,
+                                const struct virgl_vp9_picture_desc *desc,
+                                unsigned num_buffers,
+                                const void * const *buffers,
+                                const unsigned *sizes)
+{
+    DXVA_PicParams_VP9 pp;
+
+    fill_dxva_picparams_vp9(codec, target, desc, &pp);
+
+    /* VP9 has no separate IQ matrix buffer; quantization is per-segment
+     * inside the picture params. */
+    return submit_short_format_decode(codec,
+                                      &pp, (UINT)sizeof(pp),
+                                      NULL, 0,
+                                      (UINT)sizeof(DXVA_Slice_VPx_Short),
+                                      build_sc_vpx, NULL,
+                                      num_buffers, buffers, sizes);
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * AV1 picture-parameter marshalling.
+ *
+ * AV1 is the densest of the four codecs: DXVA_PicParams_AV1 covers
+ * sequence/frame header, tile geometry, segmentation, CDEF, loop
+ * restoration, quantization, film grain and global motion. virgl's
+ * picture_parameter mirrors the same concepts one-to-one (Mesa fills it
+ * from VADecPictureParameterBufferAV1), so the mapping is mechanical.
+ *
+ * Slice control for AV1 uses DXVA_Tile_AV1 (not a short-format slice), one
+ * per tile. virgl slice_parameter carries per-tile offset/size/row/col.
+ * ---------------------------------------------------------------------------
+ */
+
+static void fill_dxva_picparams_av1(struct virgl_video_codec *codec,
+                                    struct virgl_video_buffer *target,
+                                    const struct virgl_av1_picture_desc *desc,
+                                    DXVA_PicParams_AV1 *pp)
+{
+    const struct virgl_av1_picture_desc *d = desc;
+    unsigned i, j;
+    int self_slot;
+
+    memset(pp, 0, sizeof(*pp));
+
+    pp->width       = d->picture_parameter.frame_width;
+    pp->height      = d->picture_parameter.frame_height;
+    pp->max_width   = d->picture_parameter.max_width;
+    pp->max_height  = d->picture_parameter.max_height;
+
+    self_slot = codec_find_or_add_ref_slot(codec, target->id, target);
+    if (self_slot < 0)
+        self_slot = 0;
+    pp->CurrPicTextureIndex = (UCHAR)(self_slot & 0x7F);
+
+    pp->superres_denom = d->picture_parameter.superres_scale_denominator;
+    /* AV1 profile 0 is 8-bit; bit_depth_idx values per AV1 spec:
+     *   0 => 8-bit, 1 => 10-bit, 2 => 12-bit. */
+    switch (d->picture_parameter.bit_depth_idx) {
+    case 0: pp->bitdepth = 8;  break;
+    case 1: pp->bitdepth = 10; break;
+    case 2: pp->bitdepth = 12; break;
+    default: pp->bitdepth = 8; break;
+    }
+    pp->seq_profile = d->picture_parameter.profile;
+
+    /* Tile geometry. AV1 allows up to 64x64 tiles; DXVA stores widths and
+     * heights per-tile-col / per-tile-row. */
+    pp->tiles.cols = d->picture_parameter.tile_cols;
+    pp->tiles.rows = d->picture_parameter.tile_rows;
+    pp->tiles.context_update_id = d->picture_parameter.context_update_tile_id;
+    for (i = 0; i < 64; i++) {
+        pp->tiles.widths[i]  = d->picture_parameter.width_in_sbs[i];
+        pp->tiles.heights[i] = d->picture_parameter.height_in_sbs[i];
+    }
+
+    /* CodingParamToolFlags */
+    pp->coding.use_128x128_superblock =
+        d->picture_parameter.seq_info_fields.use_128x128_superblock;
+    pp->coding.intra_edge_filter =
+        d->picture_parameter.seq_info_fields.enable_intra_edge_filter;
+    pp->coding.interintra_compound =
+        d->picture_parameter.seq_info_fields.enable_interintra_compound;
+    pp->coding.masked_compound =
+        d->picture_parameter.seq_info_fields.enable_masked_compound;
+    pp->coding.warped_motion =
+        d->picture_parameter.pic_info_fields.allow_warped_motion;
+    pp->coding.dual_filter =
+        d->picture_parameter.seq_info_fields.enable_dual_filter;
+    pp->coding.jnt_comp =
+        d->picture_parameter.seq_info_fields.enable_jnt_comp;
+    pp->coding.screen_content_tools =
+        d->picture_parameter.pic_info_fields.allow_screen_content_tools;
+    pp->coding.integer_mv =
+        d->picture_parameter.pic_info_fields.force_integer_mv;
+    pp->coding.cdef =
+        d->picture_parameter.seq_info_fields.enable_cdef;
+    pp->coding.restoration = 0;   /* derived from loop_restoration_fields below */
+    pp->coding.film_grain =
+        d->picture_parameter.seq_info_fields.film_grain_params_present;
+    pp->coding.intrabc =
+        d->picture_parameter.pic_info_fields.allow_intrabc;
+    pp->coding.high_precision_mv =
+        d->picture_parameter.pic_info_fields.allow_high_precision_mv;
+    pp->coding.switchable_motion_mode =
+        d->picture_parameter.pic_info_fields.is_motion_mode_switchable;
+    pp->coding.filter_intra =
+        d->picture_parameter.seq_info_fields.enable_filter_intra;
+    pp->coding.disable_frame_end_update_cdf =
+        d->picture_parameter.pic_info_fields.disable_frame_end_update_cdf;
+    pp->coding.disable_cdf_update =
+        d->picture_parameter.pic_info_fields.disable_cdf_update;
+    pp->coding.reference_mode =
+        d->picture_parameter.mode_control_fields.reference_select;
+    pp->coding.skip_mode =
+        d->picture_parameter.mode_control_fields.skip_mode_present;
+    pp->coding.reduced_tx_set =
+        d->picture_parameter.mode_control_fields.reduced_tx_set_used;
+    pp->coding.superres =
+        d->picture_parameter.pic_info_fields.use_superres;
+    pp->coding.tx_mode =
+        d->picture_parameter.mode_control_fields.tx_mode;
+    pp->coding.use_ref_frame_mvs =
+        d->picture_parameter.pic_info_fields.use_ref_frame_mvs;
+    pp->coding.enable_ref_frame_mvs =
+        d->picture_parameter.seq_info_fields.ref_frame_mvs;
+    pp->coding.reference_frame_update = 1;   /* virgl desc lacks a direct
+                                              * signal; conservative 1 tells
+                                              * driver to update ref state */
+
+    /* FormatAndPictureInfoFlags */
+    pp->format.frame_type =
+        d->picture_parameter.pic_info_fields.frame_type;
+    pp->format.show_frame =
+        d->picture_parameter.pic_info_fields.show_frame;
+    pp->format.showable_frame =
+        d->picture_parameter.pic_info_fields.showable_frame;
+    /* AV1 profile 0 => 4:2:0; subsampling_{x,y} = 1. Higher profiles flip
+     * these bits; we pull them from bit_depth_idx / profile for profile 0
+     * and leave the driver to check against its own CheckVideoDecoderFormat
+     * result for other profiles. */
+    pp->format.subsampling_x = 1;
+    pp->format.subsampling_y = 1;
+    pp->format.mono_chrome =
+        d->picture_parameter.seq_info_fields.mono_chrome;
+
+    pp->primary_ref_frame = d->picture_parameter.primary_ref_frame;
+    pp->order_hint        = d->picture_parameter.order_hint;
+    pp->order_hint_bits   =
+        (UCHAR)(d->picture_parameter.order_hint_bits_minus_1 + 1);
+
+    /* frame_refs[7]: per-ref width/height/global-motion. These indices
+     * point at entries in RefFrameMapTextureIndex[]. */
+    for (i = 0; i < 7; i++) {
+        memset(&pp->frame_refs[i], 0, sizeof(pp->frame_refs[i]));
+        pp->frame_refs[i].Index = d->picture_parameter.ref_frame_idx[i];
+        pp->frame_refs[i].wminvalid = d->picture_parameter.wm[i].invalid ? 1 : 0;
+        pp->frame_refs[i].wmtype    = (UCHAR)(d->picture_parameter.wm[i].wmtype & 0x3);
+        for (j = 0; j < 6; j++)
+            pp->frame_refs[i].wmmat[j] = d->picture_parameter.wm[i].wmmat[j];
+        /* Per-ref coded width/height: pull from our tracked ref buffers if
+         * available; otherwise use current-frame size. */
+        pp->frame_refs[i].width  = d->picture_parameter.frame_width;
+        pp->frame_refs[i].height = d->picture_parameter.frame_height;
+    }
+
+    /* RefFrameMapTextureIndex: 8 entries, mapping AV1 ref-slot -> decode
+     * texture slot. */
+    for (i = 0; i < 8; i++)
+        pp->RefFrameMapTextureIndex[i] = 0xFF;
+    for (i = 0; i < 8; i++) {
+        uint32_t bid = d->ref[i];
+        int slot;
+        if (bid == 0)
+            continue;
+        slot = codec_find_or_add_ref_slot(codec, bid, NULL);
+        if (slot < 0)
+            continue;
+        pp->RefFrameMapTextureIndex[i] = (UCHAR)(slot & 0x7F);
+    }
+
+    /* Loop filter */
+    pp->loop_filter.filter_level[0] = d->picture_parameter.filter_level[0];
+    pp->loop_filter.filter_level[1] = d->picture_parameter.filter_level[1];
+    pp->loop_filter.filter_level_u  = d->picture_parameter.filter_level_u;
+    pp->loop_filter.filter_level_v  = d->picture_parameter.filter_level_v;
+    pp->loop_filter.sharpness_level =
+        d->picture_parameter.loop_filter_info_fields.sharpness_level;
+    pp->loop_filter.mode_ref_delta_enabled =
+        d->picture_parameter.loop_filter_info_fields.mode_ref_delta_enabled;
+    pp->loop_filter.mode_ref_delta_update =
+        d->picture_parameter.loop_filter_info_fields.mode_ref_delta_update;
+    pp->loop_filter.delta_lf_multi =
+        d->picture_parameter.mode_control_fields.delta_lf_multi;
+    pp->loop_filter.delta_lf_present =
+        d->picture_parameter.mode_control_fields.delta_lf_present_flag;
+    for (i = 0; i < 8; i++)
+        pp->loop_filter.ref_deltas[i] = d->picture_parameter.ref_deltas[i];
+    pp->loop_filter.mode_deltas[0] = d->picture_parameter.mode_deltas[0];
+    pp->loop_filter.mode_deltas[1] = d->picture_parameter.mode_deltas[1];
+    pp->loop_filter.delta_lf_res =
+        (UCHAR)d->picture_parameter.mode_control_fields.log2_delta_lf_res;
+    pp->loop_filter.frame_restoration_type[0] =
+        (UCHAR)d->picture_parameter.loop_restoration_fields.yframe_restoration_type;
+    pp->loop_filter.frame_restoration_type[1] =
+        (UCHAR)d->picture_parameter.loop_restoration_fields.cbframe_restoration_type;
+    pp->loop_filter.frame_restoration_type[2] =
+        (UCHAR)d->picture_parameter.loop_restoration_fields.crframe_restoration_type;
+    pp->loop_filter.log2_restoration_unit_size[0] =
+        d->picture_parameter.lr_unit_size[0];
+    pp->loop_filter.log2_restoration_unit_size[1] =
+        d->picture_parameter.lr_unit_size[1];
+    pp->loop_filter.log2_restoration_unit_size[2] =
+        d->picture_parameter.lr_unit_size[2];
+
+    /* Set loop-restoration enable bit based on whether any plane has it on. */
+    if (pp->loop_filter.frame_restoration_type[0] ||
+        pp->loop_filter.frame_restoration_type[1] ||
+        pp->loop_filter.frame_restoration_type[2])
+        pp->coding.restoration = 1;
+
+    /* Quantization */
+    pp->quantization.delta_q_present =
+        d->picture_parameter.mode_control_fields.delta_q_present_flag;
+    pp->quantization.delta_q_res =
+        d->picture_parameter.mode_control_fields.log2_delta_q_res;
+    pp->quantization.base_qindex  = d->picture_parameter.base_qindex;
+    pp->quantization.y_dc_delta_q = d->picture_parameter.y_dc_delta_q;
+    pp->quantization.u_dc_delta_q = d->picture_parameter.u_dc_delta_q;
+    pp->quantization.v_dc_delta_q = d->picture_parameter.v_dc_delta_q;
+    pp->quantization.u_ac_delta_q = d->picture_parameter.u_ac_delta_q;
+    pp->quantization.v_ac_delta_q = d->picture_parameter.v_ac_delta_q;
+    pp->quantization.qm_y = (UCHAR)d->picture_parameter.qmatrix_fields.qm_y;
+    pp->quantization.qm_u = (UCHAR)d->picture_parameter.qmatrix_fields.qm_u;
+    pp->quantization.qm_v = (UCHAR)d->picture_parameter.qmatrix_fields.qm_v;
+
+    /* CDEF */
+    pp->cdef.damping = (UCHAR)(d->picture_parameter.cdef_damping_minus_3 & 0x3);
+    pp->cdef.bits    = (UCHAR)(d->picture_parameter.cdef_bits & 0x3);
+    for (i = 0; i < 8; i++) {
+        pp->cdef.y_strengths[i].combined  = d->picture_parameter.cdef_y_strengths[i];
+        pp->cdef.uv_strengths[i].combined = d->picture_parameter.cdef_uv_strengths[i];
+    }
+
+    pp->interp_filter = d->picture_parameter.interp_filter;
+
+    /* Segmentation */
+    pp->segmentation.enabled =
+        d->picture_parameter.seg_info.segment_info_fields.enabled;
+    pp->segmentation.update_map =
+        d->picture_parameter.seg_info.segment_info_fields.update_map;
+    pp->segmentation.update_data =
+        d->picture_parameter.seg_info.segment_info_fields.update_data;
+    pp->segmentation.temporal_update =
+        d->picture_parameter.seg_info.segment_info_fields.temporal_update;
+    for (i = 0; i < 8; i++) {
+        pp->segmentation.feature_mask[i].mask =
+            d->picture_parameter.seg_info.feature_mask[i];
+        for (j = 0; j < 8; j++)
+            pp->segmentation.feature_data[i][j] =
+                d->picture_parameter.seg_info.feature_data[i][j];
+    }
+
+    /* Film grain */
+    pp->film_grain.apply_grain =
+        d->picture_parameter.film_grain_info.film_grain_info_fields.apply_grain;
+    pp->film_grain.scaling_shift_minus8 =
+        d->picture_parameter.film_grain_info.film_grain_info_fields.grain_scaling_minus_8;
+    pp->film_grain.chroma_scaling_from_luma =
+        d->picture_parameter.film_grain_info.film_grain_info_fields.chroma_scaling_from_luma;
+    pp->film_grain.ar_coeff_lag =
+        d->picture_parameter.film_grain_info.film_grain_info_fields.ar_coeff_lag;
+    pp->film_grain.ar_coeff_shift_minus6 =
+        d->picture_parameter.film_grain_info.film_grain_info_fields.ar_coeff_shift_minus_6;
+    pp->film_grain.grain_scale_shift =
+        d->picture_parameter.film_grain_info.film_grain_info_fields.grain_scale_shift;
+    pp->film_grain.overlap_flag =
+        d->picture_parameter.film_grain_info.film_grain_info_fields.overlap_flag;
+    pp->film_grain.clip_to_restricted_range =
+        d->picture_parameter.film_grain_info.film_grain_info_fields.clip_to_restricted_range;
+    pp->film_grain.matrix_coeff_is_identity = 0;   /* TODO: derive from
+                                                    * matrix_coefficients==AV1_MC_IDENTITY */
+    pp->film_grain.grain_seed =
+        d->picture_parameter.film_grain_info.grain_seed;
+    pp->film_grain.num_y_points =
+        d->picture_parameter.film_grain_info.num_y_points;
+    pp->film_grain.num_cb_points =
+        d->picture_parameter.film_grain_info.num_cb_points;
+    pp->film_grain.num_cr_points =
+        d->picture_parameter.film_grain_info.num_cr_points;
+    for (i = 0; i < 14; i++) {
+        pp->film_grain.scaling_points_y[i][0] =
+            d->picture_parameter.film_grain_info.point_y_value[i];
+        pp->film_grain.scaling_points_y[i][1] =
+            d->picture_parameter.film_grain_info.point_y_scaling[i];
+    }
+    for (i = 0; i < 10; i++) {
+        pp->film_grain.scaling_points_cb[i][0] =
+            d->picture_parameter.film_grain_info.point_cb_value[i];
+        pp->film_grain.scaling_points_cb[i][1] =
+            d->picture_parameter.film_grain_info.point_cb_scaling[i];
+        pp->film_grain.scaling_points_cr[i][0] =
+            d->picture_parameter.film_grain_info.point_cr_value[i];
+        pp->film_grain.scaling_points_cr[i][1] =
+            d->picture_parameter.film_grain_info.point_cr_scaling[i];
+    }
+    for (i = 0; i < 24; i++)
+        pp->film_grain.ar_coeffs_y[i] =
+            (UCHAR)d->picture_parameter.film_grain_info.ar_coeffs_y[i];
+    for (i = 0; i < 25; i++) {
+        pp->film_grain.ar_coeffs_cb[i] =
+            (UCHAR)d->picture_parameter.film_grain_info.ar_coeffs_cb[i];
+        pp->film_grain.ar_coeffs_cr[i] =
+            (UCHAR)d->picture_parameter.film_grain_info.ar_coeffs_cr[i];
+    }
+    pp->film_grain.cb_mult      = d->picture_parameter.film_grain_info.cb_mult;
+    pp->film_grain.cb_luma_mult = d->picture_parameter.film_grain_info.cb_luma_mult;
+    pp->film_grain.cr_mult      = d->picture_parameter.film_grain_info.cr_mult;
+    pp->film_grain.cr_luma_mult = d->picture_parameter.film_grain_info.cr_luma_mult;
+    pp->film_grain.cb_offset    =
+        (SHORT)d->picture_parameter.film_grain_info.cb_offset;
+    pp->film_grain.cr_offset    =
+        (SHORT)d->picture_parameter.film_grain_info.cr_offset;
+
+    pp->StatusReportFeedbackNumber = codec->status_report_feedback++;
+    if (pp->StatusReportFeedbackNumber == 0)
+        pp->StatusReportFeedbackNumber = codec->status_report_feedback++;
+}
+
+/* AV1 slice control is a DXVA_Tile_AV1 array, one per submitted OBU-tile.
+ * virgl slice_parameter carries 1:1 per-tile offset/size/row/col/anchor. */
+struct av1_sc_ctx {
+    const struct virgl_av1_picture_desc *desc;
+};
+
+static void build_sc_av1(void *sc_array, unsigned idx,
+                         UINT bs_offset, UINT slice_sz, void *user)
+{
+    DXVA_Tile_AV1 *arr = (DXVA_Tile_AV1 *)sc_array;
+    struct av1_sc_ctx *ctx = (struct av1_sc_ctx *)user;
+
+    arr[idx].DataOffset    = bs_offset;
+    arr[idx].DataSize      = slice_sz;
+    arr[idx].row           = (idx < 256) ?
+        ctx->desc->slice_parameter.slice_data_row[idx] : 0;
+    arr[idx].column        = (idx < 256) ?
+        ctx->desc->slice_parameter.slice_data_col[idx] : 0;
+    arr[idx].anchor_frame  = (idx < 256) ?
+        ctx->desc->slice_parameter.slice_data_anchor_frame_idx[idx] : 0xFF;
+    arr[idx].Reserved16Bits = 0;
+    arr[idx].Reserved8Bits  = 0;
+}
+
+static int av1_decode_bitstream(struct virgl_video_codec *codec,
+                                struct virgl_video_buffer *target,
+                                const struct virgl_av1_picture_desc *desc,
+                                unsigned num_buffers,
+                                const void * const *buffers,
+                                const unsigned *sizes)
+{
+    DXVA_PicParams_AV1 pp;
+    struct av1_sc_ctx ctx = { .desc = desc };
+
+    fill_dxva_picparams_av1(codec, target, desc, &pp);
+
+    /* AV1 has no IQ-matrix buffer (quantization is per-segment in pic
+     * params). Slice-control element is DXVA_Tile_AV1. */
+    return submit_short_format_decode(codec,
+                                      &pp, (UINT)sizeof(pp),
+                                      NULL, 0,
+                                      (UINT)sizeof(DXVA_Tile_AV1),
+                                      build_sc_av1, &ctx,
+                                      num_buffers, buffers, sizes);
+}
+
 int virgl_video_decode_bitstream(struct virgl_video_codec *codec,
                                  struct virgl_video_buffer *target,
                                  const union virgl_picture_desc *desc,
@@ -1240,7 +2498,19 @@ int virgl_video_decode_bitstream(struct virgl_video_codec *codec,
     case PIPE_VIDEO_PROFILE_MPEG4_AVC_HIGH:
         return h264_decode_bitstream(codec, target, &desc->h264,
                                      num_buffers, buffers, sizes);
-    /* TODO future codec: HEVC, VP9, AV1, MPEG2 go here. */
+    case PIPE_VIDEO_PROFILE_HEVC_MAIN:
+    case PIPE_VIDEO_PROFILE_HEVC_MAIN_STILL:
+    case PIPE_VIDEO_PROFILE_HEVC_MAIN_10:
+        return hevc_decode_bitstream(codec, target, &desc->h265,
+                                     num_buffers, buffers, sizes);
+    case PIPE_VIDEO_PROFILE_VP9_PROFILE0:
+    case PIPE_VIDEO_PROFILE_VP9_PROFILE2:
+        return vp9_decode_bitstream(codec, target, &desc->vp9,
+                                    num_buffers, buffers, sizes);
+    case PIPE_VIDEO_PROFILE_AV1_MAIN:
+        return av1_decode_bitstream(codec, target, &desc->av1,
+                                    num_buffers, buffers, sizes);
+    /* TODO future codec: MPEG2 goes here. */
     default:
         virgl_error("virgl_video_win32: profile %d not implemented\n",
                     (int)codec->profile);
