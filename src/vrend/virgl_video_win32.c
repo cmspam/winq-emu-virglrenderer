@@ -139,6 +139,22 @@ DEFINE_GUID(MF_LOW_LATENCY_local,
  * 7 active frame_refs — 16 is sufficient for all four codecs. */
 #define VIRGL_VIDEO_WIN32_MAX_REFS 16
 
+/* Size of the shared Decoded Picture Buffer (DPB) texture array owned by each
+ * codec. DXVA uses RefFrameList[i].Index7Bits to identify which array slice of
+ * the shared NV12/P010 texture the GPU decoder should sample as a reference
+ * for inter-prediction. The DPB size must accommodate the worst-case number
+ * of in-flight decoded pictures:
+ *   H.264 Level 5.1: max_dec_frame_buffering = 16 + 1 current = 17
+ *   HEVC Main 6.0:   sps_max_dec_pic_buffering_minus1 + 1 (<= 16) + 1 = 17
+ *   VP9:             8 reference slots + 1 current = 9
+ *   AV1:             8 reference slots + 1 current = 9
+ * We pick 17 as a single value that fits all four codecs.
+ *
+ * The slot index fits in 7 bits (DXVA_PicEntry.Index7Bits), so the ceiling is
+ * 127; 17 is comfortably below that. A 3840x2160 NV12 array at slice 17 is
+ * ~106 MiB of GPU memory, which is acceptable. */
+#define VIRGL_VIDEO_WIN32_DPB_SIZE 17
+
 /* AV1 VLD Profile 0 GUID. The D3D11 public headers bundled with MinGW don't
  * always expose D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0, so we define the
  * value here. dxva.h does provide DXVA_ModeAV1_VLD_Profile0 with the same
@@ -174,11 +190,17 @@ struct virgl_video_buffer {
      * address cast to uint32_t since we don't maintain a surface-id table. */
     uint32_t id;
 
-    /* The decoder-writable NV12 texture. Created with D3D11_BIND_DECODER and
-     * a single array slice so the ID3D11VideoDecoderOutputView can point at
-     * it directly. */
-    ID3D11Texture2D *decode_tex;
-    ID3D11VideoDecoderOutputView *decode_view;
+    /* Index of the array slice in the decoder's shared DPB texture
+     * (codec->decode_tex_array) currently backing this buffer, or -1 when
+     * unassigned. Set by virgl_video_begin_frame(); the inter-prediction
+     * RefFrameList/RefPicList/ref_frame_map entries for downstream frames
+     * reference this slot. current_codec_holder points at the codec whose
+     * DPB holds the slot, so destroy_buffer can punch out the back-reference
+     * when the buffer dies while still holding a slot. A buffer can only
+     * live in one codec's DPB at a time in our design — DXVA pic entries
+     * are scoped to a single decoder. */
+    int current_slot_in_codec;
+    struct virgl_video_codec *current_codec_holder;
 
     /* Single NV12 staging texture we Map to read Y+UV data back. Y lives
      * at mapped.pData, UV at an offset the driver chooses (queried via
@@ -240,13 +262,31 @@ struct virgl_video_codec {
     uint32_t status_report_feedback;
 
     /* Reference-frame tracking. We map each ref frame's guest-visible id (the
-     * 32-bit handle Mesa passes in desc->buffer_id[]) to the backing NV12
-     * texture's array slice index, so the decoder knows which slots in its
-     * RefFrameList correspond to which prior decoded pictures. */
+     * 32-bit handle Mesa passes in desc->buffer_id[]) to its backing
+     * virgl_video_buffer*. The slice the buffer currently occupies in the DPB
+     * array is stored on the buffer itself (current_slot_in_codec). */
     struct {
         uint32_t buffer_id;            /* Guest ref id; 0 when slot unused */
         struct virgl_video_buffer *buf;
     } refs[VIRGL_VIDEO_WIN32_MAX_REFS];
+
+    /* Shared Decoded Picture Buffer. DXVA inter-prediction requires every
+     * reference frame (and the current frame) to live in slices of one shared
+     * ID3D11Texture2D array; RefFrameList[i].Index7Bits identifies which slice
+     * holds which reference. Per-buffer standalone textures cannot be fed to
+     * the hardware decoder for multi-ref prediction.
+     *
+     * decode_tex_array is sized (codec->width, codec->height, ArraySize = DPB_SIZE).
+     * slot_views[i] is an ID3D11VideoDecoderOutputView for array slice i.
+     * slot_buffer[i] maps the slice back to the virgl_video_buffer currently
+     *   occupying it, or NULL if the slot is free.
+     * slot_last_used[i] is an LRU tick for eviction when all slots are in use. */
+    ID3D11Texture2D *decode_tex_array;
+    ID3D11VideoDecoderOutputView *slot_views[VIRGL_VIDEO_WIN32_DPB_SIZE];
+    struct virgl_video_buffer *slot_buffer[VIRGL_VIDEO_WIN32_DPB_SIZE];
+    uint64_t slot_last_used[VIRGL_VIDEO_WIN32_DPB_SIZE];
+    uint64_t lru_tick;
+    DXGI_FORMAT dpb_format;
 
     /* --------------------------------------------------------------
      * Encode-only state (populated lazily for ENCODE entrypoint codecs).
@@ -1037,6 +1077,7 @@ struct virgl_video_codec *virgl_video_create_codec(
      * the matching DXGI format independently. */
     desc.OutputFormat = profile_wants_10bit_output(args->profile) ?
                         DXGI_FORMAT_P010 : DXGI_FORMAT_NV12;
+    codec->dpb_format = desc.OutputFormat;
 
     if (pick_decoder_config(codec, &desc, &codec->config) != 0)
         goto fail;
@@ -1050,6 +1091,60 @@ struct virgl_video_codec *virgl_video_create_codec(
         goto fail;
     }
 
+    /* Allocate the shared DPB texture array (one slice per in-flight frame)
+     * and its per-slice decoder output views. DXVA inter-prediction reads
+     * references out of array slices of a single NV12/P010 texture; each
+     * view binds one slice for DecoderBeginFrame. */
+    {
+        D3D11_TEXTURE2D_DESC arr;
+        unsigned s;
+        uint32_t cw = (codec->width  + 1u) & ~1u;
+        uint32_t ch = (codec->height + 1u) & ~1u;
+
+        memset(&arr, 0, sizeof(arr));
+        arr.Width = cw;
+        arr.Height = ch;
+        arr.MipLevels = 1;
+        arr.ArraySize = VIRGL_VIDEO_WIN32_DPB_SIZE;
+        arr.Format = codec->dpb_format;
+        arr.SampleDesc.Count = 1;
+        arr.Usage = D3D11_USAGE_DEFAULT;
+        arr.BindFlags = D3D11_BIND_DECODER;
+        arr.CPUAccessFlags = 0;
+        arr.MiscFlags = 0;
+
+        hr = ID3D11Device_CreateTexture2D(g_vid.device, &arr, NULL,
+                                          &codec->decode_tex_array);
+        if (FAILED(hr) || !codec->decode_tex_array) {
+            virgl_error("virgl_video_win32: CreateTexture2D(DPB array) "
+                        "%ux%ux%u failed: 0x%lx\n",
+                        cw, ch, VIRGL_VIDEO_WIN32_DPB_SIZE,
+                        (unsigned long)hr);
+            goto fail;
+        }
+
+        for (s = 0; s < VIRGL_VIDEO_WIN32_DPB_SIZE; s++) {
+            D3D11_VIDEO_DECODER_OUTPUT_VIEW_DESC view;
+            memset(&view, 0, sizeof(view));
+            view.DecodeProfile = codec->dxva_profile;
+            view.ViewDimension = D3D11_VDOV_DIMENSION_TEXTURE2D;
+            view.Texture2D.ArraySlice = s;
+            hr = ID3D11VideoDevice_CreateVideoDecoderOutputView(
+                    g_vid.video_device,
+                    (ID3D11Resource *)codec->decode_tex_array,
+                    &view,
+                    &codec->slot_views[s]);
+            if (FAILED(hr) || !codec->slot_views[s]) {
+                virgl_error("virgl_video_win32: CreateVideoDecoderOutputView "
+                            "slot %u failed: 0x%lx\n", s, (unsigned long)hr);
+                goto fail;
+            }
+            codec->slot_buffer[s] = NULL;
+            codec->slot_last_used[s] = 0;
+        }
+        codec->lru_tick = 0;
+    }
+
     return codec;
 
 fail:
@@ -1059,8 +1154,28 @@ fail:
 
 void virgl_video_destroy_codec(struct virgl_video_codec *codec)
 {
+    unsigned s;
+
     if (!codec)
         return;
+
+    /* Detach each slot from its occupant buffer so subsequent codecs can
+     * reassign the buffer without a stale slot index hanging around. */
+    for (s = 0; s < VIRGL_VIDEO_WIN32_DPB_SIZE; s++) {
+        if (codec->slot_buffer[s]) {
+            codec->slot_buffer[s]->current_slot_in_codec = -1;
+            codec->slot_buffer[s]->current_codec_holder = NULL;
+            codec->slot_buffer[s] = NULL;
+        }
+        if (codec->slot_views[s]) {
+            ID3D11VideoDecoderOutputView_Release(codec->slot_views[s]);
+            codec->slot_views[s] = NULL;
+        }
+    }
+    if (codec->decode_tex_array) {
+        ID3D11Texture2D_Release(codec->decode_tex_array);
+        codec->decode_tex_array = NULL;
+    }
     if (codec->decoder) {
         ID3D11VideoDecoder_Release(codec->decoder);
         codec->decoder = NULL;
@@ -1083,10 +1198,16 @@ void *virgl_video_codec_opaque_data(struct virgl_video_codec *codec)
 /*
  * ---------------------------------------------------------------------------
  * Video buffers. Each buffer owns:
- *   - decode_tex : BIND_DECODER NV12 texture, the actual DXVA output surface.
- *   - decode_view: VideoDecoderOutputView pointed at decode_tex array slice 0.
- *   - staging_tex: USAGE_STAGING, CPU-readable NV12 texture; copy target for
- *                  the post-decode readback.
+ *   - staging_tex: USAGE_STAGING, CPU-readable NV12/P010 texture; copy target
+ *                  for the post-decode readback. Per-buffer (CPU readback is
+ *                  not performance critical, and different buffers may be
+ *                  read back concurrently).
+ *
+ * The actual decoder-writable texture lives on the codec as a shared
+ * ID3D11Texture2D with ArraySize = VIRGL_VIDEO_WIN32_DPB_SIZE. begin_frame()
+ * assigns one slice of that array to the buffer (tracked via
+ * buffer->current_slot_in_codec); end_frame() copies from the slice into the
+ * staging texture.
  * ---------------------------------------------------------------------------
  */
 
@@ -1136,29 +1257,7 @@ struct virgl_video_buffer *virgl_video_create_buffer(
     buf->interlaced = args->interlaced;
     buf->opaque = args->opaque;
     buf->id = (uint32_t)(uintptr_t)buf;   /* stable while buf lives */
-
-    /* Decoder-writable NV12 texture. BIND_DECODER is the critical flag; a
-     * single array slice keeps slot 0 addressing simple. */
-    memset(&tex, 0, sizeof(tex));
-    tex.Width = buf->width;
-    tex.Height = buf->height;
-    tex.MipLevels = 1;
-    tex.ArraySize = 1;
-    tex.Format = fmt;
-    tex.SampleDesc.Count = 1;
-    tex.Usage = D3D11_USAGE_DEFAULT;
-    tex.BindFlags = D3D11_BIND_DECODER;
-    tex.CPUAccessFlags = 0;
-    tex.MiscFlags = 0;
-
-    hr = ID3D11Device_CreateTexture2D(g_vid.device, &tex, NULL,
-                                      &buf->decode_tex);
-    if (FAILED(hr)) {
-        virgl_error("virgl_video_win32: CreateTexture2D(decode) "
-                    "%ux%u failed: 0x%lx\n",
-                    buf->width, buf->height, (unsigned long)hr);
-        goto fail;
-    }
+    buf->current_slot_in_codec = -1;
 
     /* Single NV12 staging texture matching the decoder output layout. */
     memset(&tex, 0, sizeof(tex));
@@ -1181,11 +1280,6 @@ struct virgl_video_buffer *virgl_video_create_buffer(
         goto fail;
     }
 
-    /* The VideoDecoderOutputView is created lazily in begin_frame(); we need
-     * the decoder object for that, which the codec may not exist yet at this
-     * point (buffers and codecs are created independently by vrend_video). */
-    buf->decode_view = NULL;
-
     return buf;
 
 fail:
@@ -1200,14 +1294,30 @@ void virgl_video_destroy_buffer(struct virgl_video_buffer *buffer)
 
     unmap_staging_if_needed(buffer);
 
-    if (buffer->decode_view) {
-        ID3D11VideoDecoderOutputView_Release(buffer->decode_view);
-        buffer->decode_view = NULL;
+    /* If this buffer currently occupies a slot in a codec's DPB, punch out
+     * the codec's back-reference so the slot is freed (and doesn't point at
+     * released memory on the next LRU scan). The codec's refs[] table also
+     * caches buffer pointers; clear matching entries there too. */
+    if (buffer->current_codec_holder) {
+        struct virgl_video_codec *c = buffer->current_codec_holder;
+        unsigned i;
+        if (buffer->current_slot_in_codec >= 0 &&
+            buffer->current_slot_in_codec < VIRGL_VIDEO_WIN32_DPB_SIZE &&
+            c->slot_buffer[buffer->current_slot_in_codec] == buffer) {
+            c->slot_buffer[buffer->current_slot_in_codec] = NULL;
+        }
+        for (i = 0; i < VIRGL_VIDEO_WIN32_MAX_REFS; i++) {
+            if (c->refs[i].buf == buffer) {
+                c->refs[i].buf = NULL;
+                /* buffer_id stays — the id-to-nonexistent-buf mapping will
+                 * be skipped by the "buf must be live" guard in picparam
+                 * fills. */
+            }
+        }
+        buffer->current_codec_holder = NULL;
+        buffer->current_slot_in_codec = -1;
     }
-    if (buffer->decode_tex) {
-        ID3D11Texture2D_Release(buffer->decode_tex);
-        buffer->decode_tex = NULL;
-    }
+
     if (buffer->staging_tex) {
         ID3D11Texture2D_Release(buffer->staging_tex);
         buffer->staging_tex = NULL;
@@ -1235,39 +1345,53 @@ void *virgl_video_buffer_opaque_data(struct virgl_video_buffer *buffer)
  * ---------------------------------------------------------------------------
  * Reference-frame bookkeeping.
  *
- * The DXVA H.264 RefFrameList[16] stores DXVA_PicEntry_H264 entries with an
- * Index7Bits slot number and an AssociatedFlag bit. Driver-wise, the slot
- * number is just an index the host decoder agreed on with itself: we use it
- * as an opaque tag that must be distinct per in-flight reference frame. We
- * keep our own codec->refs[] table and look up entries by buffer_id (the
- * guest-side handle Mesa passes in virgl_h264_picture_desc::buffer_id[]).
+ * DXVA inter-prediction requires each reference in RefFrameList[] /
+ * RefPicList[] / ref_frame_map[] / RefFrameMapTextureIndex[] to carry the
+ * DPB array-slice index of the corresponding prior decoded frame. The slice
+ * index lives on the virgl_video_buffer itself (current_slot_in_codec,
+ * assigned by begin_frame), but Mesa identifies references by their opaque
+ * guest-visible buffer id, not by pointer. codec->refs[] is the
+ * id-to-virgl_video_buffer* cache used when filling picparams: each time a
+ * buffer is the target of begin_frame, or shows up as a reference in a
+ * picture desc, we remember its pointer here so the next frame's picparam
+ * marshalling can translate its id back to a buffer and thus to a DPB slot.
  * ---------------------------------------------------------------------------
  */
 
-static int codec_find_or_add_ref_slot(struct virgl_video_codec *codec,
-                                      uint32_t buffer_id,
-                                      struct virgl_video_buffer *buf)
+static void codec_remember_ref(struct virgl_video_codec *codec,
+                               uint32_t buffer_id,
+                               struct virgl_video_buffer *buf)
 {
     unsigned i, free_slot = UINT_MAX;
 
     if (buffer_id == 0)
-        return -1;
+        return;
 
     for (i = 0; i < VIRGL_VIDEO_WIN32_MAX_REFS; i++) {
         if (codec->refs[i].buffer_id == buffer_id) {
-            codec->refs[i].buf = buf;
-            return (int)i;
+            if (buf)
+                codec->refs[i].buf = buf;
+            return;
         }
         if (codec->refs[i].buffer_id == 0 && free_slot == UINT_MAX)
             free_slot = i;
     }
-    if (free_slot == UINT_MAX) {
-        /* Evict slot 0; in practice we rarely exceed 16 tracked refs. */
-        free_slot = 0;
-    }
+    if (free_slot == UINT_MAX)
+        free_slot = 0;   /* round-robin evict slot 0 (rarely hit) */
     codec->refs[free_slot].buffer_id = buffer_id;
     codec->refs[free_slot].buf = buf;
-    return (int)free_slot;
+}
+
+/* Back-compat shim: accept the old function name so the per-codec picparam
+ * marshalling can keep its existing "(void)codec_find_or_add_ref_slot(...)"
+ * calls unchanged. Return value is ignored by all callers now — the slot
+ * number they actually use comes from target->current_slot_in_codec. */
+static int codec_find_or_add_ref_slot(struct virgl_video_codec *codec,
+                                      uint32_t buffer_id,
+                                      struct virgl_video_buffer *buf)
+{
+    codec_remember_ref(codec, buffer_id, buf);
+    return 0;
 }
 
 /*
@@ -1276,49 +1400,116 @@ static int codec_find_or_add_ref_slot(struct virgl_video_codec *codec,
  * ---------------------------------------------------------------------------
  */
 
-static HRESULT ensure_decode_view(struct virgl_video_codec *codec,
-                                  struct virgl_video_buffer *buf)
+/* Assign an array slice in codec->decode_tex_array to `target`:
+ *   1. If target already owns a slot on this codec, keep it (monotonic slot
+ *      assignment is required for references from prior frames to stay
+ *      valid).
+ *   2. Otherwise pick a free slot (slot_buffer[i] == NULL).
+ *   3. If none are free, evict the least-recently-used slot. The evicted
+ *      buffer's current_slot_in_codec is cleared so any future picparam
+ *      marshalling will emit the 0xFF "no reference" sentinel for it.
+ *
+ * target must match codec->dpb_format and codec dimensions — we checked that
+ * at the top of begin_frame.
+ */
+static int codec_assign_dpb_slot(struct virgl_video_codec *codec,
+                                 struct virgl_video_buffer *target)
 {
-    D3D11_VIDEO_DECODER_OUTPUT_VIEW_DESC view;
+    unsigned i;
+    int chosen = -1;
+    uint64_t oldest = UINT64_MAX;
 
-    if (buf->decode_view)
-        return S_OK;
+    /* Case 1: already assigned. */
+    if (target->current_codec_holder == codec &&
+        target->current_slot_in_codec >= 0 &&
+        target->current_slot_in_codec < VIRGL_VIDEO_WIN32_DPB_SIZE &&
+        codec->slot_buffer[target->current_slot_in_codec] == target) {
+        codec->slot_last_used[target->current_slot_in_codec] = ++codec->lru_tick;
+        return target->current_slot_in_codec;
+    }
 
-    memset(&view, 0, sizeof(view));
-    view.DecodeProfile = codec->dxva_profile;
-    view.ViewDimension = D3D11_VDOV_DIMENSION_TEXTURE2D;
-    view.Texture2D.ArraySlice = 0;
+    /* Case 2: target is attached to a *different* codec. Detach first. */
+    if (target->current_codec_holder && target->current_codec_holder != codec) {
+        struct virgl_video_codec *old = target->current_codec_holder;
+        if (target->current_slot_in_codec >= 0 &&
+            target->current_slot_in_codec < VIRGL_VIDEO_WIN32_DPB_SIZE &&
+            old->slot_buffer[target->current_slot_in_codec] == target)
+            old->slot_buffer[target->current_slot_in_codec] = NULL;
+        target->current_codec_holder = NULL;
+        target->current_slot_in_codec = -1;
+    }
 
-    return ID3D11VideoDevice_CreateVideoDecoderOutputView(
-                g_vid.video_device,
-                (ID3D11Resource *)buf->decode_tex,
-                &view,
-                &buf->decode_view);
+    /* Case 3: find a free slot. */
+    for (i = 0; i < VIRGL_VIDEO_WIN32_DPB_SIZE; i++) {
+        if (codec->slot_buffer[i] == NULL) {
+            chosen = (int)i;
+            break;
+        }
+    }
+
+    /* Case 4: LRU-evict. In practice this only happens in adversarial streams
+     * that reference more than DPB_SIZE frames. All real H.264/HEVC/VP9/AV1
+     * streams have a max_dec_frame_buffering <= 16 so we should never hit
+     * this path in well-formed content. */
+    if (chosen < 0) {
+        for (i = 0; i < VIRGL_VIDEO_WIN32_DPB_SIZE; i++) {
+            if (codec->slot_last_used[i] < oldest) {
+                oldest = codec->slot_last_used[i];
+                chosen = (int)i;
+            }
+        }
+        if (chosen >= 0 && codec->slot_buffer[chosen]) {
+            struct virgl_video_buffer *victim = codec->slot_buffer[chosen];
+            virgl_warn("virgl_video_win32: DPB full, evicting slot %d "
+                       "(buf id=0x%x)\n", chosen, victim->id);
+            victim->current_slot_in_codec = -1;
+            victim->current_codec_holder  = NULL;
+            codec->slot_buffer[chosen] = NULL;
+        }
+    }
+
+    if (chosen < 0) {
+        /* Should be unreachable — DPB_SIZE > 0, so the LRU walk always picks
+         * something. Belt-and-suspenders fallback. */
+        chosen = 0;
+    }
+
+    codec->slot_buffer[chosen] = target;
+    codec->slot_last_used[chosen] = ++codec->lru_tick;
+    target->current_slot_in_codec = chosen;
+    target->current_codec_holder  = codec;
+    return chosen;
 }
 
 int virgl_video_begin_frame(struct virgl_video_codec *codec,
                             struct virgl_video_buffer *target)
 {
     HRESULT hr;
+    int slot;
 
     if (!g_vid.initialized || !codec || !target || !codec->decoder)
         return -1;
+
+    if (!codec->decode_tex_array) {
+        virgl_error("virgl_video_win32: codec DPB array missing\n");
+        return -1;
+    }
 
     /* If the previous frame's map is still live, release it now. The guest's
      * Mesa driver has already copied out the bytes via the decode_completed
      * callback by the time it sends another begin_frame. */
     unmap_staging_if_needed(target);
 
-    hr = ensure_decode_view(codec, target);
-    if (FAILED(hr) || !target->decode_view) {
-        virgl_error("virgl_video_win32: CreateVideoDecoderOutputView failed: "
-                    "0x%lx\n", (unsigned long)hr);
+    slot = codec_assign_dpb_slot(codec, target);
+    if (slot < 0 || slot >= VIRGL_VIDEO_WIN32_DPB_SIZE ||
+        !codec->slot_views[slot]) {
+        virgl_error("virgl_video_win32: DPB slot assignment failed\n");
         return -1;
     }
 
     hr = ID3D11VideoContext_DecoderBeginFrame(g_vid.video_context,
                                               codec->decoder,
-                                              target->decode_view,
+                                              codec->slot_views[slot],
                                               0, NULL);
     if (FAILED(hr)) {
         virgl_error("virgl_video_win32: DecoderBeginFrame failed: 0x%lx\n",
@@ -1343,8 +1534,12 @@ int virgl_video_begin_frame(struct virgl_video_codec *codec,
 
 static void dxva_picentry_invalidate(DXVA_PicEntry_H264 *e)
 {
+    /* Per DXVA spec: bPicEntry = 0xFF (Index7Bits=0x7F, AssociatedFlag=1) is
+     * the "no valid reference here" sentinel. Drivers reject other
+     * combinations — e.g. Index7Bits=0x7F with AssociatedFlag=0 is interpreted
+     * as a short-term reference at slot 127, which then reads garbage. */
     e->Index7Bits = 0x7F;
-    e->AssociatedFlag = 0;
+    e->AssociatedFlag = 1;
 }
 
 static void fill_dxva_picparams_h264(struct virgl_video_codec *codec,
@@ -1363,11 +1558,18 @@ static void fill_dxva_picparams_h264(struct virgl_video_codec *codec,
     pp->wFrameWidthInMbsMinus1 = (USHORT)((codec->width + 15) / 16 - 1);
     pp->wFrameHeightInMbsMinus1 = (USHORT)((codec->height + 15) / 16 - 1);
 
-    /* CurrPic: we pack "slot 0 in the output view array" with an associated
-     * flag indicating bottom-field when field-coded. */
-    self_slot = codec_find_or_add_ref_slot(codec, target->id, target);
-    if (self_slot < 0)
-        self_slot = 0;
+    /* Also cache the current target in the per-codec refs[] table so that
+     * subsequent frames can resolve buffer_id -> virgl_video_buffer* ->
+     * current_slot_in_codec when marshalling their ref lists. */
+    (void)codec_find_or_add_ref_slot(codec, target->id, target);
+
+    /* CurrPic.Index7Bits must be the DPB slot in codec->decode_tex_array that
+     * the decoder is writing into this frame (set by begin_frame via
+     * codec_assign_dpb_slot). AssociatedFlag is bottom-field-in-field-pair.
+     */
+    self_slot = target->current_slot_in_codec;
+    if (self_slot < 0 || self_slot >= VIRGL_VIDEO_WIN32_DPB_SIZE)
+        self_slot = 0;   /* should be unreachable: begin_frame assigns slot */
     pp->CurrPic.Index7Bits = (UCHAR)(self_slot & 0x7F);
     pp->CurrPic.AssociatedFlag = desc->field_pic_flag && desc->bottom_field_flag;
 
@@ -1417,15 +1619,31 @@ static void fill_dxva_picparams_h264(struct virgl_video_codec *codec,
 
     for (i = 0; i < desc->num_ref_frames && i < 16; i++) {
         uint32_t bid = desc->buffer_id[i];
-        int slot;
+        struct virgl_video_buffer *refbuf = NULL;
+        int slot = -1;
+        unsigned j;
 
         if (bid == 0) {
             pp->NonExistingFrameFlags |= (USHORT)(1u << (i * 1));
             continue;
         }
 
-        slot = codec_find_or_add_ref_slot(codec, bid, NULL);
-        if (slot < 0) {
+        /* Look up the referenced buffer by guest id. If we have a live
+         * mapping, its DPB slot is what the GPU decoder needs to find the
+         * reference pixels. */
+        for (j = 0; j < VIRGL_VIDEO_WIN32_MAX_REFS; j++) {
+            if (codec->refs[j].buffer_id == bid) {
+                refbuf = codec->refs[j].buf;
+                break;
+            }
+        }
+        if (refbuf && refbuf->current_codec_holder == codec)
+            slot = refbuf->current_slot_in_codec;
+
+        if (slot < 0 || slot >= VIRGL_VIDEO_WIN32_DPB_SIZE) {
+            /* Buffer either never decoded in this codec or has since been
+             * evicted from the DPB. Mark non-existing; RefFrameList[i] stays
+             * at the 0xFF sentinel from dxva_picentry_invalidate above. */
             pp->NonExistingFrameFlags |= (USHORT)(1u << (i * 1));
             continue;
         }
@@ -1433,6 +1651,11 @@ static void fill_dxva_picparams_h264(struct virgl_video_codec *codec,
         pp->RefFrameList[i].AssociatedFlag = desc->is_long_term[i] ? 1 : 0;
         pp->FieldOrderCntList[i][0] = (INT)desc->field_order_cnt_list[i][0];
         pp->FieldOrderCntList[i][1] = (INT)desc->field_order_cnt_list[i][1];
+        /* Mesa stores frame_num for short-term refs and long-term pic num
+         * (pic_id / LongTermPicNum) for long-term refs in frame_num_list[i].
+         * When AssociatedFlag=1 (long-term) the DXVA driver interprets
+         * FrameNumList[i] as LongTermPicNum automatically, which matches
+         * ffmpeg's dxva2_h264.c and Mesa's va_dec_h264.c layout. */
         pp->FrameNumList[i] = (USHORT)desc->frame_num_list[i];
 
         /* UsedForReferenceFlags is 2 bits per entry: top + bottom. */
@@ -1440,6 +1663,31 @@ static void fill_dxva_picparams_h264(struct virgl_video_codec *codec,
             pp->UsedForReferenceFlags |= (UINT)(1u << (i * 2 + 0));
         if (desc->bottom_is_reference[i])
             pp->UsedForReferenceFlags |= (UINT)(1u << (i * 2 + 1));
+    }
+
+    /* One-shot diagnostic: first few decodes, dump refs to confirm the DPB
+     * array slices map correctly. Gate on a static counter — logging every
+     * frame drowns the log with tens of KB. */
+    {
+        static unsigned logged = 0;
+        if (logged < 6) {
+            char rl[256] = {0};
+            size_t off = 0;
+            for (i = 0; i < 16 && i < desc->num_ref_frames; i++) {
+                off += (size_t)snprintf(rl + off, sizeof(rl) - off,
+                    " [%u]:bid=%u slot=%d LT=%u fn=%u",
+                    i, desc->buffer_id[i],
+                    (pp->RefFrameList[i].bPicEntry == 0xFF) ? -1 :
+                        pp->RefFrameList[i].Index7Bits,
+                    desc->is_long_term[i], desc->frame_num_list[i]);
+                if (off >= sizeof(rl)) break;
+            }
+            virgl_warn("vid-h264 fr=%u curr_slot=%d num_refs=%u POC=%d/%d fields=%u%s\n",
+                logged, pp->CurrPic.Index7Bits, desc->num_ref_frames,
+                pp->CurrFieldOrderCnt[0], pp->CurrFieldOrderCnt[1],
+                pp->UsedForReferenceFlags, rl);
+            logged++;
+        }
     }
 
     /* Quantization / deblocking parameters. */
@@ -1753,9 +2001,11 @@ static void fill_dxva_picparams_hevc(struct virgl_video_codec *codec,
     pp->NoPicReorderingFlag = 0;
     pp->NoBiPredFlag        = 0;
 
-    /* CurrPic */
-    self_slot = codec_find_or_add_ref_slot(codec, target->id, target);
-    if (self_slot < 0)
+    /* CurrPic: Index7Bits is the DPB slot in codec->decode_tex_array that
+     * the decoder is writing into this frame (assigned by begin_frame). */
+    (void)codec_find_or_add_ref_slot(codec, target->id, target);
+    self_slot = target->current_slot_in_codec;
+    if (self_slot < 0 || self_slot >= VIRGL_VIDEO_WIN32_DPB_SIZE)
         self_slot = 0;
     pp->CurrPic.Index7Bits   = (UCHAR)(self_slot & 0x7F);
     pp->CurrPic.AssociatedFlag = 0;
@@ -1873,14 +2123,26 @@ static void fill_dxva_picparams_hevc(struct virgl_video_codec *codec,
     }
     for (i = 0; i < 15; i++) {
         uint32_t bid = desc->ref[i];
-        int slot;
+        struct virgl_video_buffer *refbuf = NULL;
+        int slot = -1;
+        unsigned j;
 
         if (bid == 0)
             continue;
 
-        slot = codec_find_or_add_ref_slot(codec, bid, NULL);
-        if (slot < 0)
+        for (j = 0; j < VIRGL_VIDEO_WIN32_MAX_REFS; j++) {
+            if (codec->refs[j].buffer_id == bid) {
+                refbuf = codec->refs[j].buf;
+                break;
+            }
+        }
+        if (refbuf && refbuf->current_codec_holder == codec)
+            slot = refbuf->current_slot_in_codec;
+        if (slot < 0 || slot >= VIRGL_VIDEO_WIN32_DPB_SIZE) {
+            /* Ref not resident in our DPB — leave the 0xFF sentinel in
+             * place. */
             continue;
+        }
         pp->RefPicList[i].Index7Bits    = (UCHAR)(slot & 0x7F);
         pp->RefPicList[i].AssociatedFlag = desc->IsLongTerm[i] ? 1 : 0;
         pp->PicOrderCntValList[i] = desc->PicOrderCntVal[i];
@@ -2182,8 +2444,11 @@ static void fill_dxva_picparams_vp9(struct virgl_video_codec *codec,
 
     memset(pp, 0, sizeof(*pp));
 
-    self_slot = codec_find_or_add_ref_slot(codec, target->id, target);
-    if (self_slot < 0)
+    /* Cache the current target and pick its DPB slot (assigned by
+     * begin_frame). */
+    (void)codec_find_or_add_ref_slot(codec, target->id, target);
+    self_slot = target->current_slot_in_codec;
+    if (self_slot < 0 || self_slot >= VIRGL_VIDEO_WIN32_DPB_SIZE)
         self_slot = 0;
     pp->CurrPic.Index7Bits     = (UCHAR)(self_slot & 0x7F);
     pp->CurrPic.AssociatedFlag = 0;
@@ -2222,22 +2487,24 @@ static void fill_dxva_picparams_vp9(struct virgl_video_codec *codec,
     }
     for (i = 0; i < 8; i++) {
         uint32_t bid = d->ref[i];
-        int slot;
+        int slot = -1;
         struct virgl_video_buffer *refbuf = NULL;
+        unsigned j;
 
         if (bid == 0)
             continue;
 
         /* Find tracked buf to extract coded width/height. */
-        for (unsigned j = 0; j < VIRGL_VIDEO_WIN32_MAX_REFS; j++) {
+        for (j = 0; j < VIRGL_VIDEO_WIN32_MAX_REFS; j++) {
             if (codec->refs[j].buffer_id == bid) {
                 refbuf = codec->refs[j].buf;
                 break;
             }
         }
-        slot = codec_find_or_add_ref_slot(codec, bid, refbuf);
-        if (slot < 0)
-            continue;
+        if (refbuf && refbuf->current_codec_holder == codec)
+            slot = refbuf->current_slot_in_codec;
+        if (slot < 0 || slot >= VIRGL_VIDEO_WIN32_DPB_SIZE)
+            continue;   /* leave 0xFF sentinel in place */
         pp->ref_frame_map[i].Index7Bits = (UCHAR)(slot & 0x7F);
         pp->ref_frame_map[i].AssociatedFlag = 0;
         if (refbuf) {
@@ -2413,8 +2680,11 @@ static void fill_dxva_picparams_av1(struct virgl_video_codec *codec,
     pp->max_width   = d->picture_parameter.max_width;
     pp->max_height  = d->picture_parameter.max_height;
 
-    self_slot = codec_find_or_add_ref_slot(codec, target->id, target);
-    if (self_slot < 0)
+    /* CurrPicTextureIndex: DPB slot in codec->decode_tex_array the decoder
+     * is writing into this frame (assigned by begin_frame). */
+    (void)codec_find_or_add_ref_slot(codec, target->id, target);
+    self_slot = target->current_slot_in_codec;
+    if (self_slot < 0 || self_slot >= VIRGL_VIDEO_WIN32_DPB_SIZE)
         self_slot = 0;
     pp->CurrPicTextureIndex = (UCHAR)(self_slot & 0x7F);
 
@@ -2549,11 +2819,20 @@ static void fill_dxva_picparams_av1(struct virgl_video_codec *codec,
         pp->RefFrameMapTextureIndex[i] = 0xFF;
     for (i = 0; i < 8; i++) {
         uint32_t bid = d->ref[i];
-        int slot;
+        struct virgl_video_buffer *refbuf = NULL;
+        int slot = -1;
+        unsigned k;
         if (bid == 0)
             continue;
-        slot = codec_find_or_add_ref_slot(codec, bid, NULL);
-        if (slot < 0)
+        for (k = 0; k < VIRGL_VIDEO_WIN32_MAX_REFS; k++) {
+            if (codec->refs[k].buffer_id == bid) {
+                refbuf = codec->refs[k].buf;
+                break;
+            }
+        }
+        if (refbuf && refbuf->current_codec_holder == codec)
+            slot = refbuf->current_slot_in_codec;
+        if (slot < 0 || slot >= VIRGL_VIDEO_WIN32_DPB_SIZE)
             continue;
         pp->RefFrameMapTextureIndex[i] = (UCHAR)(slot & 0x7F);
     }
@@ -2898,10 +3177,11 @@ int virgl_video_decode_bitstream(struct virgl_video_codec *codec,
  *   - virgl_video_destroy_codec() releases the MFT and drops the MF refcount.
  *
  * NV12 staging texture model: the encode source comes in as a
- * virgl_video_buffer whose decode_tex is NV12. We CopyResource it into the
- * existing staging_tex, Map() the staging, and memcpy into an IMFMediaBuffer.
- * That's the same copy path we already use for decode readback, just in
- * reverse.
+ * virgl_video_buffer whose guest-side GL texture was read back to CPU by
+ * vrend_video.c and stashed in buf->encode_src_nv12 via
+ * virgl_video_buffer_cpu_writeback(). We memcpy that slab into an
+ * IMFMediaBuffer. The (rarely-hit) fallback path also Maps() buf->staging_tex
+ * to read whatever was most recently copied there by an end_frame decode.
  * ---------------------------------------------------------------------------
  */
 
@@ -3255,10 +3535,10 @@ static HRESULT encoder_start_streaming(struct virgl_video_codec *codec)
  * Preferred source is the CPU slab latched by virgl_video_buffer_cpu_writeback
  * (populated by vrend_video.c reading the guest's GL textures with
  * glGetTexImage). If that slab is absent for any reason we fall back to
- * staging the backend's own decode_tex — this only produces meaningful pixels
- * when `source` was filled by a prior decode on the same buffer; for the
- * normal guest-side encode path, relying on that fallback would feed garbage
- * to the MFT, so it exists purely for robustness. */
+ * reading the buffer's staging texture — this only produces meaningful pixels
+ * when `source` was the target of a recent decode on this same buffer; for
+ * the normal guest-side encode path, relying on that fallback would feed
+ * garbage (typically zeroes, i.e. a green frame) to the MFT. */
 static HRESULT encoder_build_sample(struct virgl_video_codec *codec,
                                     struct virgl_video_buffer *source,
                                     bool force_keyframe,
@@ -3291,20 +3571,21 @@ static HRESULT encoder_build_sample(struct virgl_video_codec *codec,
          * blob. Just memcpy it straight into the MF media buffer. */
         memcpy(mdata, source->encode_src_nv12, total);
     } else {
-        /* Fallback: read from the backend's decode_tex via the staging
-         * texture. This yields real pixels only if the same buffer was the
-         * target of a recent decode on this host — not the typical encode
-         * scenario, so if we hit this path during an encoder-only workload
-         * the MFT will see whatever happens to be in the decode_tex (usually
-         * zeroes, i.e. a green frame). */
+        /* Fallback: read whatever's already in the buffer's staging texture.
+         * The encode path normally receives NV12 bytes via
+         * virgl_video_buffer_cpu_writeback() (above), so this branch only
+         * fires when vrend_video.c failed to call that helper — in which case
+         * the staging texture still holds pixels from the most recent decode
+         * on this same buffer (if any) or zeroes (green frame). Previously
+         * this path did a per-buffer decode_tex -> staging copy, but with the
+         * DPB moved onto the codec there's no per-buffer decode texture to
+         * re-stage from; the previously-copied staging content is the best
+         * we can do. */
         UINT y_pitch;
         UINT uv_pitch;
         BYTE *y_src;
         BYTE *uv_src;
 
-        ID3D11DeviceContext_CopyResource(g_vid.context,
-                                         (ID3D11Resource *)source->staging_tex,
-                                         (ID3D11Resource *)source->decode_tex);
         hr = ID3D11DeviceContext_Map(g_vid.context,
                                      (ID3D11Resource *)source->staging_tex,
                                      0, D3D11_MAP_READ, 0, &mapped);
@@ -3666,9 +3947,9 @@ static int encode_one_frame(struct virgl_video_codec *codec,
     /*
      * Ask vrend_video.c to copy the guest-side source NV12 bytes into our
      * per-buffer CPU slab via virgl_video_buffer_cpu_writeback(). Without
-     * this, encoder_build_sample() would fall back to reading the backend's
-     * decode_tex (which is never written on the encode-only path) and the
-     * MFT would see a solid green/zeroed frame every time.
+     * this, encoder_build_sample() would fall back to reading the buffer's
+     * staging texture (which is never written on the encode-only path) and
+     * the MFT would see a solid green/zeroed frame every time.
      *
      * The callback shape matches the libva side (virgl_video_dma_buf), but
      * on Windows the fd fields are unused — vrend_video.c just needs the
@@ -3784,9 +4065,14 @@ int virgl_video_end_frame(struct virgl_video_codec *codec,
                           struct virgl_video_buffer *target)
 {
     HRESULT hr;
+    int slot;
 
     if (!g_vid.initialized || !codec || !target || !codec->decoder)
         return -1;
+    if (!codec->decode_tex_array) {
+        virgl_error("virgl_video_win32: end_frame without DPB array\n");
+        return -1;
+    }
 
     hr = ID3D11VideoContext_DecoderEndFrame(g_vid.video_context,
                                             codec->decoder);
@@ -3798,9 +4084,22 @@ int virgl_video_end_frame(struct virgl_video_codec *codec,
 
     unmap_staging_if_needed(target);
 
-    ID3D11DeviceContext_CopyResource(g_vid.context,
-                                     (ID3D11Resource *)target->staging_tex,
-                                     (ID3D11Resource *)target->decode_tex);
+    /* Copy the just-decoded slice of the DPB array into the per-buffer
+     * staging texture for CPU readback. Staging remains per-buffer so
+     * multiple outputs can be mapped concurrently by the guest. */
+    slot = target->current_slot_in_codec;
+    if (slot < 0 || slot >= VIRGL_VIDEO_WIN32_DPB_SIZE) {
+        virgl_error("virgl_video_win32: end_frame with no DPB slot (slot=%d)\n",
+                    slot);
+        return -1;
+    }
+    ID3D11DeviceContext_CopySubresourceRegion(
+            g_vid.context,
+            (ID3D11Resource *)target->staging_tex, 0, /* DstSubresource */
+            0, 0, 0,
+            (ID3D11Resource *)codec->decode_tex_array,
+            (UINT)slot,                               /* SrcSubresource */
+            NULL);
 
     hr = ID3D11DeviceContext_Map(g_vid.context,
                                  (ID3D11Resource *)target->staging_tex,
