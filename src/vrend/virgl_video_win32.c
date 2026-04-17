@@ -502,7 +502,7 @@ static void fill_caps_for_hevc(struct virgl_video_caps *v,
 {
     v->profile = profile;
     v->entrypoint = PIPE_VIDEO_ENTRYPOINT_BITSTREAM;
-    v->max_level = 153;             /* HEVC Level 5.1 encoded as 30*level */
+    v->max_level = 0;             /* let Mesa compute from attributes */
     v->stacked_frames = 0;
     /* Advertise up to 8K decode so guest Mesa can pick through. Actual
      * support is gated by CheckVideoDecoderFormat + CreateVideoDecoder. */
@@ -529,8 +529,7 @@ static void fill_caps_for_vp9(struct virgl_video_caps *v,
 {
     v->profile = profile;
     v->entrypoint = PIPE_VIDEO_ENTRYPOINT_BITSTREAM;
-    v->max_level = 51;              /* VP9 uses a 0..6.2 level range; the
-                                     * cap is advisory for the guest */
+    v->max_level = 0;
     v->stacked_frames = 0;
     /* Advertised cap (uint16 max_macroblocks overflows past ~4K @ 16x16;
      * Mesa uses max_macroblocks to gate profile advertisement in the guest
@@ -557,7 +556,7 @@ static void fill_caps_for_av1(struct virgl_video_caps *v,
 {
     v->profile = profile;
     v->entrypoint = PIPE_VIDEO_ENTRYPOINT_BITSTREAM;
-    v->max_level = 51;              /* AV1 level 5.1 */
+    v->max_level = 0;
     v->stacked_frames = 0;
     /* Advertised cap (uint16 max_macroblocks overflows past ~4K @ 16x16;
      * Mesa uses max_macroblocks to gate profile advertisement in the guest
@@ -692,6 +691,11 @@ int virgl_video_fill_caps(union virgl_caps *caps)
     }
 
     caps->v2.num_video_caps = out;
+    virgl_warn("virgl_video_win32: fill_caps advertised %u profiles "
+               "(h264=%d hevc_main=%d hevc_m10=%d vp9_p0=%d vp9_p2=%d av1=%d)\n",
+               out,
+               have_h264_nofgt, have_hevc_main, have_hevc_main10,
+               have_vp9_p0, have_vp9_p2, have_av1_p0);
     return 0;
 }
 
