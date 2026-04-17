@@ -457,8 +457,14 @@ static struct virgl_video_callbacks video_callbacks = {
 
 int vrend_video_init(int drm_fd)
 {
+#ifndef _WIN32
+    /* POSIX hosts: libva needs a real DRM render-node fd. */
     if (drm_fd < 0)
         return -1;
+#else
+    /* Windows backend uses D3D11 device enumeration, not a DRM fd. */
+    (void)drm_fd;
+#endif
 
     return virgl_video_init(drm_fd, &video_callbacks, 0);
 }
