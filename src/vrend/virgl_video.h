@@ -166,6 +166,18 @@ unsigned virgl_video_buffer_cpu_readback(struct virgl_video_buffer *buffer,
                                          void *planes_out[4],
                                          uint32_t pitches_out[4]);
 
+/*
+ * Called by the encode upload path on Windows: vrend_video.c hands in
+ * NV12-laid-out CPU bytes (Y plane followed by interleaved UV) for the
+ * given buffer; the backend latches them for the next encoder submission.
+ *
+ * Returns 0 on success, -1 on failure. On POSIX (libva) the backend uses a
+ * DMA-BUF path instead and ignores this call, returning 0 unconditionally.
+ */
+int virgl_video_buffer_cpu_writeback(struct virgl_video_buffer *buf,
+                                     const void *nv12_data,
+                                     uint32_t nv12_size);
+
 int virgl_video_begin_frame(struct virgl_video_codec *codec,
                             struct virgl_video_buffer *target);
 int virgl_video_decode_bitstream(struct virgl_video_codec *codec,

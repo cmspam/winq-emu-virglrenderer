@@ -916,6 +916,22 @@ unsigned virgl_video_buffer_cpu_readback(struct virgl_video_buffer *buffer,
     return 0;
 }
 
+/*
+ * CPU writeback path is only used by the Windows D3D11 + MF encoder backend,
+ * which needs vrend_video.c to deliver guest-side NV12 bytes before encode
+ * submission. The libva path uses DMA-BUF export to the encoder surface and
+ * has no need for a CPU memcpy slab, so this is a no-op returning success.
+ */
+int virgl_video_buffer_cpu_writeback(struct virgl_video_buffer *buf,
+                                     const void *nv12_data,
+                                     uint32_t nv12_size)
+{
+    (void)buf;
+    (void)nv12_data;
+    (void)nv12_size;
+    return 0;
+}
+
 int virgl_video_begin_frame(struct virgl_video_codec *codec,
                             struct virgl_video_buffer *target)
 {
