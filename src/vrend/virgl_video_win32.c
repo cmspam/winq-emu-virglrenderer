@@ -506,11 +506,17 @@ static void fill_caps_for_hevc(struct virgl_video_caps *v,
     v->stacked_frames = 0;
     /* Advertise up to 8K decode so guest Mesa can pick through. Actual
      * support is gated by CheckVideoDecoderFormat + CreateVideoDecoder. */
-    v->max_width = 7680;
-    v->max_height = 4320;
+    /* Advertised cap (uint16 max_macroblocks overflows past ~4K @ 16x16;
+     * Mesa uses max_macroblocks to gate profile advertisement in the guest
+     * so keep it accurate. Actual decoder support is re-checked against
+     * D3D11 at CreateVideoDecoder time — so larger clips still work if the
+     * host driver accepts them; they just don't count toward the "supports
+     * profile X" heuristic in the guest. */
+    v->max_width = 3840;
+    v->max_height = 2160;
     v->prefered_format = (profile == PIPE_VIDEO_PROFILE_HEVC_MAIN_10) ?
                          PIPE_FORMAT_P010 : PIPE_FORMAT_NV12;
-    v->max_macroblocks = (7680 / 16) * (4320 / 16);
+    v->max_macroblocks = (3840 / 16) * (2160 / 16);
     v->npot_texture = 1;
     v->supports_progressive = 1;
     v->supports_interlaced = 0;
@@ -526,13 +532,19 @@ static void fill_caps_for_vp9(struct virgl_video_caps *v,
     v->max_level = 51;              /* VP9 uses a 0..6.2 level range; the
                                      * cap is advisory for the guest */
     v->stacked_frames = 0;
-    v->max_width = 7680;
-    v->max_height = 4320;
+    /* Advertised cap (uint16 max_macroblocks overflows past ~4K @ 16x16;
+     * Mesa uses max_macroblocks to gate profile advertisement in the guest
+     * so keep it accurate. Actual decoder support is re-checked against
+     * D3D11 at CreateVideoDecoder time — so larger clips still work if the
+     * host driver accepts them; they just don't count toward the "supports
+     * profile X" heuristic in the guest. */
+    v->max_width = 3840;
+    v->max_height = 2160;
     v->prefered_format = (profile == PIPE_VIDEO_PROFILE_VP9_PROFILE2) ?
                          PIPE_FORMAT_P010 : PIPE_FORMAT_NV12;
     /* VP9 "superblocks" are 64x64 but Mesa's cap accounting is in 16x16
      * macroblock equivalents, matching what the H.264/HEVC branches do. */
-    v->max_macroblocks = (7680 / 16) * (4320 / 16);
+    v->max_macroblocks = (3840 / 16) * (2160 / 16);
     v->npot_texture = 1;
     v->supports_progressive = 1;
     v->supports_interlaced = 0;
@@ -547,11 +559,17 @@ static void fill_caps_for_av1(struct virgl_video_caps *v,
     v->entrypoint = PIPE_VIDEO_ENTRYPOINT_BITSTREAM;
     v->max_level = 51;              /* AV1 level 5.1 */
     v->stacked_frames = 0;
-    v->max_width = 7680;
-    v->max_height = 4320;
+    /* Advertised cap (uint16 max_macroblocks overflows past ~4K @ 16x16;
+     * Mesa uses max_macroblocks to gate profile advertisement in the guest
+     * so keep it accurate. Actual decoder support is re-checked against
+     * D3D11 at CreateVideoDecoder time — so larger clips still work if the
+     * host driver accepts them; they just don't count toward the "supports
+     * profile X" heuristic in the guest. */
+    v->max_width = 3840;
+    v->max_height = 2160;
     /* Profile 0 is 8-bit 4:2:0; output is always NV12 here. */
     v->prefered_format = PIPE_FORMAT_NV12;
-    v->max_macroblocks = (7680 / 16) * (4320 / 16);
+    v->max_macroblocks = (3840 / 16) * (2160 / 16);
     v->npot_texture = 1;
     v->supports_progressive = 1;
     v->supports_interlaced = 0;
