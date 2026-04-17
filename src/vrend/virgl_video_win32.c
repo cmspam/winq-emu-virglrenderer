@@ -983,31 +983,12 @@ static int pick_decoder_config(struct virgl_video_codec *codec,
         return -1;
     }
 
-    /* Prefer the first config that uses short-format bitstream and doesn't
-     * require encrypted input; otherwise fall back to the first one. We
-     * detect "short format" via ConfigBitstreamRaw == 2 per DXVA spec. In
-     * practice nearly all modern drivers report config 0 as a short-format
-     * non-encrypted H.264 setup, but being explicit documents intent. */
-    for (i = 0; i < count; i++) {
-        D3D11_VIDEO_DECODER_CONFIG cfg;
-        hr = ID3D11VideoDevice_GetVideoDecoderConfig(
-                        g_vid.video_device, desc, i, &cfg);
-        if (FAILED(hr))
-            continue;
-        (void)codec;
-        /* ConfigBitstreamRaw:
-         *   0 => legacy long-format (MBctrl / Residual paths).
-         *   1 => long-format bitstream.
-         *   2 => short-format bitstream. <-- what we want.
-         * Some drivers report 0 even for working H.264; we tolerate that by
-         * picking the first valid one if none claim short format. */
-        if (cfg.ConfigBitstreamRaw == 2) {
-            *out_cfg = cfg;
-            return 0;
-        }
-    }
-
-    /* Fallback: take index 0. */
+    /* Take the first non-encrypted config. ConfigBitstreamRaw meaning is
+     * codec-specific: for H.264 "==2" is short-format; for HEVC "==1" is
+     * short-format; VP9/AV1 typically only expose "==1". All Intel/AMD/
+     * NVIDIA Windows drivers expose the native short-format config at
+     * index 0 for our supported profiles. */
+    (void)codec;
     hr = ID3D11VideoDevice_GetVideoDecoderConfig(
                     g_vid.video_device, desc, 0, out_cfg);
     if (FAILED(hr)) {
@@ -2111,6 +2092,10 @@ static void fill_dxva_picparams_hevc(struct virgl_video_codec *codec,
     if (self_slot < 0 || self_slot >= VIRGL_VIDEO_WIN32_DPB_SIZE)
         self_slot = 0;
     pp->CurrPic.Index7Bits   = (UCHAR)(self_slot & 0x7F);
+    /* ffmpeg dxva2_hevc.c calls `fill_picture_entry(&pp->CurrPic,
+     * get_surface_index(..., 1), 0)` — the "1" is the 4th arg of
+     * get_surface_index (allow-null flag), and "0" is fill_picture_entry's
+     * long_term flag. CurrPic.AssociatedFlag = 0 for HEVC. */
     pp->CurrPic.AssociatedFlag = 0;
 
     /* SPS-derived scalars. */
@@ -2137,10 +2122,15 @@ static void fill_dxva_picparams_hevc(struct virgl_video_codec *codec,
     pp->num_ref_idx_l1_default_active_minus1 =
         pps->num_ref_idx_l1_default_active_minus1;
     pp->init_qp_minus26            = pps->init_qp_minus26;
-    pp->ucNumDeltaPocsOfRefRpsIdx  = (UCHAR)desc->NumDeltaPocsOfRefRpsIdx;
-    pp->wNumBitsForShortTermRPSInSlice =
-        desc->UseStRpsBits ? (USHORT)desc->NumShortTermPictureSliceHeaderBits
-                           : (USHORT)pps->st_rps_bits;
+    /* Per ffmpeg dxva2_hevc.c: only populate the inline-RPS bit count /
+     * NumDeltaPocsOfRefRpsIdx when the slice header carries an inline RPS
+     * (short_term_ref_pic_set_sps_flag=0). Mesa signals that via UseStRpsBits.
+     * Otherwise the driver parses the RPS index from PPS/slice and these
+     * fields must stay zero. */
+    if (desc->UseStRpsBits) {
+        pp->ucNumDeltaPocsOfRefRpsIdx      = (UCHAR)desc->NumDeltaPocsOfRefRpsIdx;
+        pp->wNumBitsForShortTermRPSInSlice = (USHORT)desc->NumShortTermPictureSliceHeaderBits;
+    }
 
     /* dwCodingParamToolFlags (SPS-ish) */
     pp->scaling_list_enabled_flag         = sps->scaling_list_enabled_flag;
@@ -2148,14 +2138,18 @@ static void fill_dxva_picparams_hevc(struct virgl_video_codec *codec,
     pp->sample_adaptive_offset_enabled_flag =
         sps->sample_adaptive_offset_enabled_flag;
     pp->pcm_enabled_flag                  = sps->pcm_enabled_flag;
-    pp->pcm_sample_bit_depth_luma_minus1  = sps->pcm_sample_bit_depth_luma_minus1;
-    pp->pcm_sample_bit_depth_chroma_minus1 =
-        sps->pcm_sample_bit_depth_chroma_minus1;
-    pp->log2_min_pcm_luma_coding_block_size_minus3 =
-        sps->log2_min_pcm_luma_coding_block_size_minus3;
-    pp->log2_diff_max_min_pcm_luma_coding_block_size =
-        sps->log2_diff_max_min_pcm_luma_coding_block_size;
-    pp->pcm_loop_filter_disabled_flag     = sps->pcm_loop_filter_disabled_flag;
+    /* PCM sub-fields are only meaningful when pcm_enabled_flag=1. Mesa
+     * leaves them undefined otherwise — zero them per ffmpeg dxva2_hevc.c. */
+    if (sps->pcm_enabled_flag) {
+        pp->pcm_sample_bit_depth_luma_minus1  = sps->pcm_sample_bit_depth_luma_minus1;
+        pp->pcm_sample_bit_depth_chroma_minus1 =
+            sps->pcm_sample_bit_depth_chroma_minus1;
+        pp->log2_min_pcm_luma_coding_block_size_minus3 =
+            sps->log2_min_pcm_luma_coding_block_size_minus3;
+        pp->log2_diff_max_min_pcm_luma_coding_block_size =
+            sps->log2_diff_max_min_pcm_luma_coding_block_size;
+        pp->pcm_loop_filter_disabled_flag = sps->pcm_loop_filter_disabled_flag;
+    }
     pp->long_term_ref_pics_present_flag   = sps->long_term_ref_pics_present_flag;
     pp->sps_temporal_mvp_enabled_flag     = sps->sps_temporal_mvp_enabled_flag;
     pp->strong_intra_smoothing_enabled_flag =
@@ -2178,9 +2172,14 @@ static void fill_dxva_picparams_hevc(struct virgl_video_codec *codec,
     pp->transquant_bypass_enabled_flag    = pps->transquant_bypass_enabled_flag;
     pp->tiles_enabled_flag                = pps->tiles_enabled_flag;
     pp->entropy_coding_sync_enabled_flag  = pps->entropy_coding_sync_enabled_flag;
-    pp->uniform_spacing_flag              = pps->uniform_spacing_flag;
-    pp->loop_filter_across_tiles_enabled_flag =
-        pps->loop_filter_across_tiles_enabled_flag;
+    /* uniform_spacing_flag + loop_filter_across_tiles_enabled_flag are only
+     * meaningful when tiles are enabled. Mesa leaves them undefined
+     * otherwise; clear to match ffmpeg dxva2_hevc.c. */
+    if (pps->tiles_enabled_flag) {
+        pp->uniform_spacing_flag = pps->uniform_spacing_flag;
+        pp->loop_filter_across_tiles_enabled_flag =
+            pps->loop_filter_across_tiles_enabled_flag;
+    }
     pp->pps_loop_filter_across_slices_enabled_flag =
         pps->pps_loop_filter_across_slices_enabled_flag;
     pp->deblocking_filter_override_enabled_flag =
@@ -2192,24 +2191,29 @@ static void fill_dxva_picparams_hevc(struct virgl_video_codec *codec,
         pps->slice_segment_header_extension_present_flag;
     pp->IrapPicFlag                       = desc->RAPPicFlag ? 1 : 0;
     pp->IdrPicFlag                        = desc->IDRPicFlag ? 1 : 0;
-    /* IntraPicFlag is a hint for intra-only frames; derive conservatively
-     * from IDR. TODO: virgl desc doesn't expose a distinct intra-only bit,
-     * so non-IDR I-frames report 0 and the driver will resolve from slice
-     * headers. */
-    pp->IntraPicFlag                      = desc->IDRPicFlag ? 1 : 0;
+    /* ffmpeg dxva2_hevc.c sets IntraPicFlag = IS_IRAP(h) — identical to
+     * IrapPicFlag. Using IDR alone miscategorises CRA/BLA/RASL, which some
+     * drivers latch as "DPB is warm" and then mis-resolve later B-frames. */
+    pp->IntraPicFlag                      = desc->RAPPicFlag ? 1 : 0;
 
     pp->pps_cb_qp_offset        = pps->pps_cb_qp_offset;
     pp->pps_cr_qp_offset        = pps->pps_cr_qp_offset;
-    pp->num_tile_columns_minus1 = pps->num_tile_columns_minus1;
-    pp->num_tile_rows_minus1    = pps->num_tile_rows_minus1;
 
-    /* DXVA carries 19 columns / 21 rows worth of sizes; virgl has 20/22.
-     * We only copy as many as the PPS says are present, which is bounded
-     * by num_tile_{columns,rows}_minus1 <= DXVA's array size. */
-    for (i = 0; i < 19 && i < 20; i++)
-        pp->column_width_minus1[i] = pps->column_width_minus1[i];
-    for (i = 0; i < 21 && i < 22; i++)
-        pp->row_height_minus1[i]   = pps->row_height_minus1[i];
+    /* Tile counts + spacing arrays only carry meaning when tiles_enabled_flag
+     * is 1 (per Chromium d3d11_h265_accelerator / ffmpeg dxva2_hevc). Mesa
+     * may forward uninitialized values from the VA PPS when tiles are off;
+     * leave the DXVA fields at their memset'd 0 to avoid feeding the driver
+     * stale column/row configuration. */
+    if (pps->tiles_enabled_flag) {
+        pp->num_tile_columns_minus1 = pps->num_tile_columns_minus1;
+        pp->num_tile_rows_minus1    = pps->num_tile_rows_minus1;
+        if (!pps->uniform_spacing_flag) {
+            for (i = 0; i < 19 && i < 20; i++)
+                pp->column_width_minus1[i] = pps->column_width_minus1[i];
+            for (i = 0; i < 21 && i < 22; i++)
+                pp->row_height_minus1[i]   = pps->row_height_minus1[i];
+        }
+    }
 
     pp->diff_cu_qp_delta_depth       = pps->diff_cu_qp_delta_depth;
     pp->pps_beta_offset_div2         = pps->pps_beta_offset_div2;
@@ -2218,68 +2222,79 @@ static void fill_dxva_picparams_hevc(struct virgl_video_codec *codec,
         pps->log2_parallel_merge_level_minus2;
     pp->CurrPicOrderCntVal           = desc->CurrPicOrderCntVal;
 
-    /* RefPicList: up to 15 entries. DXVA encodes a long-term flag in the
-     * AssociatedFlag bit; we mark unused slots with bPicEntry=0xFF. We
-     * preserve Mesa's positional mapping: desc->ref[i] -> RefPicList[i]
-     * so that desc->RefPicSetStCurr{Before,After,LtCurr}[] indices
-     * (which reference positions in desc->ref[]) remain valid indices
-     * into pp->RefPicList[]. This matches the VA-API ReferenceFrames[]
-     * convention that Mesa serialises one-for-one from.
+    /* RefPicList: up to 15 entries. DXVA expects valid refs packed contiguously
+     * at positions 0..N-1 (ffmpeg dxva2_hevc.c compact-walk pattern), with
+     * invalid trailing entries sentinel'd to 0xFF. Mesa emits refs in a
+     * sparse `desc->ref[]` layout (following VA-API ReferenceFrames[]); we
+     * walk it, keep only entries we can map to a DPB slot, and record the
+     * original desc index so we can remap RefPicSetStCurr*[] afterwards.
      *
-     * PicOrderCntValList[i] must be populated from desc->PicOrderCntVal[i]
-     * unconditionally — even for invalid RefPicList entries. The driver
-     * indexes PicOrderCntValList by the same i it reads RefPicList[] at
-     * when resolving RefPicSetStCurr*, and a stale zero POC for a
-     * supposedly-invalid slot that RefPicSet still references produces
-     * wrong MV scaling on B-frames. This matches ffmpeg dxva2_hevc.c
-     * which copies PicOrderCntVal[] verbatim. */
-    for (i = 0; i < 15; i++) {
-        dxva_picentry_hevc_invalidate(&pp->RefPicList[i]);
-        pp->PicOrderCntValList[i] = desc->PicOrderCntVal[i];
-    }
-    for (i = 0; i < 15; i++) {
-        uint32_t bid = desc->ref[i];
-        struct virgl_video_buffer *refbuf = NULL;
-        int slot = -1;
-        unsigned j;
+     * PicOrderCntValList[i] follows RefPicList[i] 1:1 — populated with the
+     * POC of RefPicList[i] for valid slots, 0 for invalid trailing entries
+     * (matches ffmpeg; per DXVA spec the list is parallel to RefPicList). */
+    {
+        uint8_t orig_to_compact[16];
+        unsigned n_valid = 0;
 
-        if (bid == 0)
-            continue;
+        for (i = 0; i < 16; i++)
+            orig_to_compact[i] = 0xFF;
+        for (i = 0; i < 15; i++) {
+            dxva_picentry_hevc_invalidate(&pp->RefPicList[i]);
+            pp->PicOrderCntValList[i] = 0;
+        }
 
-        for (j = 0; j < VIRGL_VIDEO_WIN32_MAX_REFS; j++) {
-            if (codec->refs[j].buffer_id == bid) {
-                refbuf = codec->refs[j].buf;
-                break;
+        for (i = 0; i < 15; i++) {
+            uint32_t bid = desc->ref[i];
+            struct virgl_video_buffer *refbuf = NULL;
+            int slot = -1;
+            unsigned j;
+
+            if (bid == 0)
+                continue;
+
+            for (j = 0; j < VIRGL_VIDEO_WIN32_MAX_REFS; j++) {
+                if (codec->refs[j].buffer_id == bid) {
+                    refbuf = codec->refs[j].buf;
+                    break;
+                }
             }
-        }
-        if (refbuf && refbuf->current_codec_holder == codec)
-            slot = refbuf->current_slot_in_codec;
-        if (slot < 0 || slot >= VIRGL_VIDEO_WIN32_DPB_SIZE) {
-            /* Ref not resident in our DPB — leave the 0xFF sentinel in
-             * place. PicOrderCntValList[i] is already filled above. */
-            continue;
-        }
-        pp->RefPicList[i].Index7Bits    = (UCHAR)(slot & 0x7F);
-        pp->RefPicList[i].AssociatedFlag = desc->IsLongTerm[i] ? 1 : 0;
-    }
+            if (refbuf && refbuf->current_codec_holder == codec)
+                slot = refbuf->current_slot_in_codec;
+            if (slot < 0 || slot >= VIRGL_VIDEO_WIN32_DPB_SIZE)
+                continue;
 
-    /* Ref-pic-set indices into RefPicList[]: curr-before, curr-after,
-     * lt-curr. Pad unused positions with 0xFF — Intel's HEVC driver
-     * treats any non-0xFF entry past Num* as a valid reference and
-     * reads phantom refs on B-frames otherwise. */
-    memset(pp->RefPicSetStCurrBefore, 0xFF, sizeof(pp->RefPicSetStCurrBefore));
-    memset(pp->RefPicSetStCurrAfter,  0xFF, sizeof(pp->RefPicSetStCurrAfter));
-    memset(pp->RefPicSetLtCurr,       0xFF, sizeof(pp->RefPicSetLtCurr));
-    for (i = 0; i < desc->NumPocStCurrBefore && i < 8; i++)
-        pp->RefPicSetStCurrBefore[i] = desc->RefPicSetStCurrBefore[i];
-    for (i = 0; i < desc->NumPocStCurrAfter && i < 8; i++)
-        pp->RefPicSetStCurrAfter[i]  = desc->RefPicSetStCurrAfter[i];
-    for (i = 0; i < desc->NumPocLtCurr && i < 8; i++)
-        pp->RefPicSetLtCurr[i]       = desc->RefPicSetLtCurr[i];
+            pp->RefPicList[n_valid].Index7Bits    = (UCHAR)(slot & 0x7F);
+            pp->RefPicList[n_valid].AssociatedFlag = desc->IsLongTerm[i] ? 1 : 0;
+            pp->PicOrderCntValList[n_valid]       = desc->PicOrderCntVal[i];
+            orig_to_compact[i] = (uint8_t)n_valid;
+            n_valid++;
+        }
+
+        /* Ref-pic-set indices. Mesa's desc->RefPicSetStCurr*[i] are indices
+         * into desc->ref[]; DXVA wants indices into pp->RefPicList[]. Remap
+         * via the orig→compact map; unresolvable indices stay 0xFF so Intel's
+         * HEVC driver doesn't create phantom refs. */
+        memset(pp->RefPicSetStCurrBefore, 0xFF, sizeof(pp->RefPicSetStCurrBefore));
+        memset(pp->RefPicSetStCurrAfter,  0xFF, sizeof(pp->RefPicSetStCurrAfter));
+        memset(pp->RefPicSetLtCurr,       0xFF, sizeof(pp->RefPicSetLtCurr));
+        for (i = 0; i < desc->NumPocStCurrBefore && i < 8; i++) {
+            uint8_t o = desc->RefPicSetStCurrBefore[i];
+            if (o < 16) pp->RefPicSetStCurrBefore[i] = orig_to_compact[o];
+        }
+        for (i = 0; i < desc->NumPocStCurrAfter && i < 8; i++) {
+            uint8_t o = desc->RefPicSetStCurrAfter[i];
+            if (o < 16) pp->RefPicSetStCurrAfter[i]  = orig_to_compact[o];
+        }
+        for (i = 0; i < desc->NumPocLtCurr && i < 8; i++) {
+            uint8_t o = desc->RefPicSetLtCurr[i];
+            if (o < 16) pp->RefPicSetLtCurr[i]       = orig_to_compact[o];
+        }
+    }
 
     pp->StatusReportFeedbackNumber = codec->status_report_feedback++;
     if (pp->StatusReportFeedbackNumber == 0)
         pp->StatusReportFeedbackNumber = codec->status_report_feedback++;
+
 }
 
 static void fill_dxva_qmatrix_hevc(const struct virgl_h265_picture_desc *desc,
@@ -2287,20 +2302,39 @@ static void fill_dxva_qmatrix_hevc(const struct virgl_h265_picture_desc *desc,
 {
     const struct virgl_h265_sps *sps = &desc->pps.sps;
 
-    /* HEVC has four block-size classes of scaling lists. virgl packs them
-     * in the same zig-zag order DXVA expects (matching VA-API semantics). */
-    memcpy(qm->ucScalingLists0, sps->ScalingList4x4,
-           sizeof(qm->ucScalingLists0));
-    memcpy(qm->ucScalingLists1, sps->ScalingList8x8,
-           sizeof(qm->ucScalingLists1));
-    memcpy(qm->ucScalingLists2, sps->ScalingList16x16,
-           sizeof(qm->ucScalingLists2));
-    memcpy(qm->ucScalingLists3, sps->ScalingList32x32,
-           sizeof(qm->ucScalingLists3));
-    memcpy(qm->ucScalingListDCCoefSizeID2, sps->ScalingListDCCoeff16x16,
-           sizeof(qm->ucScalingListDCCoefSizeID2));
-    memcpy(qm->ucScalingListDCCoefSizeID3, sps->ScalingListDCCoeff32x32,
-           sizeof(qm->ucScalingListDCCoefSizeID3));
+    if (sps->scaling_list_enabled_flag) {
+        /* HEVC has four block-size classes of scaling lists. Mesa has
+         * already unzigzagged VA-API's up-right-diagonal input to raster
+         * order; DXVA also expects raster (per picture_hevc.c / dxva.h). */
+        memcpy(qm->ucScalingLists0, sps->ScalingList4x4,
+               sizeof(qm->ucScalingLists0));
+        memcpy(qm->ucScalingLists1, sps->ScalingList8x8,
+               sizeof(qm->ucScalingLists1));
+        memcpy(qm->ucScalingLists2, sps->ScalingList16x16,
+               sizeof(qm->ucScalingLists2));
+        memcpy(qm->ucScalingLists3, sps->ScalingList32x32,
+               sizeof(qm->ucScalingLists3));
+        memcpy(qm->ucScalingListDCCoefSizeID2, sps->ScalingListDCCoeff16x16,
+               sizeof(qm->ucScalingListDCCoefSizeID2));
+        memcpy(qm->ucScalingListDCCoefSizeID3, sps->ScalingListDCCoeff32x32,
+               sizeof(qm->ucScalingListDCCoefSizeID3));
+    } else {
+        /* Per HEVC spec, when scaling_list_enabled_flag=0 the default
+         * scaling list is flat 16s for every coefficient. Mesa leaves the
+         * scaling arrays zero-initialized in this case; forwarding zeros
+         * makes Intel's HEVC driver scale every inverse-transform
+         * coefficient by 0, which wipes the residual for P/B frames
+         * (keyframes are less sensitive because residuals are smaller
+         * relative to intra prediction accuracy). Fill with spec defaults. */
+        memset(qm->ucScalingLists0, 16, sizeof(qm->ucScalingLists0));
+        memset(qm->ucScalingLists1, 16, sizeof(qm->ucScalingLists1));
+        memset(qm->ucScalingLists2, 16, sizeof(qm->ucScalingLists2));
+        memset(qm->ucScalingLists3, 16, sizeof(qm->ucScalingLists3));
+        memset(qm->ucScalingListDCCoefSizeID2, 16,
+               sizeof(qm->ucScalingListDCCoefSizeID2));
+        memset(qm->ucScalingListDCCoefSizeID3, 16,
+               sizeof(qm->ucScalingListDCCoefSizeID3));
+    }
 }
 
 /* Shared short-format slice/bitstream submission for HEVC / VP9 / AV1.
@@ -2532,6 +2566,27 @@ static int submit_short_format_decode(struct virgl_video_codec *codec,
         return -1;
     }
 
+    /* Pad the bitstream buffer to 128-byte alignment and extend the last
+     * slice's SliceBytesInBuffer by the padding amount. Per ffmpeg
+     * dxva2_hevc.c (lines 312-318), some HEVC drivers silently no-op
+     * non-IDR frames without this padding. The padding bytes are set to
+     * 0; the driver tolerates trailing zeros in the bitstream. */
+    if (parse_mode == VIRGL_VIDEO_PARSE_HEVC ||
+        parse_mode == VIRGL_VIDEO_PARSE_H264) {
+        UINT aligned = (bs_offset + 127u) & ~127u;
+        if (aligned > bs_offset && aligned <= bs_buf_size) {
+            memset((uint8_t *)bs_ptr + bs_offset, 0, aligned - bs_offset);
+            if (parse_mode == VIRGL_VIDEO_PARSE_HEVC && sc_elem_size == sizeof(DXVA_Slice_HEVC_Short)) {
+                DXVA_Slice_HEVC_Short *arr = (DXVA_Slice_HEVC_Short *)slice_storage;
+                arr[slice_count - 1].SliceBytesInBuffer += (aligned - bs_offset);
+            } else if (parse_mode == VIRGL_VIDEO_PARSE_H264 && sc_elem_size == sizeof(DXVA_Slice_H264_Short)) {
+                DXVA_Slice_H264_Short *arr = (DXVA_Slice_H264_Short *)slice_storage;
+                arr[slice_count - 1].SliceBytesInBuffer += (aligned - bs_offset);
+            }
+            bs_offset = aligned;
+        }
+    }
+
     hr = ID3D11VideoContext_ReleaseDecoderBuffer(
             g_vid.video_context, codec->decoder,
             D3D11_VIDEO_DECODER_BUFFER_BITSTREAM);
@@ -2580,13 +2635,16 @@ static int submit_short_format_decode(struct virgl_video_codec *codec,
         ret_desc++;
     }
 
+    /* ffmpeg dxva2.c (dxva2_common_end_frame) and Chromium submit Bitstream
+     * BEFORE SliceControl. Intel's HEVC driver is order-sensitive: a
+     * SliceControl-first ordering causes non-IDR frames to silently no-op. */
+    descs[ret_desc].BufferType = D3D11_VIDEO_DECODER_BUFFER_BITSTREAM;
+    descs[ret_desc].DataSize = bs_offset;
+    ret_desc++;
+
     descs[ret_desc].BufferType =
         D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL;
     descs[ret_desc].DataSize = (UINT)(slice_count * sc_elem_size);
-    ret_desc++;
-
-    descs[ret_desc].BufferType = D3D11_VIDEO_DECODER_BUFFER_BITSTREAM;
-    descs[ret_desc].DataSize = bs_offset;
     ret_desc++;
 
     hr = ID3D11VideoContext_SubmitDecoderBuffers(
@@ -2623,13 +2681,21 @@ static int hevc_decode_bitstream(struct virgl_video_codec *codec,
     fill_dxva_picparams_hevc(codec, target, desc, &pp);
     fill_dxva_qmatrix_hevc(desc, &qm);
 
-    return submit_short_format_decode(codec,
+    {
+        const void *qm_ptr = NULL;
+        UINT qm_size = 0;
+        if (desc->pps.sps.scaling_list_enabled_flag) {
+            qm_ptr = &qm;
+            qm_size = (UINT)sizeof(qm);
+        }
+        return submit_short_format_decode(codec,
                                       &pp, (UINT)sizeof(pp),
-                                      &qm, (UINT)sizeof(qm),
+                                      qm_ptr, qm_size,
                                       (UINT)sizeof(DXVA_Slice_HEVC_Short),
                                       build_sc_hevc, NULL,
                                       VIRGL_VIDEO_PARSE_HEVC,
                                       num_buffers, buffers, sizes);
+    }
 }
 
 /*
@@ -4321,6 +4387,7 @@ int virgl_video_end_frame(struct virgl_video_codec *codec,
                     (unsigned long)hr);
         return -1;
     }
+
 
     unmap_staging_if_needed(target);
 
