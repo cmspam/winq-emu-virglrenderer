@@ -480,6 +480,36 @@ static int sync_cpu_planes_to_video_buffer(struct vrend_video_buffer *buf,
          * Each plane is its own vrend_resource with its own iov, so
          * we always write starting at offset 0. `vrend_write_to_iovec`
          * handles multi-segment iov for us. */
+        {
+            /* Log every unique res handle we see, so we can compare
+             * ffmpeg vs Brave surface allocation patterns. Hash table of
+             * up to 64 seen handles; beyond that we just stop logging
+             * to avoid unbounded state. */
+            static int diag_cached = -1;
+            if (diag_cached < 0) {
+                const char *e = getenv("VIRGL_VIDEO_DIAG");
+                diag_cached = (e && *e && *e != '0') ? 1 : 0;
+            }
+            if (diag_cached) {
+                static uint32_t seen_handles[64];
+                static unsigned seen_count = 0;
+                uint32_t h = plane->res_handle;
+                bool already = false;
+                for (unsigned k = 0; k < seen_count; k++) {
+                    if (seen_handles[k] == h) { already = true; break; }
+                }
+                if (!already && seen_count < 64) {
+                    seen_handles[seen_count++] = h;
+                    virgl_warn("vid-iov plane %u res=%u iov=%p num_iovs=%u "
+                               "storage_bits=0x%x blob_id=%u target=0x%x "
+                               "guest_dims=%ux%u\n",
+                               i, h,
+                               (void *)res->iov, res->num_iovs,
+                               res->storage_bits, res->blob_id, res->target,
+                               res->base.width0, res->base.height0);
+                }
+            }
+        }
         if (res->iov && res->num_iovs > 0) {
             uint32_t bytes_per_row;
             uint32_t num_rows;
