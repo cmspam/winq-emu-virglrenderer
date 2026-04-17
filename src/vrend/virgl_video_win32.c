@@ -67,9 +67,18 @@
 #include <windows.h>
 #include <initguid.h>
 #include <d3d11.h>
+#include <d3d11sdklayers.h>
 #include <dxgi.h>
 #include <dxgi1_2.h>
 #include <dxva.h>
+
+/* D3DERR_WASSTILLDRAWING is declared in <d3d9.h> which we don't include.
+ * The constant value is stable (0x8876021C) per MSDN documentation for
+ * `ID3D11VideoContext::DecoderBeginFrame`. Defined here so we can treat
+ * it as a "retry" return value alongside E_PENDING. */
+#ifndef D3DERR_WASSTILLDRAWING
+#define D3DERR_WASSTILLDRAWING ((HRESULT)0x8876021CL)
+#endif
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
@@ -328,6 +337,13 @@ static struct {
     ID3D11VideoDevice *video_device;
     ID3D11VideoContext *video_context;
 
+    /* Optional. Populated when D3D11_CREATE_DEVICE_DEBUG succeeds at
+     * device creation. We use it to surface runtime validation messages
+     * after SubmitDecoderBuffers / DecoderEndFrame (per MSDN guidance in
+     * `using-the-debug-layer-to-test-apps`) — the debug layer is the only
+     * documented channel for driver-level D3D11 validation output. */
+    ID3D11InfoQueue *info_queue;
+
     D3D_FEATURE_LEVEL feature_level;
     struct virgl_video_callbacks *callbacks;
 
@@ -511,6 +527,15 @@ int virgl_video_init(int drm_fd,
         D3D_FEATURE_LEVEL_10_1,
         D3D_FEATURE_LEVEL_10_0,
     };
+    /* Opt into the D3D11 Debug Layer when the env var is set. Per MSDN
+     * (`overviews-direct3d-11-devices-layers`) D3D11_CREATE_DEVICE_DEBUG
+     * plus ID3D11InfoQueue is the documented channel for runtime driver
+     * validation messages, and we only want the overhead when diagnosing.
+     * `D3D11CreateDevice` returns `DXGI_ERROR_SDK_COMPONENT_MISSING` if the
+     * debug SDK component (Graphics Tools optional feature) is absent — we
+     * fall back to the non-debug flag in that case. */
+    bool want_debug = getenv("VIRGL_VIDEO_D3D11_DEBUG") != NULL;
+    UINT debug_flag = want_debug ? D3D11_CREATE_DEVICE_DEBUG : 0;
 
     (void)drm_fd;   /* Windows backend doesn't use DRM fds. */
     (void)flags;
@@ -525,12 +550,29 @@ int virgl_video_init(int drm_fd,
     hr = D3D11CreateDevice(NULL,
                            D3D_DRIVER_TYPE_HARDWARE,
                            NULL,
-                           device_flags,
+                           device_flags | debug_flag,
                            levels, ARRAY_SIZE(levels),
                            D3D11_SDK_VERSION,
                            &g_vid.device,
                            &g_vid.feature_level,
                            &g_vid.context);
+    if (FAILED(hr) && debug_flag) {
+        /* Graphics Tools optional feature not installed — retry without. */
+        virgl_warn("virgl_video_win32: D3D11_CREATE_DEVICE_DEBUG failed "
+                   "(hr=0x%lx); falling back to non-debug device. Install "
+                   "the 'Graphics Tools' optional feature to use the debug "
+                   "layer.\n", (unsigned long)hr);
+        debug_flag = 0;
+        hr = D3D11CreateDevice(NULL,
+                               D3D_DRIVER_TYPE_HARDWARE,
+                               NULL,
+                               device_flags,
+                               levels, ARRAY_SIZE(levels),
+                               D3D11_SDK_VERSION,
+                               &g_vid.device,
+                               &g_vid.feature_level,
+                               &g_vid.context);
+    }
     if (FAILED(hr)) {
         /* Fallback for CI machines without a GPU video driver: try WARP. */
         hr = D3D11CreateDevice(NULL,
@@ -546,6 +588,21 @@ int virgl_video_init(int drm_fd,
             virgl_error("virgl_video_win32: D3D11CreateDevice failed: 0x%lx\n",
                         (unsigned long)hr);
             return -1;
+        }
+    } else if (debug_flag) {
+        /* Obtain the ID3D11InfoQueue. Only available when the debug layer
+         * is active (QI fails otherwise). We use it to drain driver
+         * validation messages after decode-path calls. */
+        HRESULT iq_hr = ID3D11Device_QueryInterface(g_vid.device,
+                                                    &IID_ID3D11InfoQueue,
+                                                    (void **)&g_vid.info_queue);
+        if (SUCCEEDED(iq_hr) && g_vid.info_queue) {
+            virgl_warn("virgl_video_win32: D3D11 debug layer active; "
+                       "ID3D11InfoQueue attached\n");
+        } else {
+            virgl_warn("virgl_video_win32: debug device created but "
+                       "QI(ID3D11InfoQueue) failed: 0x%lx\n",
+                       (unsigned long)iq_hr);
         }
     }
 
@@ -578,8 +635,47 @@ fail:
     return -1;
 }
 
+/* Drain any pending driver validation messages from the D3D11 debug layer
+ * and log them. No-op when the info queue is not attached (i.e. normal
+ * production runs without VIRGL_VIDEO_D3D11_DEBUG set). Per MSDN's
+ * `nn-d3d11sdklayers-id3d11infoqueue` documentation, the two-call pattern
+ * (GetMessage with NULL buffer to size, then second call to read) is the
+ * documented way to retrieve messages. We ClearStoredMessages after
+ * draining so subsequent calls only see new driver output. */
+static void vid_drain_info_queue(const char *where)
+{
+    if (!g_vid.info_queue)
+        return;
+    UINT64 n = ID3D11InfoQueue_GetNumStoredMessages(g_vid.info_queue);
+    if (n == 0)
+        return;
+    for (UINT64 i = 0; i < n; i++) {
+        SIZE_T sz = 0;
+        HRESULT hr = ID3D11InfoQueue_GetMessage(g_vid.info_queue, i, NULL, &sz);
+        if (FAILED(hr) || sz == 0)
+            continue;
+        D3D11_MESSAGE *m = malloc(sz);
+        if (!m)
+            continue;
+        hr = ID3D11InfoQueue_GetMessage(g_vid.info_queue, i, m, &sz);
+        if (SUCCEEDED(hr)) {
+            virgl_warn("vid-d3d11-debug [%s] cat=%d sev=%d id=%d: %.*s\n",
+                       where, (int)m->Category, (int)m->Severity, (int)m->ID,
+                       (int)m->DescriptionByteLength,
+                       m->pDescription);
+        }
+        free(m);
+    }
+    ID3D11InfoQueue_ClearStoredMessages(g_vid.info_queue);
+}
+
 void virgl_video_destroy(void)
 {
+    if (g_vid.info_queue) {
+        vid_drain_info_queue("destroy");
+        ID3D11InfoQueue_Release(g_vid.info_queue);
+        g_vid.info_queue = NULL;
+    }
     if (g_vid.video_context) {
         ID3D11VideoContext_Release(g_vid.video_context);
         g_vid.video_context = NULL;
@@ -1071,6 +1167,7 @@ struct virgl_video_codec *virgl_video_create_codec(
     hr = ID3D11VideoDevice_CreateVideoDecoder(g_vid.video_device,
                                               &desc, &codec->config,
                                               &codec->decoder);
+    vid_drain_info_queue("CreateVideoDecoder");
     if (FAILED(hr) || !codec->decoder) {
         virgl_error("virgl_video_win32: CreateVideoDecoder failed: 0x%lx\n",
                     (unsigned long)hr);
@@ -1493,10 +1590,25 @@ int virgl_video_begin_frame(struct virgl_video_codec *codec,
         return -1;
     }
 
-    hr = ID3D11VideoContext_DecoderBeginFrame(g_vid.video_context,
-                                              codec->decoder,
-                                              codec->slot_views[slot],
-                                              0, NULL);
+    /* DecoderBeginFrame may return E_PENDING or D3DERR_WASSTILLDRAWING while
+     * the hardware is busy. MSDN (`nf-d3d11-id3d11videocontext-decoderbeginframe`):
+     * "the decoder should try to make the call again." ffmpeg retries 50x at
+     * 2ms intervals (dxva2.c:891+). We mirror that pattern. */
+    {
+        unsigned retries = 0;
+        for (;;) {
+            hr = ID3D11VideoContext_DecoderBeginFrame(g_vid.video_context,
+                                                      codec->decoder,
+                                                      codec->slot_views[slot],
+                                                      0, NULL);
+            if (hr != E_PENDING && hr != D3DERR_WASSTILLDRAWING)
+                break;
+            if (++retries > 50)
+                break;
+            Sleep(2);
+        }
+    }
+    vid_drain_info_queue("DecoderBeginFrame");
     if (FAILED(hr)) {
         virgl_error("virgl_video_win32: DecoderBeginFrame failed: 0x%lx\n",
                     (unsigned long)hr);
@@ -2011,6 +2123,7 @@ static int submit_h264_decode(struct virgl_video_codec *codec,
 
     hr = ID3D11VideoContext_SubmitDecoderBuffers(
             g_vid.video_context, codec->decoder, ret_desc, descs);
+    vid_drain_info_queue("h264-SubmitDecoderBuffers");
     if (FAILED(hr)) {
         virgl_error("virgl_video_win32: SubmitDecoderBuffers failed: 0x%lx\n",
                     (unsigned long)hr);
@@ -2127,15 +2240,18 @@ static void fill_dxva_picparams_hevc(struct virgl_video_codec *codec,
     pp->num_ref_idx_l1_default_active_minus1 =
         pps->num_ref_idx_l1_default_active_minus1;
     pp->init_qp_minus26            = pps->init_qp_minus26;
-    /* Per ffmpeg dxva2_hevc.c: only populate the inline-RPS bit count /
-     * NumDeltaPocsOfRefRpsIdx when the slice header carries an inline RPS
-     * (short_term_ref_pic_set_sps_flag=0). Mesa signals that via UseStRpsBits.
-     * Otherwise the driver parses the RPS index from PPS/slice and these
-     * fields must stay zero. */
-    if (desc->UseStRpsBits) {
-        pp->ucNumDeltaPocsOfRefRpsIdx      = (UCHAR)desc->NumDeltaPocsOfRefRpsIdx;
-        pp->wNumBitsForShortTermRPSInSlice = (USHORT)desc->NumShortTermPictureSliceHeaderBits;
-    }
+    /* Forward NumDeltaPocsOfRefRpsIdx / NumShortTermPictureSliceHeaderBits
+     * unconditionally. Mesa radeonsi peer consumer does the same
+     * (si_video_dec.c si_dec_h265 lines 729-730) and Mesa's VA frontend
+     * populates NumShortTermPictureSliceHeaderBits from VA-API's
+     * st_rps_bits, which is already 0 when the slice uses SPS-indexed
+     * RPS (short_term_ref_pic_set_sps_flag=1). Per DXVA HEVC §3.2 the
+     * value must be non-zero when inline RPS is used and 0 otherwise,
+     * and Mesa's forwarding already satisfies that. `UseStRpsBits` is a
+     * virgl-protocol field not populated by upstream Mesa — gating on
+     * it suppressed valid data. */
+    pp->ucNumDeltaPocsOfRefRpsIdx      = (UCHAR)desc->NumDeltaPocsOfRefRpsIdx;
+    pp->wNumBitsForShortTermRPSInSlice = (USHORT)desc->NumShortTermPictureSliceHeaderBits;
 
     /* dwCodingParamToolFlags (SPS-ish) */
     pp->scaling_list_enabled_flag         = sps->scaling_list_enabled_flag;
@@ -2654,6 +2770,7 @@ static int submit_short_format_decode(struct virgl_video_codec *codec,
 
     hr = ID3D11VideoContext_SubmitDecoderBuffers(
             g_vid.video_context, codec->decoder, ret_desc, descs);
+    vid_drain_info_queue("short-SubmitDecoderBuffers");
     if (FAILED(hr)) {
         virgl_error("virgl_video_win32: SubmitDecoderBuffers failed: 0x%lx\n",
                     (unsigned long)hr);
@@ -4405,6 +4522,7 @@ int virgl_video_end_frame(struct virgl_video_codec *codec,
 
     hr = ID3D11VideoContext_DecoderEndFrame(g_vid.video_context,
                                             codec->decoder);
+    vid_drain_info_queue("DecoderEndFrame");
     if (FAILED(hr)) {
         virgl_error("virgl_video_win32: DecoderEndFrame failed: 0x%lx\n",
                     (unsigned long)hr);
