@@ -66,6 +66,8 @@
  */
 
 
+#include "config.h"
+
 #include "virgl_video.h"
 #include "virgl_video_hw.h"
 
@@ -73,6 +75,20 @@
 #include "vrend_winsys.h"
 #include "vrend_renderer.h"
 #include "vrend_video.h"
+
+/*
+ * On Windows we don't have dma-buf / EGL_LINUX_DMA_BUF — the D3D11 video
+ * backend hands us CPU NV12 planes via virgl_video_buffer_cpu_readback().
+ * The EGLImage path would drag in eglCreateImageKHR / GL_OES_EGL_image which
+ * are unavailable against Mesa-on-Windows today, so we compile out the
+ * import/export helpers entirely on Win32 and use glTexSubImage2D to upload
+ * the CPU pixel data into the guest-visible resource textures instead.
+ */
+#if defined(ENABLE_VIDEO_WIN32) || defined(_WIN32)
+#  define VREND_VIDEO_WIN32_CPU_UPLOAD 1
+#else
+#  define VREND_VIDEO_WIN32_CPU_UPLOAD 0
+#endif
 
 struct vrend_context;
 
@@ -95,7 +111,9 @@ struct vrend_video_plane {
     uint32_t res_handle;
     GLuint texture;         /* texture for temporary use */
     GLuint framebuffer;     /* framebuffer for temporary use */
+#if !VREND_VIDEO_WIN32_CPU_UPLOAD
     EGLImageKHR egl_image;  /* egl image for temporary use */
+#endif
 };
 
 struct vrend_video_buffer {
@@ -146,6 +164,7 @@ static struct vrend_video_buffer *get_video_buffer(
 }
 
 
+#if !VREND_VIDEO_WIN32_CPU_UPLOAD
 static int sync_dmabuf_to_video_buffer(struct vrend_video_buffer *buf,
                                        const struct virgl_video_dma_buf *dmabuf)
 {
@@ -268,6 +287,78 @@ static int sync_video_buffer_to_dmabuf(struct vrend_video_buffer *buf,
 
     return 0;
 }
+#endif /* !VREND_VIDEO_WIN32_CPU_UPLOAD */
+
+#if VREND_VIDEO_WIN32_CPU_UPLOAD
+/*
+ * Windows CPU path. The D3D11 backend has already copied the NV12 frame into
+ * a CPU-mapped staging texture by the time decode_completed fires; we pull
+ * plane pointers out via virgl_video_buffer_cpu_readback() and push them into
+ * the guest-visible resource textures using glTexSubImage2D.
+ *
+ * NV12 plane 0 is a single-channel 8-bit Y plane at full resolution. Plane 1
+ * is two interleaved 8-bit channels (U,V) at half resolution in each axis.
+ * On the guest side Mesa allocates the resource textures with the matching
+ * internal formats (R8 and RG8), so we can just upload with GL_RED /
+ * GL_RG and GL_UNSIGNED_BYTE.
+ */
+static int sync_cpu_planes_to_video_buffer(struct vrend_video_buffer *buf,
+                                           const struct virgl_video_dma_buf *dmabuf)
+{
+    void *planes[4] = { NULL };
+    uint32_t pitches[4] = { 0 };
+    unsigned n, i;
+
+    n = virgl_video_buffer_cpu_readback(buf->buffer, planes, pitches);
+    if (n == 0) {
+        virgl_error("%s: backend returned no CPU planes\n", __func__);
+        return -1;
+    }
+
+    for (i = 0; i < n && i < buf->num_planes; i++) {
+        struct vrend_video_plane *plane = &buf->planes[i];
+        struct vrend_resource *res;
+        GLenum ext_format;
+        unsigned width, height, row_bytes_per_px;
+
+        res = vrend_renderer_ctx_res_lookup(buf->ctx->ctx, plane->res_handle);
+        if (!res) {
+            virgl_error("%s: res %d not found\n", __func__, plane->res_handle);
+            continue;
+        }
+
+        if (i == 0) {
+            /* Y plane: full resolution, 1 byte per pixel. */
+            ext_format = GL_RED;
+            width = dmabuf->width;
+            height = dmabuf->height;
+            row_bytes_per_px = 1;
+        } else {
+            /* UV plane: half resolution each axis, 2 bytes per pixel. */
+            ext_format = GL_RG;
+            width = dmabuf->width / 2;
+            height = dmabuf->height / 2;
+            row_bytes_per_px = 2;
+        }
+
+        /* Account for any gap between bytes-per-row in the source and the
+         * destination upload width. pitches[i] is bytes-per-row of source. */
+        glPixelStorei(GL_UNPACK_ROW_LENGTH,
+                      (GLint)(pitches[i] / row_bytes_per_px));
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+
+        glBindTexture(GL_TEXTURE_2D, res->gl_id);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
+                        (GLsizei)width, (GLsizei)height,
+                        ext_format, GL_UNSIGNED_BYTE, planes[i]);
+
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    }
+
+    glBindTexture(GL_TEXTURE_2D, 0);
+    return 0;
+}
+#endif /* VREND_VIDEO_WIN32_CPU_UPLOAD */
 
 
 static void vrend_video_decode_completed(
@@ -278,7 +369,11 @@ static void vrend_video_decode_completed(
 
     (void)codec;
 
+#if VREND_VIDEO_WIN32_CPU_UPLOAD
+    sync_cpu_planes_to_video_buffer(buf, dmabuf);
+#else
     sync_dmabuf_to_video_buffer(buf, dmabuf);
+#endif
 }
 
 
@@ -290,7 +385,15 @@ static void vrend_video_enocde_upload_picture(
 
     (void)codec;
 
+#if VREND_VIDEO_WIN32_CPU_UPLOAD
+    /* Encode is unimplemented on Windows — the backend returns -ENOSYS from
+     * virgl_video_encode_bitstream() and this callback never fires. Keeping
+     * the stub here avoids an unused-symbol warning. */
+    (void)buf;
+    (void)dmabuf;
+#else
     sync_video_buffer_to_dmabuf(buf, dmabuf);
+#endif
 }
 
 static void vrend_video_encode_completed(
@@ -483,8 +586,10 @@ int vrend_video_create_buffer(struct vrend_video_context *ctx,
         return -1;
     }
 
+#if !VREND_VIDEO_WIN32_CPU_UPLOAD
     for (i = 0; i < ARRAY_SIZE(buf->planes); i++)
         buf->planes[i].egl_image = EGL_NO_IMAGE_KHR;
+#endif
 
     for (i = 0, buf->num_planes = 0;
          i < num_res && buf->num_planes < ARRAY_SIZE(buf->planes); i++) {
@@ -526,8 +631,10 @@ static void destroy_video_buffer(struct vrend_video_buffer *buf)
 
         glDeleteTextures(1, &plane->texture);
         glDeleteFramebuffers(1, &plane->framebuffer);
+#if !VREND_VIDEO_WIN32_CPU_UPLOAD
         if (plane->egl_image == EGL_NO_IMAGE_KHR)
             eglDestroyImageKHR(eglGetCurrentDisplay(), plane->egl_image);
+#endif
     }
 
     virgl_video_destroy_buffer(buf->buffer);

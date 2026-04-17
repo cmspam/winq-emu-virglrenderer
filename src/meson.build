@@ -155,10 +155,17 @@ proxy_sources = [
    'proxy/proxy_socket.c',
 ]
 
-video_sources = [
-   'vrend/virgl_video.c',
-   'vrend/vrend_video.c',
-]
+if host_machine.system() == 'windows'
+  video_sources = [
+     'vrend/virgl_video_win32.c',
+     'vrend/vrend_video.c',
+  ]
+else
+  video_sources = [
+     'vrend/virgl_video.c',
+     'vrend/vrend_video.c',
+  ]
+endif
 
 virgl_depends = [
    gallium_dep,
@@ -234,7 +241,17 @@ endif
 
 if with_video
   virgl_sources += video_sources
-  virgl_depends += [libva_dep, libvadrm_dep]
+  if host_machine.system() == 'windows'
+    cc = meson.get_compiler('c')
+    virgl_depends += [
+      cc.find_library('d3d11'),
+      cc.find_library('dxgi'),
+      cc.find_library('dxguid'),
+      cc.find_library('uuid'),
+    ]
+  else
+    virgl_depends += [libva_dep, libvadrm_dep]
+  endif
 endif
 
 if with_host_windows

@@ -135,7 +135,9 @@ if with_drm_renderers
   conf_data.set('ENABLE_DRM', 1)
 endif
 
-libdrm_dep = dependency('libdrm', version : '>=2.4.50', required: with_drm_renderers or get_option('video'))
+libdrm_dep = dependency('libdrm', version : '>=2.4.50',
+                        required: with_drm_renderers or
+                                  (get_option('video') and host_machine.system() != 'windows'))
 libdrm_amdgpu_dep = dependency('libdrm_amdgpu', version : '>=2.4.121', required: with_drm_amdgpu)
 conf_data.set('ENABLE_LIBDRM', libdrm_dep.found())
 drm_uapi_dep = declare_dependency(
@@ -407,13 +409,22 @@ if with_venus
 endif
 
 with_video = get_option('video')
+libva_dep = dependency('', required: false)
+libvadrm_dep = dependency('', required: false)
 if with_video
-  if not have_egl
-     error('video require EGL, but it is not available')
+  if host_machine.system() == 'windows'
+    # Windows uses the D3D11 Video Decoder / Media Foundation backend
+    # instead of libva; pulls in d3d11/dxgi/mfplat/mfuuid as plain -l libs.
+    conf_data.set('ENABLE_VIDEO', 1)
+    conf_data.set('ENABLE_VIDEO_WIN32', 1)
+  else
+    if not have_egl
+       error('video require EGL, but it is not available')
+    endif
+    conf_data.set('ENABLE_VIDEO', 1)
+    libva_dep = dependency('libva')
+    libvadrm_dep = dependency('libva-drm')
   endif
-  conf_data.set('ENABLE_VIDEO', 1)
-  libva_dep = dependency('libva')
-  libvadrm_dep = dependency('libva-drm')
 endif
 
 with_tests = get_option('tests')
