@@ -45,14 +45,27 @@ enum pipe_video_format
    PIPE_VIDEO_FORMAT_AV1       /**< AV1 */
 };
 
+/*
+ * These wire values must match Mesa's guest-side enum in
+ * mesa/src/gallium/include/pipe/p_video_enums.h exactly — Mesa reads the
+ * virgl_video_caps array from virglrenderer's caps blob and indexes it by
+ * these ordinals to decide whether a VA profile is advertised.
+ *
+ * The WINQ-EMU tree previously kept older virglrenderer values
+ * (MPEG4_SIMPLE / MPEG4_ADVANCED_SIMPLE at positions 4/5, only 5 HEVC
+ * variants, no AV1_PROFILE2). Mesa upstream dropped MPEG4_SIMPLE and added
+ * several HEVC variants, shifting every HEVC/JPEG/VP9/AV1 ordinal by 2+.
+ * If the two enums disagree, Mesa reads our HEVC_MAIN as HEVC_MAIN_STILL
+ * (or whatever lives at its ordinal), silently dropping HEVC and AV1 from
+ * vainfo output. Realign to Mesa 26.0 / mainline so advertised profiles
+ * actually reach the guest.
+ */
 enum pipe_video_profile
 {
    PIPE_VIDEO_PROFILE_UNKNOWN,
    PIPE_VIDEO_PROFILE_MPEG1,
    PIPE_VIDEO_PROFILE_MPEG2_SIMPLE,
    PIPE_VIDEO_PROFILE_MPEG2_MAIN,
-   PIPE_VIDEO_PROFILE_MPEG4_SIMPLE,
-   PIPE_VIDEO_PROFILE_MPEG4_ADVANCED_SIMPLE,
    PIPE_VIDEO_PROFILE_VC1_SIMPLE,
    PIPE_VIDEO_PROFILE_VC1_MAIN,
    PIPE_VIDEO_PROFILE_VC1_ADVANCED,
@@ -68,11 +81,15 @@ enum pipe_video_profile
    PIPE_VIDEO_PROFILE_HEVC_MAIN_10,
    PIPE_VIDEO_PROFILE_HEVC_MAIN_STILL,
    PIPE_VIDEO_PROFILE_HEVC_MAIN_12,
+   PIPE_VIDEO_PROFILE_HEVC_MAIN10_444,
+   PIPE_VIDEO_PROFILE_HEVC_MAIN_422,
+   PIPE_VIDEO_PROFILE_HEVC_MAIN10_422,
    PIPE_VIDEO_PROFILE_HEVC_MAIN_444,
    PIPE_VIDEO_PROFILE_JPEG_BASELINE,
    PIPE_VIDEO_PROFILE_VP9_PROFILE0,
    PIPE_VIDEO_PROFILE_VP9_PROFILE2,
    PIPE_VIDEO_PROFILE_AV1_MAIN,
+   PIPE_VIDEO_PROFILE_AV1_PROFILE2,
    PIPE_VIDEO_PROFILE_MAX
 };
 
