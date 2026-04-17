@@ -288,6 +288,11 @@ struct virgl_video_codec {
     uint64_t lru_tick;
     DXGI_FORMAT dpb_format;
 
+    /* Previous frame's coded dimensions for VP9 use_prev_in_find_mv_refs
+     * derivation (spec: !error_resilient && !intra_only && prev_size_matches). */
+    uint32_t vp9_prev_frame_width;
+    uint32_t vp9_prev_frame_height;
+
     /* --------------------------------------------------------------
      * Encode-only state (populated lazily for ENCODE entrypoint codecs).
      * -------------------------------------------------------------- */
@@ -2839,7 +2844,17 @@ static void fill_dxva_picparams_vp9(struct virgl_video_codec *codec,
     /* wControlInfoFlags */
     pp->mode_ref_delta_enabled   = d->picture_parameter.mode_ref_delta_enabled ? 1 : 0;
     pp->mode_ref_delta_update    = d->picture_parameter.mode_ref_delta_update ? 1 : 0;
-    pp->use_prev_in_find_mv_refs = 0;   /* TODO: not signalled in virgl desc */
+    /* Per VP9 spec: use_prev_in_find_mv_refs = !error_resilient && !intra_only
+     * && prev_frame_size_matches. Mesa doesn't expose prev_frame_size_matches,
+     * so we track the last frame's coded dimensions on the codec and compare. */
+    pp->use_prev_in_find_mv_refs =
+        (!d->picture_parameter.pic_fields.error_resilient_mode &&
+         !d->picture_parameter.pic_fields.intra_only &&
+         codec->vp9_prev_frame_width  == d->picture_parameter.frame_width &&
+         codec->vp9_prev_frame_height == d->picture_parameter.frame_height &&
+         codec->vp9_prev_frame_width != 0) ? 1 : 0;
+    codec->vp9_prev_frame_width  = d->picture_parameter.frame_width;
+    codec->vp9_prev_frame_height = d->picture_parameter.frame_height;
 
     memcpy(pp->ref_deltas,  d->picture_parameter.ref_deltas,  4);
     memcpy(pp->mode_deltas, d->picture_parameter.mode_deltas, 2);
@@ -2861,40 +2876,41 @@ static void fill_dxva_picparams_vp9(struct virgl_video_codec *codec,
            d->picture_parameter.mb_segment_tree_probs, 7);
     memcpy(pp->stVP9Segments.pred_probs,
            d->picture_parameter.segment_pred_probs, 3);
-    /* Per-segment filter_level / QP deltas: virgl packs in seg_param[].
-     * DXVA DXVA_segmentation_VP9.feature_data is SHORT[8][4]:
-     *   [seg][0] = luma AC QP delta
-     *   [seg][1] = luma loop-filter delta
-     *   [seg][2] = ref frame (used only when ref-enabled bit set)
-     *   [seg][3] = skip (0/1)
-     * virgl's per-seg filter/QP deltas come from slice_parameter.seg_param;
-     * the DXVA mask encodes which features are active per segment. */
-    for (i = 0; i < 8; i++) {
-        const struct virgl_vp9_segment_parameter *sp =
-            &d->slice_parameter.seg_param[i];
-        UCHAR mask = 0;
+    /* Per-segment feature data / mask is only meaningful when segmentation
+     * is enabled. Mesa may leave seg_param[] uninitialised for clips that
+     * don't segment, which previously caused us to set feature_mask bits
+     * based on garbage per-segment quant scales — corrupting residual
+     * dequantisation on streams where segmentation is off. */
+    if (d->picture_parameter.pic_fields.segmentation_enabled) {
+        for (i = 0; i < 8; i++) {
+            const struct virgl_vp9_segment_parameter *sp =
+                &d->slice_parameter.seg_param[i];
+            UCHAR mask = 0;
 
-        pp->stVP9Segments.feature_data[i][0] = sp->luma_ac_quant_scale;
-        /* The "loop-filter-level" DXVA field expects a signed delta; virgl
-         * stores per-(ref,mode) 4x2 level array. Pick ref=0/mode=0 (intra)
-         * as the primary loop filter level delta. */
-        pp->stVP9Segments.feature_data[i][1] = (SHORT)sp->filter_level[0][0];
-        pp->stVP9Segments.feature_data[i][2] =
-            sp->segment_flags.segment_reference;
-        pp->stVP9Segments.feature_data[i][3] =
-            sp->segment_flags.segment_reference_skipped;
+            /* DXVA feature_data[seg][0] is a signed QP DELTA from base_qindex,
+             * NOT the absolute scaled quant Mesa forwards. Mesa doesn't
+             * expose the delta directly; it is reconstructable only when the
+             * SPS defines a base quant — pass the value Mesa gives and rely
+             * on feature_mask to gate application. */
+            pp->stVP9Segments.feature_data[i][0] = sp->luma_ac_quant_scale;
+            pp->stVP9Segments.feature_data[i][1] = (SHORT)sp->filter_level[0][0];
+            pp->stVP9Segments.feature_data[i][2] =
+                sp->segment_flags.segment_reference;
+            pp->stVP9Segments.feature_data[i][3] =
+                sp->segment_flags.segment_reference_skipped;
 
-        /* feature_mask bits (per DXVA): alt_q, alt_lf, ref, skip. */
-        if (sp->luma_ac_quant_scale || sp->luma_dc_quant_scale ||
-            sp->chroma_ac_quant_scale || sp->chroma_dc_quant_scale)
-            mask |= 0x1;
-        if (sp->filter_level[0][0])
-            mask |= 0x2;
-        if (sp->segment_flags.segment_reference_enabled)
-            mask |= 0x4;
-        if (sp->segment_flags.segment_reference_skipped)
-            mask |= 0x8;
-        pp->stVP9Segments.feature_mask[i] = mask;
+            /* feature_mask bits (per DXVA): alt_q, alt_lf, ref, skip. */
+            if (sp->luma_ac_quant_scale || sp->luma_dc_quant_scale ||
+                sp->chroma_ac_quant_scale || sp->chroma_dc_quant_scale)
+                mask |= 0x1;
+            if (sp->filter_level[0][0])
+                mask |= 0x2;
+            if (sp->segment_flags.segment_reference_enabled)
+                mask |= 0x4;
+            if (sp->segment_flags.segment_reference_skipped)
+                mask |= 0x8;
+            pp->stVP9Segments.feature_mask[i] = mask;
+        }
     }
 
     pp->log2_tile_cols = d->picture_parameter.log2_tile_columns;
