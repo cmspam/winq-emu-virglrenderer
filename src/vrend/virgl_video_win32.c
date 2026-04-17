@@ -1576,11 +1576,24 @@ static void fill_dxva_picparams_h264(struct virgl_video_codec *codec,
     pp->CurrFieldOrderCnt[0] = (INT)desc->field_order_cnt[0];
     pp->CurrFieldOrderCnt[1] = (INT)desc->field_order_cnt[1];
     pp->frame_num = (USHORT)desc->frame_num;
-    pp->num_ref_frames = desc->num_ref_frames;
+    /* DXVA num_ref_frames is the SPS-signalled maximum (H.264 sps
+     * max_num_ref_frames), NOT the count of currently-active references in
+     * RefFrameList[]. FFmpeg's dxva2_h264.c uses h->ps.sps->ref_frame_count.
+     * Sending the active count breaks driver-side DPB sizing for streams
+     * whose active ref count grows across frames (e.g. B-frames with
+     * ref=4). */
+    pp->num_ref_frames = desc->pps.sps.max_num_ref_frames
+                             ? desc->pps.sps.max_num_ref_frames
+                             : desc->num_ref_frames;
 
     /* --- bitfields (wBitFields packed USHORT) --- */
     pp->field_pic_flag = desc->field_pic_flag ? 1 : 0;
-    pp->MbaffFrameFlag = (desc->pps.sps.mb_adaptive_frame_field_flag &&
+    /* H.264 7.4.3: MbaffFrameFlag = mb_adaptive_frame_field_flag &&
+     * !field_pic_flag. Additionally, mb_adaptive_frame_field_flag is only
+     * signalled when frame_mbs_only_flag=0, so guard on that explicitly —
+     * a misbehaving SPS can leave stale bits set. */
+    pp->MbaffFrameFlag = (!desc->pps.sps.frame_mbs_only_flag &&
+                          desc->pps.sps.mb_adaptive_frame_field_flag &&
                           !desc->field_pic_flag) ? 1 : 0;
     pp->residual_colour_transform_flag =
                           desc->pps.sps.separate_colour_plane_flag ? 1 : 0;
@@ -1624,7 +1637,11 @@ static void fill_dxva_picparams_h264(struct virgl_video_codec *codec,
         unsigned j;
 
         if (bid == 0) {
-            pp->NonExistingFrameFlags |= (USHORT)(1u << (i * 1));
+            /* Empty ref slot. Per DXVA H.264 spec and FFmpeg's dxva2_h264.c,
+             * the 0xFF sentinel (set above) is sufficient to mark an unused
+             * entry. NonExistingFrameFlags is reserved for gaps-in-frame_num
+             * generated non-existing refs, NOT for empty list positions —
+             * setting it here misleads the driver's B-frame ref management. */
             continue;
         }
 
@@ -1642,9 +1659,9 @@ static void fill_dxva_picparams_h264(struct virgl_video_codec *codec,
 
         if (slot < 0 || slot >= VIRGL_VIDEO_WIN32_DPB_SIZE) {
             /* Buffer either never decoded in this codec or has since been
-             * evicted from the DPB. Mark non-existing; RefFrameList[i] stays
-             * at the 0xFF sentinel from dxva_picentry_invalidate above. */
-            pp->NonExistingFrameFlags |= (USHORT)(1u << (i * 1));
+             * evicted from the DPB. Leave RefFrameList[i] at the 0xFF
+             * sentinel; do NOT set NonExistingFrameFlags (reserved for
+             * actual gaps-in-frame_num, not list holes). */
             continue;
         }
         pp->RefFrameList[i].Index7Bits = (UCHAR)(slot & 0x7F);
@@ -1827,30 +1844,116 @@ static int submit_h264_decode(struct virgl_video_codec *codec,
         return -1;
     }
 
+    /* Diag: first few frames, show first bytes of each slice buffer. */
+    {
+        static unsigned h264_slice_diag = 0;
+        if (h264_slice_diag < 3) {
+            char dbg[512]; size_t dbgoff = 0;
+            dbgoff += (size_t)snprintf(dbg+dbgoff, sizeof(dbg)-dbgoff,
+                    "h264 slice data: num_buffers=%u", num_buffers);
+            for (i = 0; i < num_buffers && i < 8; i++) {
+                const uint8_t *p = (const uint8_t *)buffers[i];
+                if (!p || sizes[i] < 5) {
+                    dbgoff += (size_t)snprintf(dbg+dbgoff, sizeof(dbg)-dbgoff,
+                            " [%u]:sz=%u (empty)", i, sizes[i]);
+                    continue;
+                }
+                dbgoff += (size_t)snprintf(dbg+dbgoff, sizeof(dbg)-dbgoff,
+                        " [%u]:sz=%u b=%02x%02x%02x%02x%02x",
+                        i, sizes[i], p[0], p[1], p[2], p[3], p[4]);
+                if (dbgoff >= sizeof(dbg)) break;
+            }
+            virgl_warn("%s\n", dbg);
+            h264_slice_diag++;
+        }
+    }
+
+    /* Mesa's guest virgl VA driver delivers the whole picture in ONE buffer as
+     * Annex B bytes (multiple NAL units with 0x00 0x00 0x01 or 0x00 0x00 0x00
+     * 0x01 start codes). For multi-slice pictures we must split that stream
+     * into one DXVA_Slice_H264_Short per slice NAL (nal_unit_type 1 or 5, per
+     * H.264 Annex B §7.3.1). The picture params already describe the frame;
+     * the slice control array is what tells the driver where each slice
+     * starts. Scan for every start code and classify each NAL. */
     for (i = 0; i < num_buffers && slice_count < VIRGL_VIDEO_WIN32_MAX_SLICES; i++) {
         unsigned sz = sizes[i];
-        if (!buffers[i] || !sz)
+        const uint8_t *buf = (const uint8_t *)buffers[i];
+        unsigned nal_offsets[VIRGL_VIDEO_WIN32_MAX_SLICES];
+        unsigned nal_sizes[VIRGL_VIDEO_WIN32_MAX_SLICES];
+        unsigned nal_count = 0;
+        unsigned j;
+        if (!buf || !sz)
             continue;
         if (bs_offset + sz > bs_buf_size) {
-            /* The DXVA driver owns this buffer and sized it for the frame;
-             * spill is fatal. In production we would chunk via
-             * wBadSliceChopping, but Mesa rarely hits this in H.264. */
             virgl_error("virgl_video_win32: bitstream buffer overflow "
                         "(%u + %u > %u)\n", bs_offset, sz, bs_buf_size);
-            /* Release then bail. */
             ID3D11VideoContext_ReleaseDecoderBuffer(
                 g_vid.video_context, codec->decoder,
                 D3D11_VIDEO_DECODER_BUFFER_BITSTREAM);
             return -1;
         }
-        memcpy((uint8_t *)bs_ptr + bs_offset, buffers[i], sz);
+        /* Copy the whole Annex B blob verbatim — DXVA short format expects
+         * NAL bytes including start codes. */
+        memcpy((uint8_t *)bs_ptr + bs_offset, buf, sz);
 
-        slices[slice_count].BSNALunitDataLocation = bs_offset;
-        slices[slice_count].SliceBytesInBuffer = sz;
-        slices[slice_count].wBadSliceChopping = DXVA_SLICE_CHOPPING_NONE;
+        /* Walk NAL start codes to enumerate each NAL's [start, end). */
+        for (j = 0; j + 3 < sz; ) {
+            /* Match 0x000001 or 0x00000001 */
+            unsigned sc_len = 0;
+            if (buf[j] == 0 && buf[j+1] == 0) {
+                if (buf[j+2] == 1) sc_len = 3;
+                else if (buf[j+2] == 0 && j + 3 < sz && buf[j+3] == 1) sc_len = 4;
+            }
+            if (!sc_len) { j++; continue; }
+            unsigned nal_start = j + sc_len;
+            if (nal_start >= sz) break;
+            uint8_t nal_byte = buf[nal_start];
+            uint8_t nal_type = nal_byte & 0x1F;
+            /* Slice NAL types: 1 (non-IDR) and 5 (IDR). Others (SPS=7, PPS=8,
+             * SEI=6, AUD=9, etc.) are prefix NALs that DXVA doesn't consume
+             * individually but must remain present in the bitstream blob. */
+            if (nal_type == 1 || nal_type == 5 || nal_type == 20) {
+                /* Find the NEXT start code to size this NAL. Include the
+                 * current start code in the NAL bytes so the DXVA driver sees
+                 * the Annex B prefix (it's what short format expects). */
+                unsigned next = nal_start;
+                while (next + 2 < sz) {
+                    if (buf[next] == 0 && buf[next+1] == 0 &&
+                        (buf[next+2] == 1 ||
+                         (buf[next+2] == 0 && next + 3 < sz && buf[next+3] == 1)))
+                        break;
+                    next++;
+                }
+                if (next + 2 >= sz) next = sz;
+                if (nal_count < VIRGL_VIDEO_WIN32_MAX_SLICES) {
+                    nal_offsets[nal_count] = j;       /* include start code */
+                    nal_sizes[nal_count]   = next - j;
+                    nal_count++;
+                }
+                j = next;
+            } else {
+                j = nal_start;
+            }
+        }
+
+        if (nal_count == 0) {
+            /* No slice NAL found (shouldn't happen for a valid frame); treat
+             * the whole buffer as one slice to avoid losing data. */
+            slices[slice_count].BSNALunitDataLocation = bs_offset;
+            slices[slice_count].SliceBytesInBuffer   = sz;
+            slices[slice_count].wBadSliceChopping    = DXVA_SLICE_CHOPPING_NONE;
+            slice_count++;
+        } else {
+            for (j = 0; j < nal_count &&
+                        slice_count < VIRGL_VIDEO_WIN32_MAX_SLICES; j++) {
+                slices[slice_count].BSNALunitDataLocation = bs_offset + nal_offsets[j];
+                slices[slice_count].SliceBytesInBuffer   = nal_sizes[j];
+                slices[slice_count].wBadSliceChopping    = DXVA_SLICE_CHOPPING_NONE;
+                slice_count++;
+            }
+        }
 
         bs_offset += sz;
-        slice_count++;
     }
 
     if (slice_count == 0) {
