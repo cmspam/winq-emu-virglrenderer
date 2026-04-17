@@ -3008,30 +3008,20 @@ static void fill_dxva_picparams_av1(struct virgl_video_codec *codec,
     }
     pp->seq_profile = d->picture_parameter.profile;
 
-    /* Tile geometry. AV1 allows up to 64x64 tiles; DXVA stores widths and
-     * heights per-tile-col / per-tile-row. Only the first tile_cols / tile_rows
-     * entries are meaningful; leave the remainder zero (ffmpeg does the same).
-     *
-     * IMPORTANT: DXVA's tiles.widths[i] / tiles.heights[i] fields are
-     * TileWidthInSbMinus1 / TileHeightInSbMinus1 — that is, the tile size
-     * in superblocks MINUS ONE (per MS-DXVA AV1 spec and ffmpeg's
-     * dxva2_av1.c). Mesa's virgl_av1_picture_desc.width_in_sbs[i] /
-     * height_in_sbs[i] hold the RAW count (TileWidthInSb), matching the
-     * AV1 bitstream order but NOT DXVA's minus-1 convention. Subtract 1
-     * before stuffing into DXVA — without this the driver reads one
-     * extra SB per tile and produces corrupt output across every frame
-     * (intra and inter alike). */
+    /* Tile geometry. ffmpeg dxva2_av1.c packs widths/heights as the RAW SB
+     * count (width_in_sbs_minus_1 + 1). Mesa's VA frontend already does the
+     * +1 when populating width_in_sbs[] / height_in_sbs[] from VA-API's
+     * _minus_1 fields, so we pass them through unchanged. Earlier code
+     * subtracted 1 again — that re-introduced the minus_1 form and fed the
+     * driver tile sizes one SB too small on every frame, producing corrupt
+     * output even on key/intra-only frames. */
     pp->tiles.cols = d->picture_parameter.tile_cols;
     pp->tiles.rows = d->picture_parameter.tile_rows;
     pp->tiles.context_update_id = d->picture_parameter.context_update_tile_id;
-    for (i = 0; i < pp->tiles.cols && i < 64; i++) {
-        uint16_t w = d->picture_parameter.width_in_sbs[i];
-        pp->tiles.widths[i] = (USHORT)(w > 0 ? w - 1 : 0);
-    }
-    for (i = 0; i < pp->tiles.rows && i < 64; i++) {
-        uint16_t h = d->picture_parameter.height_in_sbs[i];
-        pp->tiles.heights[i] = (USHORT)(h > 0 ? h - 1 : 0);
-    }
+    for (i = 0; i < pp->tiles.cols && i < 64; i++)
+        pp->tiles.widths[i] = d->picture_parameter.width_in_sbs[i];
+    for (i = 0; i < pp->tiles.rows && i < 64; i++)
+        pp->tiles.heights[i] = d->picture_parameter.height_in_sbs[i];
 
     /* CodingParamToolFlags */
     pp->coding.use_128x128_superblock =
@@ -3050,8 +3040,16 @@ static void fill_dxva_picparams_av1(struct virgl_video_codec *codec,
         d->picture_parameter.seq_info_fields.enable_jnt_comp;
     pp->coding.screen_content_tools =
         d->picture_parameter.pic_info_fields.allow_screen_content_tools;
-    pp->coding.integer_mv =
-        d->picture_parameter.pic_info_fields.force_integer_mv;
+    /* AV1 spec §5.9.1: integer_mv is forced to 1 for key / intra-only
+     * frames regardless of the header bit. Mesa's force_integer_mv reflects
+     * the header literal; fix up the derived value here so the driver
+     * doesn't attempt sub-pel refinement on keyframes. */
+    {
+        uint8_t ft = d->picture_parameter.pic_info_fields.frame_type;
+        bool intra_only = (ft == 0 /* key */) || (ft == 2 /* intra-only */);
+        pp->coding.integer_mv = intra_only ? 1 :
+            d->picture_parameter.pic_info_fields.force_integer_mv;
+    }
     pp->coding.cdef =
         d->picture_parameter.seq_info_fields.enable_cdef;
     /* restoration is derived from per-plane frame_restoration_type values
@@ -3289,12 +3287,20 @@ static void fill_dxva_picparams_av1(struct virgl_video_codec *codec,
         pp->quantization.qm_v = 0xFF;
     }
 
-    /* CDEF */
+    /* CDEF. VA-API packs cdef_y_strengths[i] = (primary << 2) | secondary
+     * (AV1 bitstream ordering — primary in high bits, secondary in low).
+     * DXVA's union primary:6 / secondary:2 lays primary in bits [5:0] and
+     * secondary in bits [7:6] (little-endian bitfield). Swap the two
+     * halves so the 6-bit primary value lands in DXVA's primary slot. */
     pp->cdef.damping = (UCHAR)(d->picture_parameter.cdef_damping_minus_3 & 0x3);
     pp->cdef.bits    = (UCHAR)(d->picture_parameter.cdef_bits & 0x3);
     for (i = 0; i < 8; i++) {
-        pp->cdef.y_strengths[i].combined  = d->picture_parameter.cdef_y_strengths[i];
-        pp->cdef.uv_strengths[i].combined = d->picture_parameter.cdef_uv_strengths[i];
+        UCHAR vy = d->picture_parameter.cdef_y_strengths[i];
+        UCHAR vuv = d->picture_parameter.cdef_uv_strengths[i];
+        pp->cdef.y_strengths[i].combined =
+            (UCHAR)((vy >> 2) | ((vy & 0x3) << 6));
+        pp->cdef.uv_strengths[i].combined =
+            (UCHAR)((vuv >> 2) | ((vuv & 0x3) << 6));
     }
 
     pp->interp_filter = d->picture_parameter.interp_filter;
@@ -3384,9 +3390,10 @@ static void fill_dxva_picparams_av1(struct virgl_video_codec *codec,
             (SHORT)d->picture_parameter.film_grain_info.cr_offset;
     }
 
-    pp->StatusReportFeedbackNumber = codec->status_report_feedback++;
-    if (pp->StatusReportFeedbackNumber == 0)
-        pp->StatusReportFeedbackNumber = codec->status_report_feedback++;
+    /* AV1 specifically: ffmpeg leaves StatusReportFeedbackNumber = 0 because
+     * setting it breaks decoding on some drivers (tested NVIDIA 457.09).
+     * H.264/HEVC/VP9 set it; AV1 does not. */
+    pp->StatusReportFeedbackNumber = 0;
 }
 
 /* AV1 slice control is a DXVA_Tile_AV1 array, one per submitted OBU-tile.
