@@ -78,8 +78,10 @@ vkr_win32_remap_external_handle_types_in_chain(const void *pNext)
       case VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO: {
          VkExternalMemoryBufferCreateInfo *info =
             (VkExternalMemoryBufferCreateInfo *)iter;
-         if (info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT) {
-            info->handleTypes &= ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+         if (info->handleTypes & (VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
+                                  VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)) {
+            info->handleTypes &= ~(VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
+                                   VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
             info->handleTypes |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
          }
          break;
@@ -87,16 +89,20 @@ vkr_win32_remap_external_handle_types_in_chain(const void *pNext)
       case VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO: {
          VkExternalMemoryImageCreateInfo *info =
             (VkExternalMemoryImageCreateInfo *)iter;
-         if (info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT) {
-            info->handleTypes &= ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+         if (info->handleTypes & (VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
+                                  VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)) {
+            info->handleTypes &= ~(VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
+                                   VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
             info->handleTypes |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
          }
          break;
       }
       case VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO: {
          VkExportMemoryAllocateInfo *info = (VkExportMemoryAllocateInfo *)iter;
-         if (info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT) {
-            info->handleTypes &= ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+         if (info->handleTypes & (VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
+                                  VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)) {
+            info->handleTypes &= ~(VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
+                                   VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
             info->handleTypes |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
          }
          break;
@@ -233,21 +239,49 @@ vkr_win32_CreateImage(VkDevice device,
    /* Remap any existing external memory info in the pNext chain */
    vkr_win32_remap_external_handle_types_in_chain(pCreateInfo->pNext);
 
-   /* Only remap existing external memory info (OPAQUE_FD → OPAQUE_WIN32).
+   /*
+    * For any image that requests external memory (OPAQUE_WIN32 after remap),
+    * force VK_IMAGE_TILING_LINEAR. Intel's Windows Vulkan driver picks a D3D-
+    * oriented layout for OPAQUE_WIN32-exportable memory with TILING_OPTIMAL,
+    * and that layout's byte order does NOT match the declared VkFormat. For
+    * example, VK_FORMAT_B8G8R8A8_UNORM + OPTIMAL + OPAQUE_WIN32 ends up with
+    * bytes laid out as if the format were DXGI-R8G8B8A8, so every later
+    * consumer that takes the dma-buf at face value (kwin, XWayland, ANGLE)
+    * sees R and B swapped.
     *
-    * Unlike buffers, we do NOT force VkExternalMemoryImageCreateInfo onto
-    * images that don't request it.  The Intel Windows driver misbehaves
-    * (hangs, leaks memory) when certain image types are created with
-    * external memory info that they don't support.
+    * Forcing LINEAR tells Intel's driver to use a plain row-major layout
+    * that respects the declared VkFormat byte order, which matches what
+    * Vulkan, GL, libva and every Wayland compositor expect from a
+    * dma-buf with modifier=LINEAR. Side effects: LINEAR is slower than
+    * OPTIMAL for GPU sampling, but swapchain images are write-rarely-read-
+    * once so the overhead is ~0 on GPUs that natively support both layouts
+    * (all modern Intel/NVIDIA/AMD).
     *
-    * This means images bound to forced-external HOST_VISIBLE memory may
-    * not have matching create info, which is a spec violation.  However,
-    * this matches the upstream Linux behavior where this violation is
-    * tolerated by all drivers.  The rendering correctness issue (blank
-    * output) must be addressed differently — likely by fixing the
-    * swapchain/WSI presentation path rather than image creation.
+    * The narrower version of this coercion (only when a
+    * VkImageDrmFormatModifierListCreateInfoEXT is chained) lives in
+    * vkr_dispatch_vkCreateImage; that path strips the modifier pNext and
+    * then this broader coercion picks up every other external-memory image
+    * Mesa might create for xcb/xlib DRI3, direct presentation, etc.
     */
-   return entry->saved_proc_table.CreateImage(device, pCreateInfo, pAllocator, pImage);
+   const VkImageCreateInfo *info_in = pCreateInfo;
+   VkImageCreateInfo info_local;
+   const void *pnext = info_in->pNext;
+   const VkExternalMemoryImageCreateInfo *ext_info = NULL;
+   for (const VkBaseInStructure *iter = (const VkBaseInStructure *)pnext;
+        iter; iter = iter->pNext) {
+      if (iter->sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO) {
+         ext_info = (const VkExternalMemoryImageCreateInfo *)iter;
+         break;
+      }
+   }
+   if (ext_info && ext_info->handleTypes &&
+       info_in->tiling != VK_IMAGE_TILING_LINEAR) {
+      info_local = *info_in;
+      info_local.tiling = VK_IMAGE_TILING_LINEAR;
+      info_in = &info_local;
+   }
+
+   return entry->saved_proc_table.CreateImage(device, info_in, pAllocator, pImage);
 }
 
 /* ------------------------------------------------------------------ */

@@ -10,6 +10,18 @@
 
 struct vkr_image {
    struct vkr_object base;
+
+#ifdef _WIN32
+   /* Set when the image was created through the VK_EXT_image_drm_format_modifier
+    * shim: the guest asked for tiling=DRM_FORMAT_MODIFIER_EXT with a
+    * modifier pNext chain; the shim rewrote that to tiling=LINEAR before
+    * forwarding to the host ICD. Used later to translate aspect-mask
+    * values in vkGetImageSubresourceLayout(2) — the guest queries
+    * VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT (valid only for MODIFIER
+    * tiling), but on the host we need VK_IMAGE_ASPECT_COLOR_BIT (the
+    * aspect valid for LINEAR). */
+   bool dma_buf_shim_linear;
+#endif
 };
 VKR_DEFINE_OBJECT_CAST(image, VK_OBJECT_TYPE_IMAGE, VkImage)
 
