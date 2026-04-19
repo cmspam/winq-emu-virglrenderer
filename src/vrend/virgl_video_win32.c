@@ -541,6 +541,22 @@ int virgl_video_init(int drm_fd,
         return 0;
     }
 
+    /* VA-API hardware video decode is opt-in while it remains experimental:
+     * the vaMapBuffer / vaGetImage (“copy”) path is stable in mpv, VLC,
+     * Haruna, GStreamer, etc., but the vaExportSurfaceHandle zero-copy
+     * path that Chromium's VaapiVideoDecoder takes is not yet functional
+     * through virglrenderer on Windows. Require WINQ_VAAPI=1 to enable,
+     * and expose this env var as a checkbox in the launcher's Experimental
+     * tab. When unset we simply fail init so the codec enumeration is
+     * empty — vainfo reports only VAProfileNone, matching the Alpha 5
+     * baseline. */
+    {
+        const char *e = getenv("WINQ_VAAPI");
+        if (!e || !*e || e[0] == '0') {
+            return -1;
+        }
+    }
+
     memset(&g_vid, 0, sizeof(g_vid));
 
     hr = D3D11CreateDevice(NULL,
