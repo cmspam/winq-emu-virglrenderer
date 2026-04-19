@@ -6,7 +6,12 @@
 #include "vkr_image.h"
 
 #include "vkr_image_gen.h"
+#include "vkr_device.h"
 #include "vkr_physical_device.h"
+
+#ifndef DRM_FORMAT_MOD_LINEAR
+#define DRM_FORMAT_MOD_LINEAR 0ULL
+#endif
 
 static void
 vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
@@ -31,7 +36,50 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
     * situation because the app does not consider the memory external.
     */
 
-   vkr_image_create_and_add(dispatch->data, args);
+#ifdef _WIN32
+   /*
+    * Strip VK_EXT_image_drm_format_modifier pNext structs before the host
+    * ICD sees them: the Windows ICD doesn't understand modifiers. Coerce
+    * tiling=LINEAR so the layout matches what we'll report back through
+    * vkGetImageDrmFormatModifierPropertiesEXT. LINEAR is the only modifier
+    * we synthesize.
+    */
+   struct vkr_device *dev = vkr_device_from_handle(args->device);
+   bool shim_linear = false;
+   if (dev->physical_device->dma_buf_shim_active) {
+      VkImageCreateInfo *info = (VkImageCreateInfo *)args->pCreateInfo;
+      VkBaseInStructure *prev = (VkBaseInStructure *)info;
+      while (prev->pNext) {
+         VkStructureType t = prev->pNext->sType;
+         if (t == VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT ||
+             t == VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT) {
+            prev->pNext = prev->pNext->pNext;
+            shim_linear = true;
+         } else {
+            prev = (VkBaseInStructure *)prev->pNext;
+         }
+      }
+      if (shim_linear) {
+         /* Guest set tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT along
+          * with the stripped modifier pNext. Without the pNext that tiling
+          * value is invalid. We honor DRM_FORMAT_MOD_LINEAR by coercing to
+          * TILING_LINEAR so the host ICD allocates genuinely row-major
+          * memory. Cross-process dma-buf consumers (Wayland compositors,
+          * Chromium's VaapiVideoDecoder GL import) need the backing pixels
+          * to match what they'll interpret as LINEAR — any other tiling
+          * produces garbage output even if vkCreateImage itself succeeds. */
+         info->tiling = VK_IMAGE_TILING_LINEAR;
+      }
+   }
+#endif
+
+   struct vkr_image *img = vkr_image_create_and_add(dispatch->data, args);
+#ifdef _WIN32
+   if (img && shim_linear)
+      img->dma_buf_shim_linear = true;
+#else
+   (void)img;
+#endif
 }
 
 static void
@@ -124,6 +172,27 @@ vkr_dispatch_vkGetImageSubresourceLayout(
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct vn_device_proc_table *vk = &dev->proc_table;
 
+#ifdef _WIN32
+   /* For shim images (host-side tiling=LINEAR, guest thinks tiling=MODIFIER),
+    * translate the guest's MEMORY_PLANE_0_BIT_EXT aspect (valid only for
+    * MODIFIER tiling per spec) to COLOR_BIT (what the host's LINEAR image
+    * understands). Forward the call to the host so the returned rowPitch is
+    * what the ICD actually laid out — any synthesized row pitch we invented
+    * would mismatch the real memory and produce garbled pixels in external
+    * consumers (Wayland compositors, ANGLE dma-buf import).
+    */
+   struct vkr_image *img = vkr_image_from_handle(args->image);
+   VkImageSubresource shim_sub;
+   if (img && img->dma_buf_shim_linear && args->pSubresource) {
+      shim_sub = *args->pSubresource;
+      if (shim_sub.aspectMask & VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT)
+         shim_sub.aspectMask =
+            (shim_sub.aspectMask & ~VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT) |
+            VK_IMAGE_ASPECT_COLOR_BIT;
+      args->pSubresource = &shim_sub;
+   }
+#endif
+
    vn_replace_vkGetImageSubresourceLayout_args_handle(args);
    vk->GetImageSubresourceLayout(args->device, args->image, args->pSubresource,
                                  args->pLayout);
@@ -136,6 +205,24 @@ vkr_dispatch_vkGetImageSubresourceLayout2(
 {
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct vn_device_proc_table *vk = &dev->proc_table;
+
+#ifdef _WIN32
+   /* Mirror of the non-2 path: translate MEMORY_PLANE_0_BIT_EXT → COLOR_BIT
+    * for shim-LINEAR images so the host ICD can service the query on its
+    * actually-LINEAR backing. */
+   struct vkr_image *img = vkr_image_from_handle(args->image);
+   VkImageSubresource2 shim_sub;
+   if (img && img->dma_buf_shim_linear && args->pSubresource) {
+      shim_sub = *args->pSubresource;
+      if (shim_sub.imageSubresource.aspectMask &
+          VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT)
+         shim_sub.imageSubresource.aspectMask =
+            (shim_sub.imageSubresource.aspectMask &
+             ~VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT) |
+            VK_IMAGE_ASPECT_COLOR_BIT;
+      args->pSubresource = &shim_sub;
+   }
+#endif
 
    vn_replace_vkGetImageSubresourceLayout2_args_handle(args);
    vk->GetImageSubresourceLayout2(args->device, args->image, args->pSubresource,
@@ -161,6 +248,19 @@ vkr_dispatch_vkGetImageDrmFormatModifierPropertiesEXT(
 {
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct vn_device_proc_table *vk = &dev->proc_table;
+
+#ifdef _WIN32
+   /*
+    * The Windows ICD doesn't implement this entry point (extension is
+    * synthesized by vkr). Every image created through the shim was forced
+    * to LINEAR, so answer LINEAR without calling the host.
+    */
+   if (dev->physical_device->dma_buf_shim_active) {
+      args->pProperties->drmFormatModifier = DRM_FORMAT_MOD_LINEAR;
+      args->ret = VK_SUCCESS;
+      return;
+   }
+#endif
 
    vn_replace_vkGetImageDrmFormatModifierPropertiesEXT_args_handle(args);
    args->ret = vk->GetImageDrmFormatModifierPropertiesEXT(args->device, args->image,

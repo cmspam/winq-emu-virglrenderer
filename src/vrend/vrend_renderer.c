@@ -47,6 +47,7 @@
 
 #include "vrend_object.h"
 #include "vrend_shader.h"
+#include "util/os_file.h"
 
 #include "vrend_renderer.h"
 #include "vrend_blitter.h"
@@ -60,6 +61,12 @@
 #include "virgl_resource.h"
 #include "virglrenderer.h"
 #include "virgl_protocol.h"
+
+#include "util/os_file.h"
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include "virgl_fence.h"
 #include "virtgpu_drm.h"
 
@@ -177,6 +184,7 @@ enum features_id
    feat_khr_debug,
    feat_memory_object,
    feat_memory_object_fd,
+   feat_memory_object_win32,
    feat_mesa_invert,
    feat_ms_scaled_blit,
    feat_multisample,
@@ -290,6 +298,7 @@ static const  struct {
    FEAT(khr_debug, 43, 32,  "GL_KHR_debug" ),
    FEAT(memory_object, UNAVAIL, UNAVAIL, "GL_EXT_memory_object"),
    FEAT(memory_object_fd, UNAVAIL, UNAVAIL, "GL_EXT_memory_object_fd"),
+   FEAT(memory_object_win32, UNAVAIL, UNAVAIL, "GL_EXT_memory_object_win32"),
    FEAT(mesa_invert, UNAVAIL, UNAVAIL,  "GL_MESA_pack_invert" ),
    FEAT(ms_scaled_blit, UNAVAIL, UNAVAIL,  "GL_EXT_framebuffer_multisample_blit_scaled" ),
    FEAT(multisample, 32, 30,  "GL_ARB_texture_multisample" ),
@@ -2752,13 +2761,34 @@ int vrend_create_sampler_view(struct vrend_context *ctx,
    for (enum pipe_swizzle i = 0; i < 4; ++i)
       view->gl_swizzle[i] = to_gl_swizzle(swizzle[i]);
 
-   if (res->is_imported && vrend_format_is_bgra(view->texture->base.format)) {
-      /* Swap R/B channel for vulkan imported texture. */
+   if (res->is_imported && vrend_format_is_bgra(view->texture->base.format) &&
+       !has_bit(res->storage_bits, VREND_STORAGE_GL_MEMOBJ)) {
+      /*
+       * Swap R/B channel for EGL-imported vulkan textures.
+       *
+       * On Linux, virgl_egl_image_from_dmabuf binds a BGRA dma-buf to a GL
+       * texture where EGL has renamed the channels into GL's RGBA layout,
+       * so a shader sampling `.r` returns the stored B byte. Swapping the
+       * view swizzle R↔B compensates.
+       *
+       * This does NOT apply to Windows GL_EXT_memory_object_win32 imports
+       * (VREND_STORAGE_GL_MEMOBJ set): there the host Vulkan ICD lays out
+       * memory in DXGI_FORMAT_R8G8B8A8 byte order regardless of the
+       * declared VkFormat, so a GL_RGBA8 sampler already returns
+       * R-from-byte-0 correctly and this swap would produce an inverted
+       * R/B output (observed: vkcube xcb / SuperTuxKart / Haruna+Zink).
+       */
       GLenum tmp = view->gl_swizzle[0];
       view->gl_swizzle[0] = view->gl_swizzle[2];
       view->gl_swizzle[2] = tmp;
 
       /* Don't decode vulkan imported texture. */
+      view->srgb_decode = GL_SKIP_DECODE_EXT;
+   } else if (res->is_imported &&
+              has_bit(res->storage_bits, VREND_STORAGE_GL_MEMOBJ) &&
+              util_format_is_srgb(view->texture->base.format)) {
+      /* Same srgb-decode handling as the EGL path — the imported memory is
+       * not in a state we want GL's sampler to do sRGB decoding on. */
       view->srgb_decode = GL_SKIP_DECODE_EXT;
    }
 
@@ -13474,8 +13504,12 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
 #endif /* HAVE_EPOXY_EGL_H */
          int fd = -1;
          GLenum internalformat = tex_conv_table[gr->base.format].internalformat;
+         GLuint mem_object = 0;
+#ifdef _WIN32
+         HANDLE handle = INVALID_HANDLE_VALUE;
+#endif
 
-         if (!has_feature(feat_memory_object_fd) || !has_feature(feat_memory_object)) {
+         if (!has_feature(feat_memory_object)) {
             FREE(gr);
             return EINVAL;
          }
@@ -13486,12 +13520,70 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
             return EINVAL;
          }
 
-         /* Create a GL memory object importing memory from a FD */
-         GLuint mem_object;
+#ifdef _WIN32
+         /* On Windows, a "dma-buf" resource exported from Venus (the vkr
+          * dma-buf shim) or from another Vulkan consumer is really an NT
+          * HANDLE referring to an ID3D11Resource or OPAQUE_WIN32
+          * VkDeviceMemory. Unwrap the HANDLE from our fd-indexed token
+          * table and import it into this GL context via
+          * GL_EXT_memory_object_win32 so the host GL driver ends up with
+          * a texture view of the Vulkan-allocated memory — the same zero-
+          * copy pattern Linux hosts get "for free" because both stacks
+          * share the kernel DRM BO. Without this bridge, any wayland
+          * compositor that imports the dma-buf as an EGLImage on the
+          * guest and samples it in GL (kwin, weston, mutter) spins
+          * forever waiting for GL work the driver can't complete against
+          * memory it doesn't own.
+          */
+         if (!has_feature(feat_memory_object_win32)) {
+            if (fd >= 0) os_close_fd(fd);
+            FREE(gr);
+            return EINVAL;
+         }
+
+         handle = os_get_win32_handle_from_fd(fd);
+         if (handle == INVALID_HANDLE_VALUE) {
+            if (fd >= 0) os_close_fd(fd);
+            FREE(gr);
+            return EINVAL;
+         }
+
+         /* Duplicate the HANDLE — glImportMemoryWin32HandleEXT takes
+          * ownership semantically equivalent to DuplicateHandle, and we
+          * must keep our own reference alive through the memory object's
+          * lifetime. */
+         HANDLE dup_handle = NULL;
+         if (!DuplicateHandle(GetCurrentProcess(), handle,
+                              GetCurrentProcess(), &dup_handle,
+                              0, FALSE, DUPLICATE_SAME_ACCESS)) {
+            os_close_fd(fd);
+            FREE(gr);
+            return EINVAL;
+         }
+
+         glCreateMemoryObjectsEXT(1, &mem_object);
+         GLint params = GL_TRUE;
+         glMemoryObjectParameterivEXT(mem_object,
+                                      GL_DEDICATED_MEMORY_OBJECT_EXT,
+                                      &params);
+         glImportMemoryWin32HandleEXT(mem_object, res->map_size,
+                                      GL_HANDLE_TYPE_OPAQUE_WIN32_EXT,
+                                      dup_handle);
+         os_close_fd(fd);
+         (void)dup_handle; /* ownership transferred to the memory object */
+#else
+         if (!has_feature(feat_memory_object_fd)) {
+            if (fd >= 0) os_close_fd(fd);
+            FREE(gr);
+            return EINVAL;
+         }
+
+         /* Create a GL memory object importing memory from an FD */
          glCreateMemoryObjectsEXT(1, &mem_object);
          GLint params = GL_TRUE;
          glMemoryObjectParameterivEXT(mem_object, GL_DEDICATED_MEMORY_OBJECT_EXT, &params);
          glImportMemoryFdEXT(mem_object, res->map_size, GL_HANDLE_TYPE_OPAQUE_FD_EXT, fd);
+#endif
 
          struct pipe_resource *pr = &gr->base;
          gr->target = tgsitargettogltarget(pr->target, pr->nr_samples);

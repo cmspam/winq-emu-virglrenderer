@@ -42,6 +42,15 @@ vkr_device_map_guest_ext_to_host(const struct vkr_physical_device *physical_dev,
    if (!strcmp(name, "VK_KHR_external_semaphore_fd") &&
        physical_dev->host_external_semaphore_win32)
       return "VK_KHR_external_semaphore_win32";
+   /* Extensions synthesized by the dma-buf shim don't exist on the host
+    * ICD. Drop them from the host CreateDevice list: vkr handles these
+    * calls itself without forwarding. */
+   if (!strcmp(name, "VK_EXT_external_memory_dma_buf") &&
+       physical_dev->EXT_external_memory_dma_buf_synthesized)
+      return NULL;
+   if (!strcmp(name, "VK_EXT_image_drm_format_modifier") &&
+       physical_dev->EXT_image_drm_format_modifier_synthesized)
+      return NULL;
 #endif
 
    return name;
@@ -369,6 +378,8 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
    for (uint32_t i = 0; i < guest_ext_count; i++) {
       const char *host_name = vkr_device_map_guest_ext_to_host(
          physical_dev, args->pCreateInfo->ppEnabledExtensionNames[i]);
+      if (!host_name)
+         continue; /* synthesized extension, not forwarded to host ICD */
       if (!vkr_device_has_extension(exts, host_ext_count, host_name))
          exts[host_ext_count++] = host_name;
    }
@@ -382,6 +393,7 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
    }
 
    if (physical_dev->EXT_external_memory_dma_buf &&
+       !physical_dev->EXT_external_memory_dma_buf_synthesized &&
        !vkr_device_has_extension(exts, host_ext_count, "VK_EXT_external_memory_dma_buf"))
       exts[host_ext_count++] = "VK_EXT_external_memory_dma_buf";
 

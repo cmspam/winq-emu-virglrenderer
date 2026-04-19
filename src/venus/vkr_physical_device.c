@@ -11,6 +11,19 @@
 #include "vkr_device.h"
 #include "vkr_instance.h"
 
+/*
+ * DRM format modifier constants (from <drm/drm_fourcc.h>).
+ * Duplicated here to avoid a drm/fourcc.h include, since the Windows
+ * host doesn't ship DRM headers but still needs to respond with these
+ * values when synthesizing VK_EXT_image_drm_format_modifier.
+ */
+#ifndef DRM_FORMAT_MOD_LINEAR
+#define DRM_FORMAT_MOD_LINEAR 0ULL
+#endif
+#ifndef DRM_FORMAT_MOD_INVALID
+#define DRM_FORMAT_MOD_INVALID ((1ULL << 56) - 1)
+#endif
+
 #ifdef HAVE_LINUX_UDMABUF_H
 #include <fcntl.h>
 
@@ -296,7 +309,8 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
    if (result != VK_SUCCESS)
       return;
 
-   const uint32_t extra_guest_exts = 4;
+   /* 4 slots for existing Win32 external fd shims, +2 for dma-buf + modifier */
+   const uint32_t extra_guest_exts = 6;
    exts = calloc(count + extra_guest_exts, sizeof(*exts));
    if (!exts)
       return;
@@ -382,6 +396,64 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
          free(exts);
          return;
       }
+   }
+
+   /* Synthesize Linux dma-buf + modifier extensions on Windows when we have
+    * OPAQUE_WIN32 external memory to translate to. The host ICD has no
+    * concept of dma-buf (a Linux kernel primitive), but guest consumers
+    * (ANGLE Vulkan, Zink, Mesa EGL import) require the extensions to exist
+    * before they will take zero-copy or dma-buf interop paths. We fulfill
+    * the guest-visible contract by forcing LINEAR image tiling and mapping
+    * DMA_BUF_BIT_EXT handle types to OPAQUE_WIN32_BIT inside vkr. LINEAR is
+    * the only modifier we expose, which matches what a Windows host can
+    * honestly describe across process boundaries.
+    */
+   /* Advertise VK_EXT_external_memory_dma_buf + VK_EXT_image_drm_format_modifier
+    * to the guest and translate them to OPAQUE_WIN32 + LINEAR tiling on the
+    * host Vulkan ICD.
+    *
+    * The missing piece that used to make this shim unusable — Wayland
+    * compositors spinning forever when they tried to sample a Vulkan-exported
+    * dma-buf as a GL texture — is now handled in vrend_renderer.c by
+    * glImportMemoryWin32HandleEXT (GL_EXT_memory_object_win32). That lets
+    * vrend's GL path import the Vulkan-exported NT HANDLE as a GL texture
+    * with a real linear storage view, so kwin's EGLImage → GL texture
+    * sampling produces valid pixels and the GL timer query actually
+    * completes.
+    *
+    * Opt out with WINQ_DMABUF_SHIM_OFF=1 if the current test build regresses
+    * for any workload; all the translation code stays in the binary either
+    * way, so toggling is free.
+    */
+   if (physical_dev->host_external_memory_win32 &&
+       getenv("WINQ_DMABUF_SHIM_OFF") == NULL) {
+      const bool had_dma_buf_from_host = physical_dev->EXT_external_memory_dma_buf;
+      if (!had_dma_buf_from_host &&
+          !vkr_physical_device_has_extension(exts, advertised_count,
+                                             "VK_EXT_external_memory_dma_buf")) {
+         if (!vkr_physical_device_append_extension(exts, count + extra_guest_exts,
+                                                   &advertised_count,
+                                                   "VK_EXT_external_memory_dma_buf")) {
+            free(exts);
+            return;
+         }
+      }
+      physical_dev->EXT_external_memory_dma_buf = true;
+      physical_dev->EXT_external_memory_dma_buf_synthesized = !had_dma_buf_from_host;
+
+      const bool had_modifier_from_host = vkr_physical_device_has_extension(
+         exts, advertised_count, "VK_EXT_image_drm_format_modifier");
+      if (!had_modifier_from_host) {
+         if (!vkr_physical_device_append_extension(exts, count + extra_guest_exts,
+                                                   &advertised_count,
+                                                   "VK_EXT_image_drm_format_modifier")) {
+            free(exts);
+            return;
+         }
+      }
+      physical_dev->EXT_image_drm_format_modifier_synthesized = !had_modifier_from_host;
+
+      physical_dev->dma_buf_shim_active = true;
    }
 #endif
 
@@ -807,6 +879,67 @@ vkr_dispatch_vkGetPhysicalDeviceMemoryProperties2(
    }
 }
 
+#ifdef _WIN32
+/*
+ * Fill a VkDrmFormatModifierPropertiesListEXT / List2EXT with a single
+ * LINEAR entry based on the host ICD's linearTilingFeatures for the
+ * given format. LINEAR is the one layout a Windows host can honestly
+ * describe to external consumers, so that's all the shim exposes.
+ */
+static void
+vkr_dma_buf_shim_fill_modifier_list(
+   const VkFormatProperties3 *fmt3,
+   const VkFormatProperties *fmt1,
+   VkFormatFeatureFlags2 features,
+   VkBaseOutStructure *chain)
+{
+   for (VkBaseOutStructure *s = chain; s; s = s->pNext) {
+      if (s->sType == VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT) {
+         VkDrmFormatModifierPropertiesListEXT *list =
+            (VkDrmFormatModifierPropertiesListEXT *)s;
+         VkFormatFeatureFlags feat =
+            fmt3 ? (VkFormatFeatureFlags)fmt3->linearTilingFeatures
+                 : (fmt1 ? fmt1->linearTilingFeatures : (VkFormatFeatureFlags)features);
+         if (!feat) {
+            list->drmFormatModifierCount = 0;
+         } else if (list->pDrmFormatModifierProperties) {
+            if (list->drmFormatModifierCount >= 1) {
+               list->pDrmFormatModifierProperties[0] = (VkDrmFormatModifierPropertiesEXT){
+                  .drmFormatModifier = DRM_FORMAT_MOD_LINEAR,
+                  .drmFormatModifierPlaneCount = 1,
+                  .drmFormatModifierTilingFeatures = feat,
+               };
+            }
+            list->drmFormatModifierCount = 1;
+         } else {
+            list->drmFormatModifierCount = 1;
+         }
+      } else if (s->sType == VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_2_EXT) {
+         VkDrmFormatModifierPropertiesList2EXT *list =
+            (VkDrmFormatModifierPropertiesList2EXT *)s;
+         VkFormatFeatureFlags2 feat =
+            fmt3 ? fmt3->linearTilingFeatures
+                 : (fmt1 ? (VkFormatFeatureFlags2)fmt1->linearTilingFeatures : features);
+         if (!feat) {
+            list->drmFormatModifierCount = 0;
+         } else if (list->pDrmFormatModifierProperties) {
+            if (list->drmFormatModifierCount >= 1) {
+               list->pDrmFormatModifierProperties[0] =
+                  (VkDrmFormatModifierProperties2EXT){
+                     .drmFormatModifier = DRM_FORMAT_MOD_LINEAR,
+                     .drmFormatModifierPlaneCount = 1,
+                     .drmFormatModifierTilingFeatures = feat,
+                  };
+            }
+            list->drmFormatModifierCount = 1;
+         } else {
+            list->drmFormatModifierCount = 1;
+         }
+      }
+   }
+}
+#endif /* _WIN32 */
+
 static void
 vkr_dispatch_vkGetPhysicalDeviceFormatProperties2(
    UNUSED struct vn_dispatch_context *dispatch,
@@ -816,9 +949,48 @@ vkr_dispatch_vkGetPhysicalDeviceFormatProperties2(
       vkr_physical_device_from_handle(args->physicalDevice);
    struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
 
+#ifdef _WIN32
+   /*
+    * When the guest queries a format with VkDrmFormatModifierPropertiesList(2)EXT
+    * chained, the host ICD on Windows can't fill it (extension is synthesized).
+    * Excise the modifier list struct from the pNext chain so the host only sees
+    * nodes it understands, call the host, then reinsert the modifier list at
+    * its original position and populate it ourselves. This preserves any other
+    * output structs the guest chained on either side of the modifier list.
+    */
+   VkBaseOutStructure *modifier_node = NULL;
+   VkBaseOutStructure *prev_of_modifier = NULL;
+   if (physical_dev->dma_buf_shim_active) {
+      VkBaseOutStructure *iter = (VkBaseOutStructure *)args->pFormatProperties;
+      while (iter->pNext) {
+         VkStructureType t = iter->pNext->sType;
+         if (t == VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT ||
+             t == VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_2_EXT) {
+            modifier_node = iter->pNext;
+            prev_of_modifier = iter;
+            iter->pNext = modifier_node->pNext;
+            modifier_node->pNext = NULL;
+            break;
+         }
+         iter = iter->pNext;
+      }
+   }
+#endif
+
    vn_replace_vkGetPhysicalDeviceFormatProperties2_args_handle(args);
    vk->GetPhysicalDeviceFormatProperties2(args->physicalDevice, args->format,
                                           args->pFormatProperties);
+
+#ifdef _WIN32
+   if (modifier_node) {
+      modifier_node->pNext = prev_of_modifier->pNext;
+      prev_of_modifier->pNext = modifier_node;
+      const VkFormatProperties3 *fmt3 = vkr_find_struct(
+         args->pFormatProperties->pNext, VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3);
+      vkr_dma_buf_shim_fill_modifier_list(
+         fmt3, &args->pFormatProperties->formatProperties, 0, modifier_node);
+   }
+#endif
 }
 
 static void
@@ -830,9 +1002,100 @@ vkr_dispatch_vkGetPhysicalDeviceImageFormatProperties2(
       vkr_physical_device_from_handle(args->physicalDevice);
    struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
 
+#ifdef _WIN32
+   /*
+    * If the guest chains VkPhysicalDeviceImageDrmFormatModifierInfoEXT we strip
+    * it, coerce tiling=LINEAR, and forward. Any modifier other than LINEAR is
+    * rejected since that's all the Windows host can honestly back. We also
+    * remap DMA_BUF to OPAQUE_WIN32 in any chained VkPhysicalDeviceExternalImageFormatInfo.
+    */
+   VkPhysicalDeviceImageFormatInfo2 shim_info;
+   VkBaseInStructure *strip_chain = NULL;
+   VkExternalMemoryHandleTypeFlagBits saved_handle_type = 0;
+   VkPhysicalDeviceExternalImageFormatInfo *ext_info_ptr = NULL;
+   if (physical_dev->dma_buf_shim_active) {
+      /* scan for modifier info */
+      const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *mod_info =
+         vkr_find_struct(args->pImageFormatInfo->pNext,
+                         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT);
+      if (mod_info && mod_info->drmFormatModifier != DRM_FORMAT_MOD_LINEAR) {
+         *args->pImageFormatProperties =
+            (VkImageFormatProperties2){ .sType = args->pImageFormatProperties->sType };
+         args->ret = VK_ERROR_FORMAT_NOT_SUPPORTED;
+         return;
+      }
+      if (mod_info) {
+         /* Rebuild a modified info struct on the stack. We build a shallow copy
+          * and a new pNext chain that skips the modifier info. Tiling must be
+          * LINEAR here so the host's answer corresponds to what we'll actually
+          * create in vkCreateImage (also LINEAR). Cross-process dma-buf
+          * consumers depend on pixels being in LINEAR layout; reporting
+          * OPTIMAL capabilities here and then silently creating OPTIMAL would
+          * mean compositors read a proprietary tiled layout as LINEAR and
+          * render garbage. If Intel's Windows ICD reports the combination as
+          * unsupported via this query, we honestly propagate that to the guest. */
+         shim_info = *args->pImageFormatInfo;
+         shim_info.tiling = VK_IMAGE_TILING_LINEAR;
+         /* copy + rebuild pNext excluding the modifier info */
+         VkBaseInStructure *src =
+            (VkBaseInStructure *)args->pImageFormatInfo->pNext;
+         VkBaseInStructure **dst = (VkBaseInStructure **)&shim_info.pNext;
+         shim_info.pNext = NULL;
+         while (src) {
+            if (src->sType !=
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT) {
+               *dst = src;
+               dst = (VkBaseInStructure **)&src->pNext;
+               VkBaseInStructure *next = (VkBaseInStructure *)src->pNext;
+               src->pNext = NULL;
+               src = next;
+            } else {
+               src = (VkBaseInStructure *)src->pNext;
+            }
+         }
+         args->pImageFormatInfo = &shim_info;
+         strip_chain = (VkBaseInStructure *)&shim_info;
+      }
+      /* remap external handle type if guest asked about dma-buf */
+      ext_info_ptr = vkr_find_struct(
+         args->pImageFormatInfo->pNext,
+         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO);
+      if (ext_info_ptr &&
+          ext_info_ptr->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) {
+         saved_handle_type = ext_info_ptr->handleType;
+         ext_info_ptr->handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+      } else {
+         ext_info_ptr = NULL;
+      }
+      (void)strip_chain;
+   }
+#endif
+
    vn_replace_vkGetPhysicalDeviceImageFormatProperties2_args_handle(args);
    args->ret = vk->GetPhysicalDeviceImageFormatProperties2(
       args->physicalDevice, args->pImageFormatInfo, args->pImageFormatProperties);
+
+#ifdef _WIN32
+   /* Translate the host's OPAQUE_WIN32 result back to DMA_BUF in the reply. */
+   if (ext_info_ptr) {
+      ext_info_ptr->handleType = saved_handle_type;
+      VkExternalImageFormatProperties *ext_props = vkr_find_struct(
+         args->pImageFormatProperties->pNext,
+         VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES);
+      if (ext_props) {
+         VkExternalMemoryProperties *emp = &ext_props->externalMemoryProperties;
+         /* Force non-exportable for dma-buf on Windows; see the rationale
+          * in vkr_dispatch_vkGetPhysicalDeviceExternalBufferProperties. */
+         emp->externalMemoryFeatures &= ~VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT;
+         emp->exportFromImportedHandleTypes = 0;
+         if (emp->compatibleHandleTypes &
+             VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT) {
+            emp->compatibleHandleTypes =
+               VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+         }
+      }
+   }
+#endif
 }
 
 static void
@@ -857,6 +1120,62 @@ vkr_dispatch_vkGetPhysicalDeviceExternalBufferProperties(
    struct vkr_physical_device *physical_dev =
       vkr_physical_device_from_handle(args->physicalDevice);
    struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+
+#ifdef _WIN32
+   /* Report DMA_BUF as importable-only, never exportable.
+    *
+    * Rationale: on Linux hosts, a Vulkan-exported DMA_BUF fd refers to the
+    * same kernel DRM BO that the GL stack can import and sample. On Windows
+    * the Vulkan ICD allocates proprietary D3D-backed memory whose layout
+    * virglrenderer's GL path cannot sample; if we advertise dma-buf export,
+    * Mesa's Vulkan WSI Wayland path uses it for swapchain present, the
+    * compositor imports the buffer as an EGLImage, GL sampling never
+    * completes, and kwin spins forever in GLRenderTimeQuery::query()
+    * (observed via gdb on a stuck kwin_wayland: drmIoctl
+    * DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST at 5000+/sec).
+    *
+    * Reporting IMPORTABLE without EXPORTABLE keeps the extension useful
+    * for VA-API / camera / capture dma-buf imports (the Chromium
+    * VaapiVideoDecoder path) while forcing Mesa WSI to fall back to wl_shm
+    * for swapchains — which is exactly the pre-shim behaviour that works.
+    * A future virglrenderer with proper Vulkan↔GL host memory sharing
+    * (WGL_NV_DX_interop2 or VK_EXT_external_memory_host) can flip this
+    * back to exportable.
+    */
+   if (physical_dev->dma_buf_shim_active &&
+       args->pExternalBufferInfo->handleType ==
+          VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) {
+      const VkPhysicalDeviceExternalBufferInfo host_info = {
+         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO,
+         .pNext = args->pExternalBufferInfo->pNext,
+         .flags = args->pExternalBufferInfo->flags,
+         .usage = args->pExternalBufferInfo->usage,
+         .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT,
+      };
+      VkExternalBufferProperties host_props = {
+         .sType = VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES,
+      };
+
+      vn_replace_vkGetPhysicalDeviceExternalBufferProperties_args_handle(args);
+      vk->GetPhysicalDeviceExternalBufferProperties(args->physicalDevice, &host_info,
+                                                    &host_props);
+
+      *args->pExternalBufferProperties = host_props;
+      VkExternalMemoryProperties *emp =
+         &args->pExternalBufferProperties->externalMemoryProperties;
+      /* Clear EXPORTABLE_BIT — Vulkan-backed memory can't be sampled by the
+       * host GL compositor on Windows, so callers MUST NOT expect export. */
+      emp->externalMemoryFeatures &= ~VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT;
+      emp->exportFromImportedHandleTypes = 0;
+      if (emp->compatibleHandleTypes &
+          VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT) {
+         emp->compatibleHandleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+      } else {
+         emp->compatibleHandleTypes = 0;
+      }
+      return;
+   }
+#endif
 
    vn_replace_vkGetPhysicalDeviceExternalBufferProperties_args_handle(args);
    vk->GetPhysicalDeviceExternalBufferProperties(

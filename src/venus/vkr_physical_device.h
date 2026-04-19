@@ -31,6 +31,24 @@ struct vkr_physical_device {
    bool host_external_fence_win32;
    bool host_external_semaphore_win32;
 
+   /* Windows-host synthesis of Linux dma-buf + modifier extensions.
+    * When true, vkr advertises VK_EXT_external_memory_dma_buf and
+    * VK_EXT_image_drm_format_modifier to the guest and internally
+    * translates them to OPAQUE_WIN32 + LINEAR tiling on the host ICD.
+    *
+    * This unblocks guest stacks that require these extensions to
+    * function: ANGLE's Vulkan backend for Chromium's VaapiVideoDecoder,
+    * Zink's dma-buf export for Wayland presentation, and any Mesa
+    * consumer that checks for dma-buf Vulkan interop before taking
+    * the accelerated path.
+    */
+   bool dma_buf_shim_active;
+   /* True when the extension was advertised by vkr but not by the host
+    * ICD. CreateDevice must NOT pass these names to the host ICD.
+    */
+   bool EXT_external_memory_dma_buf_synthesized;
+   bool EXT_image_drm_format_modifier_synthesized;
+
    VkPhysicalDeviceMemoryProperties memory_properties;
    VkPhysicalDeviceIDProperties id_properties;
    bool is_dma_buf_fd_export_supported;

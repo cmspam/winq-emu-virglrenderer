@@ -43,6 +43,33 @@ vkr_get_fd_info_from_resource_info(struct vkr_context *ctx,
    VkExternalMemoryHandleTypeFlagBits handle_type;
    switch (res->fd_type) {
    case VIRGL_RESOURCE_FD_DMABUF:
+#ifdef _WIN32
+      /*
+       * The dma-buf shim stores Win32 HANDLEs wrapped as fds in "dma-buf"
+       * resources. Unwrap and import as OPAQUE_WIN32 — the only handle
+       * type the Windows ICD understands — while keeping the guest's
+       * DMA_BUF viewpoint on its side of the wire.
+       */
+      if (dev->physical_device->dma_buf_shim_active) {
+         HANDLE handle = os_get_win32_handle_from_fd(res->u.fd);
+         HANDLE dup_handle = NULL;
+         if (handle == INVALID_HANDLE_VALUE ||
+             !DuplicateHandle(GetCurrentProcess(), handle, GetCurrentProcess(), &dup_handle,
+                              0, FALSE, DUPLICATE_SAME_ACCESS)) {
+            return false;
+         }
+
+         *out_win32 = (VkImportMemoryWin32HandleInfoKHR){
+            .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR,
+            .pNext = res_info->pNext,
+            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT,
+            .handle = dup_handle,
+            .name = NULL,
+         };
+         *out_import_info = out_win32;
+         return true;
+      }
+#endif
       handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
       break;
    case VIRGL_RESOURCE_FD_OPAQUE:
@@ -442,6 +469,26 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
          valid_fd_types |= 1 << VIRGL_RESOURCE_FD_DMABUF;
    }
 
+#ifdef _WIN32
+   /*
+    * dma-buf shim: host ICD does not understand DMA_BUF_BIT_EXT. Remap any
+    * DMA_BUF entry in the export info to OPAQUE_WIN32 before calling the
+    * host. guest_export_handle_types was captured above and retains the
+    * DMA_BUF bit, so valid_fd_types correctly reports DMA_BUF back to the
+    * guest. OPAQUE_FD is similarly remapped to OPAQUE_WIN32 for consistency.
+    */
+   if (export_info && physical_dev->dma_buf_shim_active) {
+      const VkExternalMemoryHandleTypeFlags fd_bits =
+         VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT |
+         VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+      if (export_info->handleTypes & fd_bits) {
+         export_info->handleTypes =
+            (export_info->handleTypes & ~fd_bits) |
+            VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+      }
+   }
+#endif
+
    struct vkr_device_memory *mem = vkr_device_memory_create_and_add(ctx, args);
    if (!mem) {
       if (local_import_info.fd >= 0)
@@ -684,13 +731,20 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
    } else {
       struct vn_device_proc_table *vk = &mem->device->proc_table;
 #ifdef _WIN32
-      if (handle_type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT &&
-          mem->device->GetMemoryWin32HandleKHR) {
+      /* On Windows, both OPAQUE_WIN32 and shim-synthesized DMA_BUF exports
+       * are backed by the same physical Win32 HANDLE. The shim advertises
+       * DMA_BUF on the guest side; internally the host ICD knows only about
+       * OPAQUE_WIN32. */
+      const bool win32_export =
+         handle_type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT ||
+         (handle_type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT &&
+          mem->device->physical_device->dma_buf_shim_active);
+      if (win32_export && mem->device->GetMemoryWin32HandleKHR) {
          HANDLE handle = INVALID_HANDLE_VALUE;
          const VkMemoryGetWin32HandleInfoKHR info = {
             .sType = VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR,
             .memory = mem->base.handle.device_memory,
-            .handleType = handle_type,
+            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT,
          };
          VkResult ret = mem->device->GetMemoryWin32HandleKHR(
             mem->device->base.handle.device, &info, &handle);
@@ -720,6 +774,11 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
    }
 
    if (fd_type == VIRGL_RESOURCE_FD_DMABUF) {
+#ifndef _WIN32
+      /* Real Linux dma-buf fds are seekable and lseek returns the size. On
+       * Windows, the "fd" is a token wrapping an NT HANDLE that isn't a
+       * real file descriptor; skip the size validation, we trust the size
+       * that was passed to vkAllocateMemory. */
       const off_t dma_buf_size = lseek(fd, 0, SEEK_END);
       if (dma_buf_size < 0 || (uint64_t)dma_buf_size < blob_size) {
          vkr_log("mem dma_buf_size %lld < blob_size %" PRIu64, (long long)dma_buf_size,
@@ -727,6 +786,7 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
          os_close_fd(fd);
          return false;
       }
+#endif
    }
 
    mem->exported = true;
