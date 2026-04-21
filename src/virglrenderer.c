@@ -1321,12 +1321,13 @@ int virgl_renderer_resource_map_fixed(uint32_t res_handle, void *addr)
    void *map = NULL;
    struct virgl_context *ctx = NULL;
    struct virgl_resource *res = virgl_resource_lookup(res_handle);
-   enum virgl_resource_fd_type fd_type = res->fd_type;
-   enum virgl_resource_fd_type export_fd_type = res->fd_type;
-   int fd = res->fd;
 
    if (!res)
       return -EINVAL;
+
+   enum virgl_resource_fd_type fd_type = res->fd_type;
+   enum virgl_resource_fd_type export_fd_type = res->fd_type;
+   int fd = res->fd;
 
    if (fd_type == VIRGL_RESOURCE_OPAQUE_HANDLE) {
       ctx = virgl_context_lookup(res->opaque_handle_context_id);
