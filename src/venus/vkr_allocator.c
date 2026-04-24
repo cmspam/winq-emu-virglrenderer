@@ -284,12 +284,14 @@ vkr_allocator_init(void)
       .pApplicationInfo = &app_info,
    };
 
+   VkInstance inst_handle;
    vk->CreateInstance =
       (PFN_vkCreateInstance)get_proc_addr(VK_NULL_HANDLE, "vkCreateInstance");
-   res = vk->CreateInstance(&inst_info, NULL, &vkr_allocator.instance);
+   res = vk->CreateInstance(&inst_info, NULL, &inst_handle);
    if (res != VK_SUCCESS)
       goto fail;
 
+   vkr_allocator.instance = inst_handle;
    vkr_allocator_inst_proc_table_init(vkr_allocator.instance, get_proc_addr, vk);
 
    vkr_allocator.device_count = VKR_ALLOCATOR_MAX_DEVICE_COUNT;
