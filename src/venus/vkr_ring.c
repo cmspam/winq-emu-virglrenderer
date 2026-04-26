@@ -259,6 +259,29 @@ vkr_ring_thread(void *arg)
    snprintf(thread_name, ARRAY_SIZE(thread_name), "vkr-ring-%d", ctx->ctx_id);
    u_thread_setname(thread_name);
 #ifdef _WIN32
+   /* Register with Multimedia Class Scheduler Service so Windows treats
+    * this thread like a low-latency audio/graphics worker: longer time
+    * slices, less likely to be preempted by background work, gets a
+    * higher base priority class. Costs nothing and reduces frame jitter
+    * for guest Vulkan submission, which is exactly what this thread does. */
+   {
+      typedef HANDLE (WINAPI *PFN_AvSetMmThreadCharacteristicsW)(LPCWSTR, LPDWORD);
+      static PFN_AvSetMmThreadCharacteristicsW pAvSet = NULL;
+      static int avrt_tried = 0;
+      if (!avrt_tried) {
+         avrt_tried = 1;
+         HMODULE h = LoadLibraryW(L"avrt.dll");
+         if (h)
+            pAvSet = (PFN_AvSetMmThreadCharacteristicsW)
+               GetProcAddress(h, "AvSetMmThreadCharacteristicsW");
+      }
+      if (pAvSet) {
+         DWORD task_index = 0;
+         /* "Pro Audio" gives the strongest scheduling guarantees. "Games"
+          * works on most systems too. Either is fine; failure is benign. */
+         (void)pAvSet(L"Pro Audio", &task_index);
+      }
+   }
    if (ring->prio_valid && !SetThreadPriority(GetCurrentThread(),
          ring->prio <= -10 ? THREAD_PRIORITY_HIGHEST :
          ring->prio <= 0   ? THREAD_PRIORITY_ABOVE_NORMAL :

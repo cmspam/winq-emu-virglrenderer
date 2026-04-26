@@ -5,6 +5,10 @@
 
 #include "vkr_queue.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #include "venus-protocol/vn_protocol_renderer_queue.h"
 
 #include "util/os_file.h"
@@ -215,6 +219,28 @@ vkr_queue_thread(void *arg)
 
    snprintf(thread_name, ARRAY_SIZE(thread_name), "vkr-queue-%d", ctx->ctx_id);
    u_thread_setname(thread_name);
+
+#ifdef _WIN32
+   /* Same MMCSS treatment as the ring thread: this thread retires GPU
+    * fences via WaitForFences and signals the guest, so its scheduling
+    * latency directly affects per-frame submit/retire turnaround. */
+   {
+      typedef HANDLE (WINAPI *PFN_AvSetMmThreadCharacteristicsW)(LPCWSTR, LPDWORD);
+      static PFN_AvSetMmThreadCharacteristicsW pAvSet = NULL;
+      static int avrt_tried = 0;
+      if (!avrt_tried) {
+         avrt_tried = 1;
+         HMODULE h = LoadLibraryW(L"avrt.dll");
+         if (h)
+            pAvSet = (PFN_AvSetMmThreadCharacteristicsW)
+               GetProcAddress(h, "AvSetMmThreadCharacteristicsW");
+      }
+      if (pAvSet) {
+         DWORD task_index = 0;
+         (void)pAvSet(L"Pro Audio", &task_index);
+      }
+   }
+#endif
 
    mtx_lock(&queue->sync_thread.mutex);
    while (true) {
