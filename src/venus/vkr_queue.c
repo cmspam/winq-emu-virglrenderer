@@ -532,9 +532,28 @@ vkr_dispatch_vkResetFenceResourceMESA(struct vn_dispatch_context *dispatch,
 {
    struct vkr_context *ctx = dispatch->data;
    struct vkr_device *dev = vkr_device_from_handle(args->device);
-   int fd = -1;
 
    vn_replace_vkResetFenceResourceMESA_args_handle(args);
+
+#ifdef _WIN32
+   /* On Linux this exports a sync_fd then closes it — sync_fd has COPY
+    * transference, so the export consumes the fence payload (i.e. resets
+    * the fence). On Windows the host export type is OPAQUE_WIN32 which has
+    * REFERENCE transference, so the export+close dance does NOT reset the
+    * fence and is pure overhead — a vkGetFenceWin32HandleKHR kernel call,
+    * an fd-table insert, and a CloseHandle, per WSI present (Mesa's
+    * vn_GetFenceFdKHR calls this via vn_async_*). Just call vkResetFences
+    * directly: that matches the Linux net effect (fence reset) at a tiny
+    * fraction of the cost. */
+   struct vn_device_proc_table *vk = &dev->proc_table;
+   const VkFence fence = args->fence;
+   VkResult result = vk->ResetFences(dev->base.handle.device, 1, &fence);
+   if (result != VK_SUCCESS) {
+      vkr_context_set_fatal(ctx);
+   }
+   return;
+#else
+   int fd = -1;
 
    const VkFenceGetFdInfoKHR info = {
       .sType = VK_STRUCTURE_TYPE_FENCE_GET_FD_INFO_KHR,
@@ -550,6 +569,7 @@ vkr_dispatch_vkResetFenceResourceMESA(struct vn_dispatch_context *dispatch,
 
    if (fd >= 0)
       os_close_fd(fd);
+#endif
 }
 
 static void
@@ -610,11 +630,18 @@ vkr_dispatch_vkWaitSemaphoreResourceMESA(
    vn_replace_vkWaitSemaphoreResourceMESA_args_handle(args);
 
 #ifdef _WIN32
+   /* Mesa's vn_GetSemaphoreFdKHR calls this via vn_async_* — fire-and-forget
+    * from the guest's perspective. Linux honors that by exporting a sync_fd
+    * (non-blocking) and immediately closing it; the GPU consumes the
+    * semaphore signal asynchronously. Match that: submit an empty waiter
+    * without blocking on completion. The dispatcher must not stall here —
+    * with the previous wait_for_completion=true, the entire context's
+    * command pipeline blocked for a GPU frame on every WSI present. */
    struct vkr_queue *queue = vkr_device_get_any_queue(dev);
    const VkSemaphore semaphore = args->semaphore;
    const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
    if (!queue || !vkr_queue_submit_empty(queue, 1, &semaphore, &wait_stage, 0, NULL,
-                                         true)) {
+                                         false)) {
       vkr_context_set_fatal(ctx);
    }
    return;
