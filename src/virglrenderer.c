@@ -35,6 +35,8 @@
 #include <sys/mman.h>
 #else
 #include "mman_win32.h"
+#include <windows.h>
+#include <timeapi.h>
 #endif
 
 #include "pipe/p_state.h"
@@ -801,6 +803,24 @@ int virgl_renderer_init(void *cookie, int flags, struct virgl_renderer_callbacks
    TRACE_FUNC();
 
    int ret;
+
+#ifdef _WIN32
+   /* Drop Windows system timer to 1ms granularity. By default the timer
+    * tick is 15.625ms (64Hz), which means clock_nanosleep / Sleep / cnd_*
+    * timed waits all round up to 15.625ms even when the requested wait
+    * is microseconds. The vkr ring relax path requests sub-millisecond
+    * sleeps that turn into ~16ms naps in practice, producing visible
+    * frame hitches in Vulkan workloads -- the host dispatcher misses an
+    * entire frame's worth of guest commands while it's asleep. With
+    * timeBeginPeriod(1), the same sleeps are honored at ~1ms or better.
+    *
+    * The cost is a small system-wide CPU bump (timer fires more often).
+    * On modern CPUs this is well under 1% and it's the standard fix every
+    * Windows audio/video application applies. We never call timeEndPeriod;
+    * that's intentional -- the runtime owns the elevated rate for as long
+    * as virglrenderer is loaded, which is the entire QEMU session. */
+   timeBeginPeriod(1);
+#endif
 
    /* VIRGL_RENDERER_THREAD_SYNC is a hint and can be silently ignored */
    if (!has_eventfd() || getenv("VIRGL_DISABLE_MT"))

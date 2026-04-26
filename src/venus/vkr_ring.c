@@ -204,14 +204,52 @@ vkr_ring_relax(uint32_t *iter)
 
    const uint32_t shift = util_last_bit(*iter) - busy_wait_order - 1;
    const uint32_t us = base_sleep_us << shift;
+
+#ifdef _WIN32
+   /* Use a high-resolution waitable timer so sub-millisecond requests are
+    * actually honored. Plain Sleep / clock_nanosleep round to the system
+    * timer tick, which is 15.625ms by default and 1ms with timeBeginPeriod
+    * (set in virgl_renderer_init). Even 1ms is too coarse for the early
+    * exponential backoff steps (10us, 20us, 40us, ...). A waitable timer
+    * with SetWaitableTimerEx + 100ns relative delays gets ~50us actual
+    * resolution on modern Windows, which keeps the ring monitor responsive
+    * to short bursts of guest activity instead of oversleeping into the
+    * next frame.
+    *
+    * Falling back to Sleep((us+999)/1000) when the timer can't be created
+    * just preserves the previous millisecond-granularity behavior. */
+   static _Thread_local HANDLE relax_timer = NULL;
+   if (!relax_timer) {
+      relax_timer = CreateWaitableTimerExW(
+         NULL, NULL,
+         CREATE_WAITABLE_TIMER_HIGH_RESOLUTION | CREATE_WAITABLE_TIMER_MANUAL_RESET,
+         TIMER_ALL_ACCESS);
+      if (!relax_timer) {
+         /* Older Windows: fall back to default-resolution timer. */
+         relax_timer = CreateWaitableTimerW(NULL, TRUE, NULL);
+      }
+   }
+   if (relax_timer) {
+      LARGE_INTEGER due;
+      due.QuadPart = -(LONGLONG)us * 10; /* 100ns units, negative = relative */
+      if (SetWaitableTimer(relax_timer, &due, 0, NULL, NULL, FALSE)) {
+         WaitForSingleObject(relax_timer, INFINITE);
+         return;
+      }
+   }
+   Sleep((us + 999) / 1000);
+#elif defined(__APPLE__)
+   /* macOS does not implement clock_nanosleep; a unified path is TBD */
    const struct timespec ts = {
       .tv_sec = us / 1000000,
       .tv_nsec = (us % 1000000) * 1000,
    };
-#ifdef __APPLE__
-   /* macOS does not implement clock_nanosleep; a unified path is TBD */
    nanosleep(&ts, NULL);
 #else
+   const struct timespec ts = {
+      .tv_sec = us / 1000000,
+      .tv_nsec = (us % 1000000) * 1000,
+   };
    clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, NULL);
 #endif
 }
