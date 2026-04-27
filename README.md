@@ -6,7 +6,7 @@ A fork of [virglrenderer](https://gitlab.freedesktop.org/virgl/virglrenderer) wi
 
 ## What's Changed
 
-All changes are in the `winq-emu-alpha8` branch, applied as a series of commits on top of upstream tag `virglrenderer-1.3.0`.
+All changes are on the `alpha10` branch, applied as a series of commits on top of upstream tag `virglrenderer-1.3.0`.
 
 ### Windows Venus Port
 - **Win32 external memory shim**: Translates POSIX fd-based memory/fence/semaphore operations to Win32 handle equivalents (`OPAQUE_FD` -> `OPAQUE_WIN32`)
@@ -21,9 +21,13 @@ All changes are in the `winq-emu-alpha8` branch, applied as a series of commits 
 
 ### Stability Fixes
 - **Push descriptor layout fix**: Strips `VkDescriptorSetLayoutBindingFlagsCreateInfo` from push descriptor DSLs to prevent driver crashes on Windows
-- **Deferred object destruction**: Delays destruction of lightweight Vulkan objects (descriptor set layouts, pipelines, render passes, etc.) until device teardown to prevent handle reuse issues
+- **Deferred object destruction**: Delays destruction of lightweight Vulkan objects (descriptor set layouts, pipelines, render passes, etc.) until device teardown to prevent handle reuse issues. Alpha 10 extends this to `VkAccelerationStructureKHR` for ray-tracing apps that destroy/recreate AS handles every frame.
 - **GL error drain**: Handles `GL_INVALID_ENUM` from `GL_SMOOTH_POINT_SIZE_RANGE`/`GL_SMOOTH_LINE_WIDTH_RANGE` on Windows GL drivers (via ANGLE)
 - **Queue creation fix**: Corrected use-after-free in queue info allocation
+- **Alpha 10 cherry-picks from upstream**: NULL-resource deref in `virgl_renderer_resource_map_fixed` (guest-triggerable crash), `vrend_renderer_init` cleanup order on init failure, `vkr_allocator` instance NULL on `vkCreateInstance` failure, cursor `Y_0_TOP` orientation flip.
+
+### Diagnostic Tooling (Alpha 10)
+- **`WINQ_DIAG=1` umbrella flag**: Sets `VIRGL_VIDEO_DIAG`, `VIRGL_VIDEO_D3D11_DEBUG`, log file (`%LOCALAPPDATA%\winq-emu\virglrenderer.log` on Windows) and log level to debug at once. Replaces the matrix of individual env vars when capturing a bug report.
 
 ## Building
 
