@@ -163,6 +163,20 @@ void flush_eventfd(int fd)
 #endif
 }
 
+/*
+ * One-shot read of WINQ_DIAG. Treat any non-empty, non-"0" value as on.
+ * Other modules call this to short-circuit their own VIRGL_*_DIAG checks.
+ */
+bool virgl_winq_diag_enabled(void)
+{
+   static int cached = -1;
+   if (cached < 0) {
+      const char *e = getenv("WINQ_DIAG");
+      cached = (e && *e && !(e[0] == '0' && e[1] == '\0')) ? 1 : 0;
+   }
+   return cached != 0;
+}
+
 const struct log_levels_lut {
    char *name;
    enum virgl_log_level_flags log_level;
@@ -190,6 +204,23 @@ void virgl_default_logger(UNUSED enum virgl_log_level_flags log_level,
    static FILE* fp = NULL;
    if (NULL == fp) {
       const char* log = getenv("VIRGL_LOG_FILE");
+#ifdef _WIN32
+      char winq_log_path[MAX_PATH];
+      if (!log && virgl_winq_diag_enabled()) {
+         const char *appdata = getenv("LOCALAPPDATA");
+         if (appdata && *appdata) {
+            char dir[MAX_PATH];
+            int n = snprintf(dir, sizeof(dir), "%s\\winq-emu", appdata);
+            if (n > 0 && n < (int)sizeof(dir)) {
+               CreateDirectoryA(dir, NULL); /* benign if already exists */
+               n = snprintf(winq_log_path, sizeof(winq_log_path),
+                            "%s\\virglrenderer.log", dir);
+               if (n > 0 && n < (int)sizeof(winq_log_path))
+                  log = winq_log_path;
+            }
+         }
+      }
+#endif
       if (log) {
          char *log_prefix = strdup(log);
          char *log_suffix = strstr(log_prefix, "%PID%");
@@ -230,6 +261,10 @@ void virgl_default_logger(UNUSED enum virgl_log_level_flags log_level,
 
          if (!lut->name)
             fprintf(fp, "Unknown log level %s requested\n", log_level_env);
+      } else if (virgl_winq_diag_enabled()) {
+         /* WINQ_DIAG without an explicit level: turn it up to DEBUG so
+          * the per-module diagnostic streams are visible in the log. */
+         virgl_log_level = VIRGL_LOG_LEVEL_DEBUG;
       }
 
       virgl_log_level_initialized = true;

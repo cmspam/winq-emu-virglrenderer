@@ -70,6 +70,13 @@ int create_eventfd(unsigned int initval);
 int write_eventfd(int fd, uint64_t val);
 void flush_eventfd(int fd);
 
+/*
+ * Returns true once WINQ_DIAG=1 (or any non-empty, non-"0" value) has been
+ * observed in the environment. Modules that have their own VIRGL_*_DIAG
+ * toggles should OR this in to flip them all on at once.
+ */
+bool virgl_winq_diag_enabled(void);
+
 void virgl_override_log_level(enum virgl_log_level_flags log_level);
 void virgl_log_set_handler(virgl_log_callback_type log_cb,
                            void *user_data,

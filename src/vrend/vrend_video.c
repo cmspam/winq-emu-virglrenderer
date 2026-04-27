@@ -76,6 +76,7 @@
 #include "vrend_renderer.h"
 #include "vrend_video.h"
 #include "vrend_iov.h"
+#include "virgl_util.h"
 
 /*
  * On Windows we don't have dma-buf / EGL_LINUX_DMA_BUF — the D3D11 video
@@ -371,12 +372,13 @@ static int sync_cpu_planes_to_video_buffer(struct vrend_video_buffer *buf,
     /* Drain any prior GL errors so our post-upload check is meaningful. */
     while (glGetError() != GL_NO_ERROR) { }
 
-    /* One-shot diagnostic: gated on VIRGL_VIDEO_DIAG=1 in the env. */
+    /* One-shot diagnostic: gated on VIRGL_VIDEO_DIAG=1 or WINQ_DIAG=1. */
     {
         static int diag_cached = -1;
         if (diag_cached < 0) {
             const char *e = getenv("VIRGL_VIDEO_DIAG");
-            diag_cached = (e && *e && *e != '0') ? 1 : 0;
+            bool on = (e && *e && *e != '0');
+            diag_cached = (on || virgl_winq_diag_enabled()) ? 1 : 0;
         }
         if (diag_cached) {
             static bool logged_once = false;
@@ -488,7 +490,8 @@ static int sync_cpu_planes_to_video_buffer(struct vrend_video_buffer *buf,
             static int diag_cached = -1;
             if (diag_cached < 0) {
                 const char *e = getenv("VIRGL_VIDEO_DIAG");
-                diag_cached = (e && *e && *e != '0') ? 1 : 0;
+                bool on = (e && *e && *e != '0');
+                diag_cached = (on || virgl_winq_diag_enabled()) ? 1 : 0;
             }
             if (diag_cached) {
                 static uint32_t seen_handles[64];

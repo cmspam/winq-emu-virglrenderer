@@ -335,14 +335,16 @@ struct virgl_video_codec {
  */
 
 /* Cached decision for one-shot diagnostic prints. Enabled when
- * VIRGL_VIDEO_DIAG=1 in the environment, so production runs (the
+ * VIRGL_VIDEO_DIAG=1 in the environment, or implicitly via the umbrella
+ * WINQ_DIAG=1 flag (see virgl_winq_diag_enabled). Production runs (the
  * common case) incur zero per-frame logging cost. AUDIT F31/F32. */
 static bool vid_diag_enabled(void)
 {
     static int cached = -1;
     if (cached < 0) {
         const char *e = getenv("VIRGL_VIDEO_DIAG");
-        cached = (e && *e && *e != '0') ? 1 : 0;
+        bool on = (e && *e && *e != '0');
+        cached = (on || virgl_winq_diag_enabled()) ? 1 : 0;
     }
     return cached == 1;
 }
@@ -530,7 +532,8 @@ int virgl_video_init(int drm_fd,
      * `D3D11CreateDevice` returns `DXGI_ERROR_SDK_COMPONENT_MISSING` if the
      * debug SDK component (Graphics Tools optional feature) is absent — we
      * fall back to the non-debug flag in that case. */
-    bool want_debug = getenv("VIRGL_VIDEO_D3D11_DEBUG") != NULL;
+    bool want_debug = getenv("VIRGL_VIDEO_D3D11_DEBUG") != NULL ||
+                      virgl_winq_diag_enabled();
     UINT debug_flag = want_debug ? D3D11_CREATE_DEVICE_DEBUG : 0;
 
     (void)drm_fd;   /* Windows backend doesn't use DRM fds. */
