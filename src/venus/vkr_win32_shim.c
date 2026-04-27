@@ -556,6 +556,12 @@ VKR_WIN32_DEFERRED_DESTROY_SHIM(VkSamplerYcbcrConversion, SamplerYcbcrConversion
 VKR_WIN32_DEFERRED_DESTROY_SHIM(VkPipelineCache, PipelineCache, VK_OBJECT_TYPE_PIPELINE_CACHE)
 VKR_WIN32_DEFERRED_DESTROY_SHIM(VkEvent, Event, VK_OBJECT_TYPE_EVENT)
 VKR_WIN32_DEFERRED_DESTROY_SHIM(VkQueryPool, QueryPool, VK_OBJECT_TYPE_QUERY_POOL)
+/* Ray-tracing apps (Quake II RTX, Portal RTX, vkd3d-proton games) destroy
+ * and recreate VkAccelerationStructureKHR every frame as TLAS rebuilds.
+ * Fall under the same Intel handle-recycle bug class as the lightweight
+ * metadata types above, so defer them too.
+ */
+VKR_WIN32_DEFERRED_DESTROY_SHIM(VkAccelerationStructureKHR, AccelerationStructureKHR, VK_OBJECT_TYPE_ACCELERATION_STRUCTURE_KHR)
 
 /* ------------------------------------------------------------------ */
 /* Install / remove                                                    */
@@ -628,6 +634,8 @@ vkr_win32_device_install_shim(struct vkr_device *dev)
    vk->DestroyPipelineCache = vkr_win32_DestroyPipelineCache;
    vk->DestroyEvent = vkr_win32_DestroyEvent;
    vk->DestroyQueryPool = vkr_win32_DestroyQueryPool;
+   if (vk->DestroyAccelerationStructureKHR)
+      vk->DestroyAccelerationStructureKHR = vkr_win32_DestroyAccelerationStructureKHR;
 
 }
 
@@ -711,6 +719,11 @@ vkr_win32_flush_deferred_destroys(struct vkr_device *dev)
          break;
       case VK_OBJECT_TYPE_QUERY_POOL:
          vk->DestroyQueryPool(device, (VkQueryPool)h->handle, NULL);
+         break;
+      case VK_OBJECT_TYPE_ACCELERATION_STRUCTURE_KHR:
+         if (vk->DestroyAccelerationStructureKHR)
+            vk->DestroyAccelerationStructureKHR(device,
+               (VkAccelerationStructureKHR)h->handle, NULL);
          break;
       default:
          vkr_log("win32 shim: unexpected deferred type %u", (uint32_t)h->type);
