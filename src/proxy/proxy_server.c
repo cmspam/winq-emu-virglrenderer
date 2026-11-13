@@ -430,15 +430,19 @@ server_context_worker_thread(void *arg)
       }
 
       case RENDER_CONTEXT_OP_IMPORT_RESOURCE: {
-         struct {
-            uint32_t res_id;
-            enum virgl_resource_fd_type fd_type;
-            uint64_t size;
-         } imp_body;
+         /* The client sends the whole protocol struct, including the 4
+          * padding bytes before the 64-bit size. A repacked struct read 16
+          * instead of 20 body bytes, left 4 bytes in the stream and shifted
+          * every later message on this context.
+          */
+         struct render_context_op_import_resource_request imp_body;
+         const size_t body_offset =
+            offsetof(struct render_context_op_import_resource_request, res_id);
 
          int fds[1];
          int fd_count;
-         if (!server_recv_with_fds(w->socket_fd, &imp_body, sizeof(imp_body),
+         if (!server_recv_with_fds(w->socket_fd, (char *)&imp_body + body_offset,
+                                   sizeof(imp_body) - body_offset,
                                    fds, 1, &fd_count))
             goto done;
 
