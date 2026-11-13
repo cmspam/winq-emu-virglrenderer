@@ -17,6 +17,8 @@
 #endif
 
 #include "server/render_protocol.h"
+#include <inttypes.h>
+#include <stddef.h>
 
 int
 proxy_server_connect(struct proxy_server *srv)
@@ -155,12 +157,6 @@ server_recv_with_fds(int fd, void *data, size_t size,
 
    *out_fd_count = (int)fd_count;
    return true;
-}
-
-static bool
-server_send_reply(int fd, const void *data, size_t size)
-{
-   return server_send_all(fd, data, size);
 }
 
 static bool
@@ -416,8 +412,16 @@ server_context_worker_thread(void *arg)
          mtx_unlock(&state->renderer_mutex);
 
          if (!ok || res_fd < 0) {
+            /* The client always reads the fd count after the reply
+             * (proxy_socket_receive_reply_with_fds). Without it, QEMU's main
+             * loop blocks in recv() forever while holding the BQL and the
+             * whole VM freezes (seen on the first Wayland swapchain present).
+             */
+            proxy_log("server worker: create resource %u (blob %" PRIu64
+                      ", size %" PRIu64 ", flags 0x%x) failed",
+                      res_id, blob_id, blob_size, blob_flags);
             reply.fd_type = VIRGL_RESOURCE_FD_INVALID;
-            server_send_reply(w->socket_fd, &reply, sizeof(reply));
+            server_send_reply_with_fds(w->socket_fd, &reply, sizeof(reply), NULL, 0);
          } else {
             server_send_reply_with_fds(w->socket_fd, &reply, sizeof(reply),
                                        &res_fd, 1);
@@ -426,15 +430,19 @@ server_context_worker_thread(void *arg)
       }
 
       case RENDER_CONTEXT_OP_IMPORT_RESOURCE: {
-         struct {
-            uint32_t res_id;
-            enum virgl_resource_fd_type fd_type;
-            uint64_t size;
-         } imp_body;
+         /* The client sends the whole protocol struct, including the 4
+          * padding bytes before the 64-bit size. A repacked struct read 16
+          * instead of 20 body bytes, left 4 bytes in the stream and shifted
+          * every later message on this context.
+          */
+         struct render_context_op_import_resource_request imp_body;
+         const size_t body_offset =
+            offsetof(struct render_context_op_import_resource_request, res_id);
 
          int fds[1];
          int fd_count;
-         if (!server_recv_with_fds(w->socket_fd, &imp_body, sizeof(imp_body),
+         if (!server_recv_with_fds(w->socket_fd, (char *)&imp_body + body_offset,
+                                   sizeof(imp_body) - body_offset,
                                    fds, 1, &fd_count))
             goto done;
 

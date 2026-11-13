@@ -179,44 +179,17 @@ vkr_win32_CreateBuffer(VkDevice device,
    if (!entry)
       return VK_ERROR_DEVICE_LOST;
 
-   const VkExternalMemoryHandleTypeFlags host_type =
-      vkr_win32_get_host_handle_type(entry->dev);
-
    /* Remap any existing external memory info in the pNext chain */
    vkr_win32_remap_external_handle_types_in_chain(pCreateInfo->pNext);
 
-   /* If the device uses external memory and the guest didn't chain
-    * VkExternalMemoryBufferCreateInfo, add one.  This is needed because
-    * vkAllocateMemory forces HOST_VISIBLE memory to be external, but the
-    * guest doesn't know this and creates buffers without the matching info.
+   /* Buffers the guest did not make external stay plain. AMD's Windows
+    * driver limits an OPAQUE_WIN32 external buffer to device-local memory
+    * (memoryTypeBits 0x1 instead of 0xf on an RX 9070 XT), so a uniform
+    * buffer had no host-visible type left, vkMapMemory failed and the guest
+    * wrote through NULL (vkcube). Binding exportable host-visible memory to
+    * a plain buffer works on the same driver (bind and map both succeed).
     */
-   VkBufferCreateInfo local_info;
-   VkExternalMemoryBufferCreateInfo ext_info;
-   const VkBufferCreateInfo *create_info = pCreateInfo;
-
-   if (host_type) {
-      bool has_external = false;
-      for (const VkBaseInStructure *iter = (const VkBaseInStructure *)pCreateInfo->pNext;
-           iter; iter = iter->pNext) {
-         if (iter->sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO) {
-            has_external = true;
-            break;
-         }
-      }
-
-      if (!has_external) {
-         local_info = *pCreateInfo;
-         ext_info = (VkExternalMemoryBufferCreateInfo){
-            .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
-            .pNext = (void *)local_info.pNext,
-            .handleTypes = host_type,
-         };
-         local_info.pNext = &ext_info;
-         create_info = &local_info;
-      }
-   }
-
-   return entry->saved_proc_table.CreateBuffer(device, create_info, pAllocator, pBuffer);
+   return entry->saved_proc_table.CreateBuffer(device, pCreateInfo, pAllocator, pBuffer);
 }
 
 /* ------------------------------------------------------------------ */
