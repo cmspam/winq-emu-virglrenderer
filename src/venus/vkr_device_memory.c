@@ -373,7 +373,21 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
    int udmabuf_fd = -1;
    void *gbm_bo = NULL;
    VkExportMemoryAllocateInfo local_export_info;
-   if ((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !res_info) {
+#ifdef _WIN32
+   /* Windows: the guest may create a blob from any allocation, also from
+    * device-local memory that is not host visible (vkcube's Wayland
+    * swapchain: "mem is not exportable", blob flags 0). Linux gets those
+    * through gbm/udmabuf import; Windows has neither, so every allocation is
+    * made exportable as OPAQUE_WIN32 when the host driver supports it.
+    */
+   const bool force_export_candidate =
+      !res_info && ((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ||
+                    physical_dev->host_external_memory_win32);
+#else
+   const bool force_export_candidate =
+      (property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !res_info;
+#endif
+   if (force_export_candidate) {
       /* An implementation can support dma_buf import along with opaque fd export/import.
        * If the client driver is using external memory and requesting dma_buf, without
        * dma_buf fd export support, we must use gbm bo import path instead of forcing
