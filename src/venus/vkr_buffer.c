@@ -52,6 +52,16 @@ vkr_buffer_prepare_external_create_info(struct vkr_device *dev,
       return;
    }
 
+#ifdef _WIN32
+   /* Not for buffers the guest did not make external: AMD's Windows driver
+    * limits an OPAQUE_WIN32 external buffer to device-local memory
+    * (memoryTypeBits 0x1), so a uniform buffer had no host-visible memory
+    * type left and vkMapMemory gave the guest a NULL pointer (vkcube
+    * crashed in demo_prepare_cube_data_buffers).
+    */
+   return;
+#endif
+
    *external_info_storage = (VkExternalMemoryBufferCreateInfo){
       .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
       .pNext = (void *)create_info->pNext,
